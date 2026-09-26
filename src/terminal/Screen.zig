@@ -3259,10 +3259,22 @@ pub const PromptInputRange = struct {
 
 /// The shell input the cursor is currently editing (cmux-specific).
 ///
-/// Offsets count "caret stops": `.input` cells that hold a character, with
+/// Offsets count "caret stops": `.input` cells that hold text, with
 /// wide-character spacers skipped. Each stop is one Left/Right arrow step for
 /// a line editor such as zle or readline, which is what lets an embedder
 /// translate a selection into cursor motion plus deletion.
+///
+/// Known limits, all conservative or documented rather than guessed at:
+/// - Only the cursor's soft-wrapped line counts. A hard newline in a
+///   multi-line buffer is a character to the line editor but occupies no
+///   cell, so offsets that crossed it would stop mapping onto arrow keys.
+/// - The line must show a `.prompt` cell before its input. This keeps
+///   zle widgets that draw below the prompt while still in input mode
+///   (fzf `--height`, completion menus) from reading as prompt input.
+/// - A line containing a multi-codepoint grapheme is not editable, since
+///   the line editor may take several arrow steps across one cell.
+/// - Text a line editor draws after the buffer while in input mode, such
+///   as a zsh-autosuggestions suggestion, is indistinguishable from input.
 pub const PromptInput = struct {
     /// Number of caret stops in the input.
     len: u32,
@@ -3277,28 +3289,55 @@ pub const PromptInput = struct {
 
 /// Whether a cell is one caret stop of shell input.
 fn promptInputIsStop(cell: *const Cell) bool {
-    if (cell.semantic_content != .input) return false;
+    if (cell.semantic_content != .input or !cell.hasText()) return false;
     return switch (cell.wide) {
         .narrow, .wide => true,
         .spacer_tail, .spacer_head => false,
     };
 }
 
-/// Visit each caret stop of the soft-wrapped line under the cursor, in
-/// order. `ctx.visit(index, pin, cell)` returns false to stop early.
-///
-/// The region is deliberately the cursor's logical (soft-wrapped) line and
-/// not every line of the prompt: a hard newline inside a multi-line buffer
-/// is a character to the line editor but occupies no cell, so offsets that
-/// crossed it would no longer map one-to-one onto arrow keys.
-fn promptInputVisit(self: *const Screen, ctx: anytype) void {
+/// The last cell a stop occupies: its spacer tail when it is wide.
+fn promptInputStopEnd(pin: Pin, cell: *const Cell) Pin {
+    if (cell.wide == .wide and pin.x + 1 < pin.node.cols()) return pin.right(1);
+    return pin;
+}
+
+/// The first and last cells of the cursor's soft-wrapped line, when that
+/// line is editable prompt input (see `PromptInput` for the rules).
+fn promptInputLine(self: *const Screen) ?[2]Pin {
+    if (self.cursor.semantic_content != .input) return null;
+
     const cursor_pin = self.cursor.page_pin.*;
-    var row_pin = cursor_pin.left(cursor_pin.x);
-    while (row_pin.up(1)) |prev| {
+    var first_row = cursor_pin.left(cursor_pin.x);
+    while (first_row.up(1)) |prev| {
         if (!prev.rowAndCell().row.wrap) break;
-        row_pin = prev;
+        first_row = prev;
     }
 
+    var seen_prompt = false;
+    var row_pin = first_row;
+    while (true) {
+        const cells = row_pin.cells(.all);
+        for (cells) |*cell| {
+            if (cell.semantic_content == .prompt) seen_prompt = true;
+            if (!promptInputIsStop(cell)) continue;
+            if (!seen_prompt) return null;
+            if (cell.hasGrapheme()) return null;
+        }
+        if (!row_pin.rowAndCell().row.wrap) break;
+        row_pin = row_pin.down(1) orelse break;
+    }
+    if (!seen_prompt) return null;
+
+    var last = row_pin;
+    last.x = row_pin.node.cols() - 1;
+    return .{ first_row, last };
+}
+
+/// Visit each caret stop of `line` in order. `ctx.visit(index, pin, cell)`
+/// returns false to stop early.
+fn promptInputVisit(line: [2]Pin, ctx: anytype) void {
+    var row_pin = line[0];
     var index: u32 = 0;
     while (true) {
         const cells = row_pin.cells(.all);
@@ -3309,30 +3348,30 @@ fn promptInputVisit(self: *const Screen, ctx: anytype) void {
             if (!ctx.visit(index, pin, cell)) return;
             index += 1;
         }
-        if (!row_pin.rowAndCell().row.wrap) return;
+        if (row_pin.node == line[1].node and row_pin.y == line[1].y) return;
         row_pin = row_pin.down(1) orelse return;
     }
 }
 
-/// The last cell a stop occupies: its spacer tail when it is wide.
-fn promptInputStopEnd(pin: Pin, cell: *const Cell) Pin {
-    if (cell.wide == .wide and pin.x + 1 < pin.node.cols()) return pin.right(1);
-    return pin;
-}
-
 /// Describe the shell input the cursor is editing, or null when the cursor
-/// is not in an OSC 133 input region (after `133;B`, before `133;C`).
+/// is not in an editable OSC 133 input line (see `PromptInput`).
 ///
 /// This does not check the alternate screen or whether the terminal as a
 /// whole is at a prompt; callers pair it with `Terminal.cursorIsAtPrompt`.
 pub fn promptInput(self: *const Screen) ?PromptInput {
-    if (self.cursor.semantic_content != .input) return null;
-
+    const line = self.promptInputLine() orelse return null;
     const cursor_pin = self.cursor.page_pin.*;
+
+    // Resolve the selection bounds once, and drop a selection that lies
+    // entirely off this line before the per-stop comparisons, which walk
+    // the page list when pins sit on different pages.
     const sel_bounds: ?[2]Pin = bounds: {
         const sel = self.selection orelse break :bounds null;
         if (sel.rectangle) break :bounds null;
-        break :bounds .{ sel.topLeft(self), sel.bottomRight(self) };
+        const tl = sel.topLeft(self);
+        const br = sel.bottomRight(self);
+        if (br.before(line[0]) or line[1].before(tl)) break :bounds null;
+        break :bounds .{ tl, br };
     };
 
     const Ctx = struct {
@@ -3349,8 +3388,9 @@ pub fn promptInput(self: *const Screen) ?PromptInput {
         sel_end: u32 = 0,
 
         fn visit(ctx: *@This(), index: u32, pin: Pin, cell: *const Cell) bool {
+            const stop_end = promptInputStopEnd(pin, cell);
             if (ctx.first == null) ctx.first = pin;
-            ctx.last_end = promptInputStopEnd(pin, cell);
+            ctx.last_end = stop_end;
             ctx.len = index + 1;
 
             const behind_cursor = pin.before(ctx.cursor) or
@@ -3358,7 +3398,9 @@ pub fn promptInput(self: *const Screen) ?PromptInput {
             if (behind_cursor) ctx.caret = index + 1;
 
             if (ctx.sel) |bounds| {
-                const inside = !pin.before(bounds[0]) and !bounds[1].before(pin);
+                // A selection that starts on a wide stop's spacer tail
+                // still covers the glyph, as Ghostty's selection text does.
+                const inside = !stop_end.before(bounds[0]) and !bounds[1].before(pin);
                 if (inside) {
                     if (ctx.sel_start == null) ctx.sel_start = index;
                     ctx.sel_end = index + 1;
@@ -3373,7 +3415,7 @@ pub fn promptInput(self: *const Screen) ?PromptInput {
         .cursor_inclusive = self.cursor.pending_wrap,
         .sel = sel_bounds,
     };
-    self.promptInputVisit(&ctx);
+    promptInputVisit(line, &ctx);
 
     var result: PromptInput = .{ .len = ctx.len, .caret = ctx.caret };
     if (sel_bounds) |bounds| selection: {
@@ -3388,11 +3430,11 @@ pub fn promptInput(self: *const Screen) ?PromptInput {
 }
 
 /// Build a selection covering caret stops `[start, end)` of the input the
-/// cursor is editing. Returns null when the cursor is not in input or the
-/// range is empty or out of bounds.
+/// cursor is editing. Returns null when the cursor is not in editable input
+/// or the range is empty or out of bounds.
 pub fn promptInputSelection(self: *const Screen, start: u32, end: u32) ?Selection {
-    if (self.cursor.semantic_content != .input) return null;
     if (start >= end) return null;
+    const line = self.promptInputLine() orelse return null;
 
     const Ctx = struct {
         start: u32,
@@ -3411,7 +3453,7 @@ pub fn promptInputSelection(self: *const Screen, start: u32, end: u32) ?Selectio
     };
 
     var ctx: Ctx = .{ .start = start, .last = end - 1 };
-    self.promptInputVisit(&ctx);
+    promptInputVisit(line, &ctx);
     const start_pin = ctx.start_pin orelse return null;
     const end_pin = ctx.end_pin orelse return null;
     return .init(start_pin, end_pin, false);
@@ -12117,6 +12159,22 @@ test "Screen: promptInput is null outside input" {
     s.cursorSetSemanticContent(.{ .input = .clear_explicit });
     try s.testWriteString("ls");
     s.cursorSetSemanticContent(.output);
+    try testing.expect(s.promptInput() == null);
+    try testing.expect(s.promptInputSelection(0, 2) == null);
+}
+
+test "Screen: promptInput ignores input-mode lines without a prompt" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var s = try init(io, alloc, .{ .cols = 20, .rows = 5, .max_scrollback = 0 });
+    defer s.deinit();
+
+    // A widget such as fzf --height draws its own query line while the
+    // shell is still in input mode, so every cell is `.input`.
+    s.cursorSetSemanticContent(.{ .input = .clear_explicit });
+    try s.testWriteString("> query");
     try testing.expect(s.promptInput() == null);
     try testing.expect(s.promptInputSelection(0, 2) == null);
 }

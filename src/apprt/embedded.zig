@@ -2680,9 +2680,9 @@ pub const CAPI = struct {
         surface: *Surface,
         result: *PromptInput,
     ) bool {
-        const input = surface.core_surface.promptInput() orelse return false;
-        result.* = .{ .length = input.len, .caret = input.caret };
-        if (input.selection) |range| {
+        const prompt = surface.core_surface.promptInput() orelse return false;
+        result.* = .{ .length = prompt.len, .caret = prompt.caret };
+        if (prompt.selection) |range| {
             result.has_selection = true;
             result.selection_start = range.start;
             result.selection_end = range.end;

@@ -2705,8 +2705,8 @@ pub fn selectCursorLine(self: *Surface) !bool {
 /// cursor is inside an OSC 133 input region. Takes the renderer mutex once;
 /// meant for key gestures, not for every keystroke.
 pub fn promptInput(self: *Surface) ?terminal.Screen.PromptInput {
-    self.renderer_state.mutex.lockUncancelable(global.io());
-    defer self.renderer_state.mutex.unlock(global.io());
+    self.renderer_state.lockDemand(global.io());
+    defer self.renderer_state.unlockDemand(global.io());
 
     if (!self.io.terminal.cursorIsAtPrompt()) return null;
     return self.io.terminal.screens.active.promptInput();
@@ -2715,8 +2715,8 @@ pub fn promptInput(self: *Surface) ?terminal.Screen.PromptInput {
 /// Select caret stops `[start, end)` of the shell input the cursor is
 /// editing (cmux-specific). Never writes a clipboard.
 pub fn selectPromptInput(self: *Surface, start: u32, end: u32) !bool {
-    self.renderer_state.mutex.lockUncancelable(global.io());
-    defer self.renderer_state.mutex.unlock(global.io());
+    self.renderer_state.lockDemand(global.io());
+    defer self.renderer_state.unlockDemand(global.io());
 
     if (!self.io.terminal.cursorIsAtPrompt()) return false;
     const screen: *terminal.Screen = self.io.terminal.screens.active;
