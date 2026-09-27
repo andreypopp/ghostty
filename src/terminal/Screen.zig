@@ -3279,6 +3279,10 @@ pub const PromptInputRange = struct {
 ///   right prompt is `.input` text behind a run of empty cells. An empty
 ///   cell between input text before the cursor means the cells do not map
 ///   onto the line editor's buffer, and the line is refused.
+/// - Spaces at or after the cursor that run into that end are dropped too.
+///   With RPROMPT shown, zle erases deleted text by writing spaces rather
+///   than clearing to the end of the line. Trailing spaces in the buffer
+///   after the cursor are dropped with them, which only shortens the input.
 /// - Text a line editor draws right after the buffer while in input mode,
 ///   such as a zsh-autosuggestions suggestion, is indistinguishable from
 ///   input.
@@ -3326,6 +3330,12 @@ fn promptInputLine(self: *const Screen) ?[2]Pin {
     var seen_prompt = false;
     var seen_stop = false;
     var last: ?Pin = null;
+    // While a run of spaces at or after the cursor is open, the last cell
+    // before it. zle cannot clear to the end of the line while RPROMPT is
+    // shown, so it erases deleted text by writing spaces; a run of spaces
+    // that reaches the end of the input is erased text, not buffer.
+    var in_space_run = false;
+    var before_space_run: ?Pin = null;
     var row_pin = first_row;
     rows: while (true) {
         const cells = row_pin.cells(.all);
@@ -3343,6 +3353,15 @@ fn promptInputLine(self: *const Screen) ?[2]Pin {
                 if (seen_stop) return null;
             }
 
+            const after_cursor = !pin.before(cursor_pin);
+            const space = cell.wide == .narrow and cell.codepoint() == ' ';
+            if (after_cursor and space) {
+                if (!in_space_run) before_space_run = last;
+                in_space_run = true;
+            } else {
+                in_space_run = false;
+            }
+
             if (cell.semantic_content == .prompt) seen_prompt = true;
             last = pin;
             if (!promptInputIsStop(cell)) continue;
@@ -3354,6 +3373,7 @@ fn promptInputLine(self: *const Screen) ?[2]Pin {
         row_pin = row_pin.down(1) orelse break;
     }
     if (!seen_prompt) return null;
+    if (in_space_run) last = before_space_run;
     return .{ first_row, last orelse return null };
 }
 
@@ -12295,6 +12315,35 @@ test "Screen: promptInput stops before a right prompt" {
         false,
     ));
     try testing.expect(s.promptInput().?.selection == null);
+}
+
+test "Screen: promptInput drops erased spaces after the cursor" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var s = try init(io, alloc, .{ .cols = 20, .rows = 5, .max_scrollback = 0 });
+    defer s.deinit();
+
+    // "git status" shortened to "git" while RPROMPT is shown: zle writes
+    // spaces over the deleted text.
+    s.cursorSetSemanticContent(.{ .prompt = .initial });
+    try s.testWriteString("> ");
+    s.cursorSetSemanticContent(.{ .input = .clear_explicit });
+    try s.testWriteString("git       ");
+    s.cursorAbsolute(18, 0);
+    try s.testWriteString("~");
+    s.cursorAbsolute(5, 0);
+
+    const input = s.promptInput().?;
+    try testing.expectEqual(@as(u32, 3), input.len);
+    try testing.expectEqual(@as(u32, 3), input.caret);
+
+    // Spaces before the cursor, or followed by text, are buffer.
+    s.cursorAbsolute(5, 0);
+    try s.testWriteString(" x");
+    s.cursorAbsolute(4, 0);
+    try testing.expectEqual(@as(u32, 5), s.promptInput().?.len);
 }
 
 test "Screen: promptInput is empty at an empty prompt with a right prompt" {
