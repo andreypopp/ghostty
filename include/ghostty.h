@@ -1671,6 +1671,30 @@ GHOSTTY_API bool ghostty_surface_has_selection(ghostty_surface_t);
 GHOSTTY_API bool ghostty_surface_select_cursor_cell(ghostty_surface_t);
 GHOSTTY_API bool ghostty_surface_select_cursor_line(ghostty_surface_t);
 GHOSTTY_API bool ghostty_surface_clear_selection(ghostty_surface_t);
+// cmux fork: the shell input (OSC 133 B region) the cursor is editing.
+// Offsets count caret stops: input cells holding text, wide-character spacers
+// skipped, over the cursor's soft-wrapped line only (a hard newline in a
+// multi-line buffer ends the region). Each stop is one Left/Right arrow step
+// for zle/readline. ghostty_surface_prompt_input returns false, leaving the
+// struct untouched, unless the terminal is at a prompt on the primary screen
+// and the cursor's line shows a prompt before its input; a line holding a
+// multi-codepoint grapheme is also refused. Text a line editor draws after the
+// buffer in input mode (zsh-autosuggestions) counts as input. The selection
+// fields are set only when the active selection lies wholly within the input.
+// ghostty_surface_select_prompt_input selects stops [start, end) without
+// writing a clipboard.
+typedef struct {
+  uint32_t length;
+  uint32_t caret;
+  bool has_selection;
+  uint32_t selection_start;
+  uint32_t selection_end;
+} ghostty_surface_prompt_input_s;
+GHOSTTY_API bool ghostty_surface_prompt_input(ghostty_surface_t,
+                                              ghostty_surface_prompt_input_s*);
+GHOSTTY_API bool ghostty_surface_select_prompt_input(ghostty_surface_t,
+                                                     uint32_t,
+                                                     uint32_t);
 // cmux fork: tracked keyboard-selection operations in viewport coordinates.
 // These avoid synthesizing mouse gestures and keep terminal row identity,
 // selection motion, rendering, and clipboard formatting inside Ghostty.
