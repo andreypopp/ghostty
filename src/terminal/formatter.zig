@@ -1261,6 +1261,14 @@ pub const PageFormatter = struct {
                 // This cell is not blank. If we have accumulated blank cells
                 // then we want to emit them now.
                 if (blank_cells > 0) {
+                    // Blank cells have the default style. Close any open
+                    // style first so the spaces do not take the previous
+                    // cell's colors, as the row-break path above does.
+                    if (formatStyled(self.opts.emit) and !style.default()) {
+                        try self.formatStyleClose(writer);
+                        style = .{};
+                    }
+
                     try writer.splatByteAll(' ', blank_cells);
 
                     if (self.point_map) |*map| {
