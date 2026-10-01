@@ -4938,6 +4938,10 @@ pub const CAPI = struct {
         surface.core_surface.io.processOutput(ptr[0..len]);
     }
 
+    export fn ghostty_surface_raise_scrollback_limit(surface: *Surface) void {
+        surface.core_surface.io.raiseScrollbackLimit();
+    }
+
     export fn ghostty_surface_prepend_history(surface: *Surface, ptr: [*]const u8, len: usize) usize {
         return surface.core_surface.io.prependHistory(ptr[0..len]) catch 0;
     }

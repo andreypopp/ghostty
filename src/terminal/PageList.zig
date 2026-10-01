@@ -3592,6 +3592,23 @@ fn fixupViewport(
     }
 }
 
+pub fn raiseLimit(self: *PageList) void {
+    self.explicit_max_size = self.maxSize() *| 2;
+}
+
+test "PageList raise limit is local and saturates" {
+    var first = try init(std.testing.allocator, 73, 24, 16 * 1024 * 1024);
+    defer first.deinit();
+    var second = try init(std.testing.allocator, 73, 24, 16 * 1024 * 1024);
+    defer second.deinit();
+    first.raiseLimit();
+    try std.testing.expectEqual(@as(usize, 32 * 1024 * 1024), first.maxSize());
+    try std.testing.expectEqual(@as(usize, 16 * 1024 * 1024), second.maxSize());
+    first.explicit_max_size = std.math.maxInt(usize);
+    first.raiseLimit();
+    try std.testing.expectEqual(std.math.maxInt(usize), first.maxSize());
+}
+
 /// Returns the actual max size. This may be greater than the explicit
 /// value if the explicit value is less than the min_max_size.
 ///

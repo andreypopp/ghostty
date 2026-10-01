@@ -849,6 +849,13 @@ pub fn processOutput(self: *Termio, buf: []const u8) void {
     if (self.pty_tee_cb) |cb| cb(self.pty_tee_userdata, buf.ptr, buf.len);
 }
 
+pub fn raiseScrollbackLimit(self: *Termio) void {
+    self.renderer_state.mutex.lockUncancelable(global.io());
+    defer self.renderer_state.mutex.unlock(global.io());
+    const pages = &self.terminal.screens.get(.primary).?.pages;
+    pages.raiseLimit();
+}
+
 pub fn prependHistory(self: *Termio, bytes: []const u8) !usize {
     self.renderer_state.mutex.lockUncancelable(global.io());
     const cols = self.terminal.cols;
