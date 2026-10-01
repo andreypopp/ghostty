@@ -358,16 +358,33 @@ pub fn deinit(self: *Terminal, alloc: Allocator) void {
 
 pub fn prependHistory(self: *Terminal, alloc: Allocator, bytes: []const u8) !usize {
     if (self.screens.active_key != .primary or bytes.len == 0) return 0;
-    var scratch = try init(self.io(), alloc, .{
-        .cols = self.cols,
+    var scratch = try historyScratch(self.io(), alloc, self.cols, bytes);
+    defer scratch.deinit(alloc);
+    return self.screens.active.pages.prepend(&scratch.screens.active.pages);
+}
+
+pub fn historyScratch(io_impl: std.Io, alloc: Allocator, cols: size.CellCountInt, bytes: []const u8) !Terminal {
+    var scratch = try init(io_impl, alloc, .{
+        .cols = cols,
         .rows = 1,
         .max_scrollback = std.math.maxInt(usize),
     });
-    defer scratch.deinit(alloc);
+    errdefer scratch.deinit(alloc);
     var stream = scratch.vtStream();
     defer stream.deinit();
     stream.nextSlice(bytes);
-    return self.screens.active.pages.prepend(&scratch.screens.active.pages);
+    return scratch;
+}
+
+test "Terminal prepend history prepared scratch preserves wrapping" {
+    var t = try init(testing.io, testing.allocator, .{ .cols = 4, .rows = 2, .max_scrollback = 10_000_000 });
+    defer t.deinit(testing.allocator);
+    var scratch = try historyScratch(testing.io, testing.allocator, 4, "\x1b[31mabcdefgh\r\nx");
+    defer scratch.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 3), try t.screens.active.pages.prepend(&scratch.screens.active.pages));
+    const text = try t.screens.active.dumpStringAllocUnwrapped(testing.allocator, .{ .screen = .{} });
+    defer testing.allocator.free(text);
+    try testing.expectEqualStrings("abcdefgh\nx", std.mem.trimEnd(u8, text, "\n"));
 }
 
 test "Terminal prepend history preserves rows, styles and viewport" {

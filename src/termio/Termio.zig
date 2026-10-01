@@ -851,8 +851,22 @@ pub fn processOutput(self: *Termio, buf: []const u8) void {
 
 pub fn prependHistory(self: *Termio, bytes: []const u8) !usize {
     self.renderer_state.mutex.lockUncancelable(global.io());
+    const cols = self.terminal.cols;
+    const identity = self.terminal.screens.active.pages.row_space_revision;
+    const epoch = self.terminal.screens.active.pages.page_serial_epoch;
+    const pages = &self.terminal.screens.active.pages;
+    const available = self.terminal.screens.active_key == .primary and
+        bytes.len > 0 and pages.page_size < pages.maxSize();
+    self.renderer_state.mutex.unlock(global.io());
+    if (!available) return 0;
+    var scratch = try terminalpkg.Terminal.historyScratch(global.io(), self.alloc, cols, bytes);
+    defer scratch.deinit(self.alloc);
+    self.renderer_state.mutex.lockUncancelable(global.io());
     defer self.renderer_state.mutex.unlock(global.io());
-    const count = try self.terminal.prependHistory(self.alloc, bytes);
+    if (self.terminal.cols != cols or self.terminal.screens.active_key != .primary or
+        self.terminal.screens.active.pages.row_space_revision != identity or
+        self.terminal.screens.active.pages.page_serial_epoch != epoch) return 0;
+    const count = try self.terminal.screens.active.pages.prepend(&scratch.screens.active.pages);
     if (count > 0) {
         self.terminal.flags.dirty = .{ .clear = true };
         try self.terminal_stream.handler.queueRender();
