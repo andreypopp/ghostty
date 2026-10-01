@@ -3975,6 +3975,39 @@ fn promptClickLine(self: *Screen, click_pin: Pin) PromptClickMove {
 /// Dump the screen to a string. The writer given should be buffered;
 /// this function does not attempt to efficiently write and generally writes
 /// one byte at a time.
+// Foundation CharacterSet.whitespaces includes U+200B.
+fn anchorWhitespace(cp: u21) bool {
+    return switch (cp) {
+        0, 9, 0x20, 0xa0, 0x1680, 0x2000...0x200b, 0x202f, 0x205f, 0x3000 => true,
+        else => false,
+    };
+}
+
+pub fn viewportLogicalLines(self: *const Screen) usize {
+    var it = self.pages.getBottomRight(.screen).?.rowIterator(.left_up, self.pages.getTopLeft(.viewport));
+    var count: usize = 0;
+    while (it.next()) |pin| {
+        const row = pin.rowAndCell().row;
+        if (count != 0) {
+            if (!row.wrap) count += 1;
+            continue;
+        }
+        for (pin.node.page().getCells(row)) |*cell| {
+            const blank = blank: {
+                if (!anchorWhitespace(cell.codepoint())) break :blank false;
+                if (pin.node.page().lookupGrapheme(cell)) |graphemes| {
+                    for (graphemes) |cp| if (!anchorWhitespace(cp)) break :blank false;
+                }
+                break :blank true;
+            };
+            if (blank) continue;
+            count = 1;
+            break;
+        }
+    }
+    return count;
+}
+
 pub fn dumpString(
     self: *const Screen,
     writer: *std.Io.Writer,
@@ -4192,6 +4225,19 @@ pub fn testWriteString(self: *Screen, text: []const u8) !void {
             self.cursor.pending_wrap = true;
         }
     }
+}
+
+test "Screen viewport logical lines excludes blank suffix" {
+    const testing = std.testing;
+    var s = try Screen.init(testing.io, testing.allocator, .{ .cols = 5, .rows = 8, .max_scrollback = 1000 });
+    defer s.deinit();
+    try testing.expectEqual(@as(usize, 0), s.viewportLogicalLines());
+    try s.testWriteString("abcdefgh\n\nlast\n \u{00a0}\u{200b}\n");
+    try testing.expectEqual(@as(usize, 3), s.viewportLogicalLines());
+    s.pages.scroll(.{ .pin = s.pages.pin(.{ .screen = .{ .y = 1 } }).? });
+    try testing.expectEqual(@as(usize, 3), s.viewportLogicalLines());
+    try s.testWriteString(" \u{0301}");
+    try testing.expectEqual(@as(usize, 5), s.viewportLogicalLines());
 }
 
 test "Screen read and write" {

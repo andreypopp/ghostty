@@ -4938,6 +4938,13 @@ pub const CAPI = struct {
         surface.core_surface.io.processOutput(ptr[0..len]);
     }
 
+    export fn ghostty_surface_viewport_logical_lines(surface: *Surface) usize {
+        const state = &surface.core_surface.renderer_state;
+        state.mutex.lockUncancelable(global.io());
+        defer state.mutex.unlock(global.io());
+        return state.terminal.screens.active.viewportLogicalLines();
+    }
+
     export fn ghostty_surface_trim_history(surface: *Surface, rows: usize) usize {
         return surface.core_surface.io.trimHistory(rows);
     }
