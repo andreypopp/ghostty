@@ -849,6 +849,17 @@ pub fn processOutput(self: *Termio, buf: []const u8) void {
     if (self.pty_tee_cb) |cb| cb(self.pty_tee_userdata, buf.ptr, buf.len);
 }
 
+pub fn prependHistory(self: *Termio, bytes: []const u8) !usize {
+    self.renderer_state.mutex.lockUncancelable(global.io());
+    defer self.renderer_state.mutex.unlock(global.io());
+    const count = try self.terminal.prependHistory(self.alloc, bytes);
+    if (count > 0) {
+        self.terminal.flags.dirty = .{ .clear = true };
+        try self.terminal_stream.handler.queueRender();
+    }
+    return count;
+}
+
 /// Start a destructive replay on a surface that has not processed output.
 /// The caller must hold renderer_state.mutex until it finishes or cancels.
 pub fn beginKittyReplayRestoreLocked(self: *Termio) bool {

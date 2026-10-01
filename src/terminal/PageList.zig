@@ -1234,6 +1234,39 @@ pub fn clone(
     return result;
 }
 
+pub fn prepend(self: *PageList, source: *const PageList) !usize {
+    assert(self.cols == source.cols);
+    if (self.page_size + source.page_size > self.maxSize()) return 0;
+    var pending: List = .{};
+    errdefer while (pending.popFirst()) |node| self.destroyNode(node);
+    var count: usize = 0;
+    var it = source.pages.last;
+    while (it) |src| : (it = src.prev) {
+        const cap = src.capacity();
+        const node = try self.createPage(.{ .cap = cap });
+        errdefer self.destroyNode(node);
+        const page = node.page();
+        page.size.rows = src.rows();
+        page.size.cols = src.cols();
+        try page.cloneFrom(src.page(), 0, src.rows());
+        pending.prepend(node);
+        count += src.rows();
+    }
+    if (count == 0) return 0;
+    if (self.viewport == .top) {
+        self.viewport_pin.* = .{ .node = self.pages.first.? };
+        self.viewport = .{ .pin = {} };
+        self.viewport_pin_row_offset = 0;
+    }
+    if (self.viewport_pin_row_offset) |*offset| offset.* += count;
+    while (pending.pop()) |node| self.pages.prepend(node);
+    self.total_rows += count;
+    self.row_space_revision +%= 1;
+    self.page_compression.markActivity();
+    self.assertIntegrity();
+    return count;
+}
+
 /// Resize options
 pub const Resize = struct {
     /// The new cols/cells of the screen.

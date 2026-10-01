@@ -356,6 +356,85 @@ pub fn deinit(self: *Terminal, alloc: Allocator) void {
     self.* = undefined;
 }
 
+pub fn prependHistory(self: *Terminal, alloc: Allocator, bytes: []const u8) !usize {
+    if (self.screens.active_key != .primary or bytes.len == 0) return 0;
+    var scratch = try init(self.io(), alloc, .{
+        .cols = self.cols,
+        .rows = 1,
+        .max_scrollback = std.math.maxInt(usize),
+    });
+    defer scratch.deinit(alloc);
+    var stream = scratch.vtStream();
+    defer stream.deinit();
+    stream.nextSlice(bytes);
+    return self.screens.active.pages.prepend(&scratch.screens.active.pages);
+}
+
+test "Terminal prepend history preserves rows, styles and viewport" {
+    var t = try init(testing.io, testing.allocator, .{ .cols = 4, .rows = 2, .max_scrollback = 10_000_000 });
+    defer t.deinit(testing.allocator);
+    var stream = t.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("new\r\nend");
+    try testing.expectEqual(@as(usize, 2), try t.prependHistory(testing.allocator, "old\r\nmid"));
+    t.screens.active.pages.scroll(.{ .delta_row = -1 });
+    const before = t.screens.active.pages.getTopLeft(.viewport);
+    const tracked = try t.screens.active.pages.trackPin(before);
+    defer t.screens.active.pages.untrackPin(tracked);
+    const offset = t.screens.active.pages.scrollbar().offset;
+    try testing.expectEqual(@as(usize, 3), try t.prependHistory(testing.allocator, "\x1b[31mabcdefgh\r\nx"));
+    try testing.expect(t.screens.active.pages.getTopLeft(.viewport).eql(before));
+    try testing.expect(tracked.eql(before));
+    try testing.expectEqual(offset + 3, t.screens.active.pages.scrollbar().offset);
+    const first = t.screens.active.pages.getCell(.{ .screen = .{ .x = 0, .y = 0 } }).?;
+    try testing.expectEqual(@as(u21, 'a'), first.cell.content.codepoint.data);
+    try testing.expect(first.cell.style_id != style.default_id);
+    try testing.expect(first.node.page().getRow(0).wrap);
+    const text = try t.screens.active.dumpStringAllocUnwrapped(testing.allocator, .{ .screen = .{} });
+    defer testing.allocator.free(text);
+    try testing.expectEqualStrings("abcdefgh\nx\nold\nmid\nnew\nend", text);
+}
+
+test "Terminal prepend history multiple pages in order" {
+    var t = try init(testing.io, testing.allocator, .{ .cols = 80, .rows = 2, .max_scrollback = 100_000_000 });
+    defer t.deinit(testing.allocator);
+    var expected: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer expected.deinit();
+    for (0..30_000) |i| try expected.writer.print("{d}\n", .{i});
+    var chunk: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer chunk.deinit();
+    for (0..6) |batch| {
+        chunk.clearRetainingCapacity();
+        const start = (5 - batch) * 5000;
+        for (start..start + 5000) |i| {
+            if (i > start) try chunk.writer.writeAll("\r\n");
+            try chunk.writer.print("{d}", .{i});
+        }
+        try testing.expectEqual(@as(usize, 5000), try t.prependHistory(testing.allocator, chunk.written()));
+    }
+    const text = try t.screens.active.dumpStringAllocUnwrapped(testing.allocator, .{ .screen = .{} });
+    defer testing.allocator.free(text);
+    try testing.expectEqualStrings(expected.written()[0 .. expected.written().len - 1], text);
+}
+
+test "Terminal prepend history preserves top viewport and enforces limit" {
+    var t = try init(testing.io, testing.allocator, .{ .cols = 80, .rows = 2, .max_scrollback = 10_000_000 });
+    defer t.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 1), try t.prependHistory(testing.allocator, "old"));
+    t.screens.active.pages.scroll(.top);
+    const before = t.screens.active.pages.getTopLeft(.viewport);
+    try testing.expectEqual(@as(usize, 1), try t.prependHistory(testing.allocator, "older"));
+    try testing.expect(t.screens.active.pages.getTopLeft(.viewport).eql(before));
+    t.screens.active.pages.explicit_max_size = 0;
+    const total = t.screens.active.pages.total_rows;
+    try testing.expectEqual(@as(usize, 0), try t.prependHistory(testing.allocator, "blocked"));
+    try testing.expectEqual(total, t.screens.active.pages.total_rows);
+    var stream = t.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("\x1b[?1049h");
+    try testing.expectEqual(@as(usize, 0), try t.prependHistory(testing.allocator, "alternate"));
+}
+
 /// Return a terminal.Stream that can process VT streams and update this
 /// terminal state. The streams will only process read-only data that
 /// modifies terminal state.
