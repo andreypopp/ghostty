@@ -7289,28 +7289,15 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
                 break :search;
             }
 
-            _ = s.state.mailbox.push(
-                global.io(),
-                .{ .change_needle = try .init(
-                    self.alloc,
-                    text,
-                ) },
-                .forever,
-            );
-            s.state.wakeup.notify() catch {};
+            try s.state.submit(.{ .change_needle = try .init(self.alloc, text) });
         },
 
         .navigate_search => |nav| {
             const s: *Search = if (self.search) |*s| s else return false;
-            _ = s.state.mailbox.push(
-                global.io(),
-                .{ .select = switch (nav) {
-                    .next => .next,
-                    .previous => .prev,
-                } },
-                .forever,
-            );
-            s.state.wakeup.notify() catch {};
+            try s.state.submit(.{ .select = switch (nav) {
+                .next => .next,
+                .previous => .prev,
+            } });
         },
 
         .copy_to_clipboard => |format| {
@@ -10225,5 +10212,61 @@ test "Surface: oversized soft-wrapped URL candidate is rejected" {
             pin,
             null,
         )) == null);
+    }
+}
+
+test "search sender accepts input and stops against full app capacity" {
+    const testing = std.testing;
+    const Context = struct {
+        search: *Search,
+        mailbox: apprt.surface.Mailbox,
+        reached: std.Io.Event = .unset,
+        delivered: std.Io.Event = .unset,
+        fn wakeup(ud: ?*anyopaque) callconv(.c) void {
+            const c: *@This() = @ptrCast(@alignCast(ud.?));
+            c.reached.set(global.io());
+        }
+        fn event(value: terminal.search.Thread.Event, ud: ?*anyopaque) void {
+            const c: *@This() = @ptrCast(@alignCast(ud.?));
+            switch (value) {
+                .total_matches => |n| {
+                    c.search.surfaceMessage(c.mailbox, .{ .search_total = n });
+                    if (!c.search.stopping.load(.acquire)) c.delivered.set(global.io());
+                },
+                else => {},
+            }
+        }
+    };
+    for ([_]bool{ false, true }) |drain_app| {
+        var mutex: std.Io.Mutex = .init;
+        var t: terminal.Terminal = try .init(testing.io, testing.allocator, .{ .cols = 20, .rows = 2 });
+        defer t.deinit(testing.allocator);
+        var search: Search = undefined;
+        var surface: Surface = undefined;
+        var rt_app: apprt.App = undefined;
+        var queue: App.Mailbox.Queue = .{};
+        var retry = std.atomic.Value(bool).init(false);
+        var context: Context = .{
+            .search = &search,
+            .mailbox = .{ .surface = &surface, .app = .{ .rt_app = &rt_app, .mailbox = &queue, .redraw_retry_requested = &retry } },
+        };
+        rt_app.opts = undefined;
+        rt_app.opts.userdata = &context;
+        rt_app.opts.wakeup = Context.wakeup;
+        for (0..64) |_| _ = queue.push(global.io(), .open_config, .instant);
+        search = .{
+            .state = try .init(testing.allocator, .{ .mutex = &mutex, .terminal = &t, .event_cb = Context.event, .event_userdata = &context }),
+            .thread = undefined,
+        };
+        search.thread = try .spawn(.{}, terminal.search.Thread.threadMain, .{&search.state});
+        try search.state.submit(.{ .change_needle = try .init(testing.allocator, @as([]const u8, "world")) });
+        try context.reached.waitTimeout(global.io(), .{ .duration = .{ .clock = .awake, .raw = .fromSeconds(2) } });
+        try testing.expectEqual(64, queue.count(global.io()));
+        for (0..256) |i| try search.state.submit(.{ .select = if (i % 2 == 0) .next else .prev });
+        if (drain_app) {
+            while (queue.pop(global.io())) |_| {}
+            try context.delivered.waitTimeout(global.io(), .{ .duration = .{ .clock = .awake, .raw = .fromSeconds(2) } });
+        }
+        search.deinit();
     }
 }

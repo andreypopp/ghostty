@@ -17,7 +17,6 @@ const Mutex = std.Io.Mutex;
 const global = @import("../../global.zig");
 const xev = global.xev;
 const internal_os = @import("../../os/main.zig");
-const BlockingQueue = @import("../../datastruct/main.zig").BlockingQueue;
 const MessageData = @import("../../datastruct/main.zig").MessageData;
 const point = @import("../point.zig");
 const FlattenedHighlight = @import("../highlight.zig").Flattened;
@@ -47,9 +46,11 @@ const REFRESH_INTERVAL = 24; // 40 FPS
 /// Allocator used for some state
 alloc: std.mem.Allocator,
 
-/// The mailbox that can be used to send this thread messages. Note
-/// this is a blocking queue so if it is full you will get errors (or block).
-mailbox: *Mailbox,
+mailbox: struct {
+    mutex: Mutex = .init,
+    pending: std.ArrayList(Message) = .empty,
+    batch: std.ArrayList(Message) = .empty,
+} = .{},
 
 /// The event loop for the search thread.
 loop: xev.Loop,
@@ -81,10 +82,6 @@ opts: Options,
 /// up all the internal state necessary prior to starting the thread. It
 /// is up to the caller to start the thread with the threadMain entrypoint.
 pub fn init(alloc: Allocator, opts: Options) !Thread {
-    // The mailbox for messaging this thread
-    var mailbox = try Mailbox.create(alloc);
-    errdefer mailbox.destroy(alloc);
-
     // Create our event loop.
     var loop = try xev.Loop.init(.{});
     errdefer loop.deinit();
@@ -103,13 +100,22 @@ pub fn init(alloc: Allocator, opts: Options) !Thread {
 
     return .{
         .alloc = alloc,
-        .mailbox = mailbox,
         .loop = loop,
         .wakeup = wakeup_h,
         .stop = stop_h,
         .refresh = refresh_h,
         .opts = opts,
     };
+}
+
+pub fn submit(self: *Thread, message: Message) !void {
+    errdefer message.deinit();
+    {
+        self.mailbox.mutex.lockUncancelable(global.io());
+        defer self.mailbox.mutex.unlock(global.io());
+        try self.mailbox.pending.append(self.alloc, message);
+    }
+    self.wakeup.notify() catch {};
 }
 
 /// Clean up the thread. This is only safe to call once the thread
@@ -119,8 +125,10 @@ pub fn deinit(self: *Thread) void {
     self.wakeup.deinit();
     self.stop.deinit();
     self.loop.deinit();
-    // Nothing can possibly access the mailbox anymore, destroy it.
-    self.mailbox.destroy(self.alloc);
+    for (self.mailbox.pending.items) |message| message.deinit();
+    self.mailbox.pending.deinit(self.alloc);
+    for (self.mailbox.batch.items) |message| message.deinit();
+    self.mailbox.batch.deinit(self.alloc);
 
     if (self.search) |*s| {
         self.opts.mutex.lockUncancelable(global.io());
@@ -183,10 +191,6 @@ fn threadMain_(self: *Thread) !void {
     while (true) {
         // If our loop is canceled then we drain our messages and quit.
         if (self.loop.stopped()) {
-            while (self.mailbox.pop(global.io())) |message| {
-                log.debug("mailbox message ignored during shutdown={}", .{message});
-            }
-
             return;
         }
 
@@ -243,13 +247,22 @@ fn threadMain_(self: *Thread) !void {
 
 /// Drain the mailbox.
 fn drainMailbox(self: *Thread) !void {
-    while (self.mailbox.pop(global.io())) |message| {
-        log.debug("mailbox message={}", .{message});
+    {
+        self.mailbox.mutex.lockUncancelable(global.io());
+        defer self.mailbox.mutex.unlock(global.io());
+        std.debug.assert(self.mailbox.batch.items.len == 0);
+        std.mem.swap(std.ArrayList(Message), &self.mailbox.pending, &self.mailbox.batch);
+    }
+    var processed: usize = 0;
+    defer {
+        for (self.mailbox.batch.items[processed..]) |message| message.deinit();
+        self.mailbox.batch.clearRetainingCapacity();
+    }
+    for (self.mailbox.batch.items) |message| {
+        processed += 1;
+        defer message.deinit();
         switch (message) {
-            .change_needle => |v| {
-                defer v.deinit();
-                try self.changeNeedle(v.slice());
-            },
+            .change_needle => |v| try self.changeNeedle(v.slice()),
             .select => |v| try self.select(v),
         }
     }
@@ -459,9 +472,6 @@ pub const Options = struct {
 
 pub const EventCallback = *const fn (event: Event, userdata: ?*anyopaque) void;
 
-/// The type used for sending messages to the thread.
-pub const Mailbox = BlockingQueue(Message, 64);
-
 /// The messages that can be sent to the thread.
 pub const Message = union(enum) {
     /// Represents a write request. Magic number comes from the max size
@@ -475,6 +485,13 @@ pub const Message = union(enum) {
 
     /// Select a search result.
     select: ScreenSearch.Select,
+
+    fn deinit(self: Message) void {
+        switch (self) {
+            .change_needle => |v| v.deinit(),
+            .select => {},
+        }
+    }
 };
 
 /// Events that can be emitted from the search thread. The caller
@@ -913,15 +930,7 @@ test {
     );
 
     // Start our search
-    _ = thread.mailbox.push(
-        io,
-        .{ .change_needle = try .init(
-            alloc,
-            @as([]const u8, "world"),
-        ) },
-        .forever,
-    );
-    try thread.wakeup.notify();
+    try thread.submit(.{ .change_needle = try .init(alloc, @as([]const u8, "world")) });
 
     // Wait for completion
     try ud.reset.waitTimeout(testing.io, .{ .duration = .{ .clock = .awake, .raw = .fromMilliseconds(100) } });
@@ -974,4 +983,69 @@ test "select after active screen removal" {
     try thread.select(.next);
     try testing.expectEqual(ScreenSet.Key.primary, thread.search.?.last_screen.key);
     try testing.expect(!thread.search.?.screens.contains(.alternate));
+}
+
+test "search input accepts 256 requests without consumer progress" {
+    var mutex: std.Io.Mutex = .init;
+    var t: Terminal = try .init(testing.io, testing.allocator, .{ .cols = 20, .rows = 2 });
+    defer t.deinit(testing.allocator);
+    var thread: Thread = try .init(testing.allocator, .{ .mutex = &mutex, .terminal = &t });
+    defer thread.deinit();
+    for (0..256) |i| {
+        if (i == 64) std.debug.print("search input: submitting request 65 with consumer gated\n", .{});
+        try thread.submit(.{ .select = if (i % 2 == 0) .next else .prev });
+    }
+    for (0..256) |i| {
+        const message = thread.mailbox.pending.items[i];
+        try testing.expectEqual(if (i % 2 == 0) ScreenSearch.Select.next else .prev, message.select);
+    }
+    try testing.expectEqual(256, thread.mailbox.pending.items.len);
+}
+
+test "search input frees heap needles on stop and allocation failure" {
+    const Probe = struct {
+        fn run(alloc: Allocator) !void {
+            var mutex: std.Io.Mutex = .init;
+            var t: Terminal = try .init(testing.io, testing.allocator, .{ .cols = 20, .rows = 2 });
+            defer t.deinit(testing.allocator);
+            var thread: Thread = try .init(alloc, .{ .mutex = &mutex, .terminal = &t });
+            defer thread.deinit();
+            const needle = [_]u8{'a'} ** 300;
+            for (0..8) |_| try thread.submit(.{ .change_needle = try .init(alloc, @as([]const u8, &needle)) });
+            try thread.drainMailbox();
+            for (0..8) |_| try thread.submit(.{ .change_needle = try .init(alloc, @as([]const u8, &needle)) });
+        }
+    };
+    try testing.checkAllAllocationFailures(testing.allocator, Probe.run, .{});
+}
+
+test "search input detached batch preserves needle and navigation order" {
+    var mutex: std.Io.Mutex = .init;
+    var t: Terminal = try .init(testing.io, testing.allocator, .{ .cols = 20, .rows = 2 });
+    defer t.deinit(testing.allocator);
+    var stream = t.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("world world");
+    var thread: Thread = try .init(testing.allocator, .{ .mutex = &mutex, .terminal = &t });
+    defer thread.deinit();
+    try thread.submit(.{ .change_needle = try .init(testing.allocator, @as([]const u8, "world")) });
+    try thread.drainMailbox();
+    for (0..100) |_| {
+        const active = &thread.search.?;
+        if (active.isComplete()) break;
+        if (active.tick() == .blocked) {
+            mutex.lockUncancelable(global.io());
+            defer mutex.unlock(global.io());
+            active.feed(testing.allocator, &t);
+        }
+    }
+    try testing.expect(thread.search.?.isComplete());
+    for (0..256) |i| try thread.submit(.{ .select = if (i % 2 == 0) .next else .prev });
+    try thread.drainMailbox();
+    try testing.expectEqual(1, thread.search.?.screens.getPtr(.primary).?.selected.?.idx);
+    const needle = [_]u8{'a'} ** 300;
+    try thread.submit(.{ .change_needle = try .init(testing.allocator, @as([]const u8, &needle)) });
+    try thread.submit(.{ .change_needle = try .init(testing.allocator, @as([]const u8, "latest")) });
+    try thread.drainMailbox();
+    try testing.expectEqualStrings("latest", thread.search.?.viewport.needle());
 }
