@@ -4954,7 +4954,15 @@ pub const CAPI = struct {
         }
         bottom.x = screen.pages.cols - 1;
         text.* = std.mem.zeroes(Text);
-        _ = readTextLocked(surface, terminal.Selection.init(top, bottom, false), text);
+        const value = screen.selectionString(global.alloc(), .{
+            .sel = terminal.Selection.init(top, bottom, false),
+            .trim = false,
+        }) catch |err| {
+            log.warn("error reading text err={}", .{err});
+            return screen.viewportLogicalLines();
+        };
+        text.text = value.ptr;
+        text.text_len = value.len;
         return screen.viewportLogicalLines();
     }
 
