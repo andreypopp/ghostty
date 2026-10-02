@@ -335,12 +335,9 @@ pub const ScreenSearch = struct {
             // change the state.
             .active, .history => {},
 
-            // Feed goes back to searching history.
-            .history_feed => self.state = .history,
-
-            // If we're complete then the feed call above should always
-            // return false and we can't reach this.
-            .complete => unreachable,
+            // Feed goes back to searching history. A complete search
+            // resumes when PageList.prepend adds older history.
+            .history_feed, .complete => self.state = .history,
         }
     }
 
@@ -1011,6 +1008,26 @@ test "simple search with history" {
             .y = 0,
         } }, t.screens.active.pages.pointFromPin(.screen, sel.end).?);
     }
+}
+
+test "complete search resumes into prepended history" {
+    const alloc = testing.allocator;
+    var t: Terminal = try .init(testing.io, alloc, .{ .cols = 10, .rows = 2, .max_scrollback = std.math.maxInt(usize) });
+    defer t.deinit(alloc);
+    const list: *PageList = &t.screens.active.pages;
+    var s = t.vtStream();
+    defer s.deinit();
+    s.nextSlice("Fizz\r\n");
+    while (list.totalPages() < 3) s.nextSlice("\r\n");
+    var search: ScreenSearch = try .init(alloc, t.screens.active, "Fizz");
+    defer search.deinit();
+    try search.searchAll();
+    try testing.expect(search.state.isComplete());
+    try testing.expectEqual(1, search.matchesLen());
+    try testing.expectEqual(2, try t.prependHistory(alloc, "Fizz\r\nold"));
+    try search.feed();
+    try search.searchAll();
+    try testing.expectEqual(2, search.matchesLen());
 }
 
 test "reload active with history change" {
