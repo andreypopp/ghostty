@@ -1474,7 +1474,7 @@ GHOSTTY_API void ghostty_surface_set_external_frame_context(ghostty_surface_t,
 GHOSTTY_API bool ghostty_surface_release_external_frame(ghostty_surface_t,
                                                         uint64_t frame_token);
 GHOSTTY_API void ghostty_surface_raise_scrollback_limit(ghostty_surface_t);
-GHOSTTY_API uintptr_t ghostty_surface_viewport_logical_lines(ghostty_surface_t);
+GHOSTTY_API uintptr_t ghostty_surface_viewport_anchor(ghostty_surface_t, ghostty_text_s*);
 GHOSTTY_API uintptr_t ghostty_surface_trim_history(ghostty_surface_t, uintptr_t);
 GHOSTTY_API uintptr_t ghostty_surface_prepend_history(ghostty_surface_t, const char *, uintptr_t);
 GHOSTTY_API bool ghostty_surface_scrollbar(ghostty_surface_t,

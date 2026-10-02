@@ -4938,11 +4938,24 @@ pub const CAPI = struct {
         surface.core_surface.io.processOutput(ptr[0..len]);
     }
 
-    export fn ghostty_surface_viewport_logical_lines(surface: *Surface) usize {
+    export fn ghostty_surface_viewport_anchor(surface: *Surface, text: *Text) usize {
         const state = &surface.core_surface.renderer_state;
         state.mutex.lockUncancelable(global.io());
         defer state.mutex.unlock(global.io());
-        return state.terminal.screens.active.viewportLogicalLines();
+        const screen = state.terminal.screens.active;
+        var top = screen.pages.getTopLeft(.viewport);
+        while (top.up(1)) |previous| {
+            if (!previous.rowAndCell().row.wrap) break;
+            top = previous;
+        }
+        var bottom = top;
+        while (bottom.rowAndCell().row.wrap) {
+            bottom = bottom.down(1) orelse break;
+        }
+        bottom.x = screen.pages.cols - 1;
+        text.* = std.mem.zeroes(Text);
+        _ = readTextLocked(surface, terminal.Selection.init(top, bottom, false), text);
+        return screen.viewportLogicalLines();
     }
 
     export fn ghostty_surface_trim_history(surface: *Surface, rows: usize) usize {
