@@ -362,7 +362,7 @@ pub fn trimHistory(self: *Terminal, rows: usize) usize {
     if (screen.selection != null) return 0;
     const pages = &screen.pages;
     const bar = pages.scrollbar();
-    var count = @min(rows, bar.offset);
+    var count = @min(rows, bar.offset, pages.total_rows - pages.rows);
     while (count > 0) {
         const cell = pages.getCell(.{ .history = .{ .y = @intCast(count - 1) } }).?;
         if (!cell.row.wrap) break;

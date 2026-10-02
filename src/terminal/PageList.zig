@@ -1236,7 +1236,7 @@ pub fn clone(
 
 pub fn prepend(self: *PageList, source: *const PageList) !usize {
     assert(self.cols == source.cols);
-    if (self.page_size + source.page_size > self.maxSize()) return 0;
+    if (source.total_rows == 0 or self.page_size + source.page_size > self.maxSize()) return 0;
     var pending: List = .{};
     errdefer while (pending.popFirst()) |node| self.destroyNode(node);
     var count: usize = 0;
@@ -1252,10 +1252,9 @@ pub fn prepend(self: *PageList, source: *const PageList) !usize {
         pending.prepend(node);
         count += src.rows();
     }
-    if (count == 0) return 0;
     if (self.viewport == .top) {
         self.viewport_pin.* = .{ .node = self.pages.first.? };
-        self.viewport = .{ .pin = {} };
+        self.viewport = if (self.pinIsActive(self.viewport_pin.*)) .active else .{ .pin = {} };
         self.viewport_pin_row_offset = 0;
     }
     if (self.viewport_pin_row_offset) |*offset| offset.* += count;
