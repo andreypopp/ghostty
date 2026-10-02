@@ -127,6 +127,7 @@ pub const StreamHandler = struct {
 
     /// Mailbox for the surface.
     surface_mailbox: apprt.surface.Mailbox,
+    stopping: std.atomic.Value(bool) = .init(false),
 
     /// The shared render state
     renderer_state: *renderer.State,
@@ -232,7 +233,7 @@ pub const StreamHandler = struct {
             }
             self.renderer_state.mutex.unlock(global.io());
             defer self.renderer_state.mutex.lockUncancelable(global.io());
-            _ = self.surface_mailbox.push(msg, .{ .forever = {} });
+            if (!self.surface_mailbox.pushUntilStopped(msg, &self.stopping)) discardSurfaceMessage(msg);
         }
     }
 
@@ -1860,4 +1861,49 @@ test "pwd change keeps scrollbar from OSC stream position" {
     try std.testing.expectEqual(@as(usize, 0), marker_scrollbar.offset);
     try std.testing.expectEqual(.primary, marker.pwd_change.screen_key);
     try std.testing.expectEqual(@as(usize, 0), marker.pwd_change.screen_generation);
+}
+
+test "stopping parser frees owning messages against full app capacity" {
+    const testing = std.testing;
+    const Context = struct {
+        handler: *StreamHandler,
+        fn wakeup(ud: ?*anyopaque) callconv(.c) void {
+            const c: *@This() = @ptrCast(@alignCast(ud.?));
+            c.handler.stopping.store(true, .release);
+        }
+    };
+    var handler: StreamHandler = undefined;
+    var context: Context = .{ .handler = &handler };
+    var app: apprt.App = undefined;
+    app.opts = undefined;
+    app.opts.userdata = &context;
+    app.opts.wakeup = Context.wakeup;
+    var surface: @import("../Surface.zig") = undefined;
+    var queue: @import("../App.zig").Mailbox.Queue = .{};
+    var retry = std.atomic.Value(bool).init(false);
+    handler.surface_mailbox = .{ .surface = &surface, .app = .{ .rt_app = &app, .mailbox = &queue, .redraw_retry_requested = &retry } };
+    handler.stopping = .init(false);
+    handler.kitty_replay_tracking = false;
+    var mutex: std.Io.Mutex = .init;
+    var state: renderer.State = .{ .mutex = &mutex, .terminal = undefined };
+    handler.renderer_state = &state;
+    mutex.lockUncancelable(global.io());
+    defer mutex.unlock(global.io());
+    for (0..64) |_| _ = queue.push(global.io(), .open_config, .instant);
+    const bytes = [_]u8{'a'} ** 300;
+    handler.surfaceMessageWriter(.{ .clipboard_write = .{ .clipboard_type = .standard, .req = try .init(testing.allocator, @as([]const u8, &bytes)) } });
+    handler.surfaceMessageWriter(.{ .tmux_control = .{ .event = .pane_output, .data = try .init(testing.allocator, @as([]const u8, &bytes)) } });
+    handler.surfaceMessageWriter(.{ .pwd_change = .{
+        .pwd = try .init(testing.allocator, @as([]const u8, &bytes)),
+        .scrollbar = .{ .total = 0, .offset = 0, .len = 0, .row_space_revision = 0 },
+        .screen_key = .primary,
+        .screen_generation = 0,
+    } });
+    try testing.expectEqual(64, queue.count(global.io()));
+    while (queue.pop(global.io())) |_| {}
+    handler.stopping.store(false, .release);
+    handler.surfaceMessageWriter(.{ .clipboard_write = .{ .clipboard_type = .standard, .req = try .init(testing.allocator, @as([]const u8, &bytes)) } });
+    const accepted = queue.pop(global.io()).?.surface_message.message;
+    discardSurfaceMessage(accepted);
+    try testing.expectEqual(0, queue.count(global.io()));
 }

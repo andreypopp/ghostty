@@ -429,6 +429,7 @@ pub fn threadEnter(
         .loop = &thread.loop,
         .renderer_state = self.renderer_state,
         .surface_mailbox = self.surface_mailbox,
+        .stopping = &self.terminal_stream.handler.stopping,
         .mailbox = &self.mailbox,
         .backend = undefined, // Backend must replace this on threadEnter
     };
@@ -498,6 +499,7 @@ fn queueMessageManual(self: *Termio, msg: termio.Message) void {
         .loop = undefined,
         .renderer_state = self.renderer_state,
         .surface_mailbox = self.surface_mailbox,
+        .stopping = &self.terminal_stream.handler.stopping,
         .backend = .{ .manual = .{} },
         .mailbox = &self.mailbox,
     };
@@ -706,6 +708,7 @@ pub fn resize(
     if (comptime builtin.os.tag == .ios) {
         _ = self.renderer_mailbox.push(global.io(), .{ .resize = size }, .{ .instant = {} });
     } else {
+        try self.renderer_wakeup.notify();
         _ = self.renderer_mailbox.push(global.io(), .{ .resize = size }, .{ .forever = {} });
     }
     self.renderer_wakeup.notify() catch {};
@@ -1050,6 +1053,7 @@ pub const ThreadData = struct {
 
     /// Mailboxes for different threads
     surface_mailbox: apprt.surface.Mailbox,
+    stopping: *const std.atomic.Value(bool),
 
     /// Data associated with the backend implementation (i.e. pty/exec state)
     backend: termio.backend.ThreadData,

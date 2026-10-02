@@ -164,6 +164,13 @@ pub const Mailbox = struct {
     surface: *Surface,
     app: App.Mailbox,
 
+    pub fn pushUntilStopped(self: Mailbox, msg: Message, stopping: *const std.atomic.Value(bool)) bool {
+        while (!stopping.load(.acquire)) {
+            if (self.push(msg, .{ .ns = 10 * std.time.ns_per_ms }) != 0) return true;
+        }
+        return false;
+    }
+
     /// Send a message to the surface.
     pub fn push(
         self: Mailbox,
