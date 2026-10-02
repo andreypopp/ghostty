@@ -1499,13 +1499,16 @@ GHOSTTY_API uint64_t ghostty_surface_search_generation(ghostty_surface_t);
 // a render-space translation only: terminal state and the PTY-visible grid
 // are unaffected, it is forced to zero on the alternate screen, and any other
 // viewport move resets it to zero. Arguments: row, pixel offset, expected
-// row-space revision, out scrollbar snapshot.
+// row-space revision, required out scrollbar snapshot and signed viewport delta
+// ((total - len - offset) after minus before). False leaves both outputs and
+// viewport unchanged; a committed mutation returns true even if waking fails.
 GHOSTTY_API bool ghostty_surface_scroll_to_row_pixel_if_revision(
     ghostty_surface_t,
     uint64_t,
     float,
     uint64_t,
-    ghostty_surface_scrollbar_s*);
+    ghostty_surface_scrollbar_s*,
+    int64_t*);
 GHOSTTY_API uint64_t ghostty_surface_foreground_pid(ghostty_surface_t);
 GHOSTTY_API ghostty_string_s ghostty_surface_tty_name(ghostty_surface_t);
 // cmux fork: export the Ghostty grid as a compact render-grid JSON frame for

@@ -3481,20 +3481,22 @@ pub const CAPI = struct {
         pixel_offset: f32,
         expected_row_space_revision: u64,
         result: *SurfaceScrollbar,
+        viewport_delta: *i64,
     ) bool {
         const target_row = std.math.cast(usize, row) orelse return false;
-        const maybe_snapshot = surface.core_surface.scrollToRowPixelIfRevision(
+        const committed = surface.core_surface.scrollToRowPixelIfRevision(
             target_row,
             pixel_offset,
             expected_row_space_revision,
-        ) catch return false;
-        const snapshot = maybe_snapshot orelse return false;
+        ) orelse return false;
+        const snapshot = committed.position;
         result.* = .{
             .total = snapshot.total,
             .offset = snapshot.offset,
             .len = snapshot.len,
             .row_space_revision = snapshot.row_space_revision,
         };
+        viewport_delta.* = committed.viewport_delta;
         return true;
     }
 
@@ -5902,6 +5904,36 @@ test "font size action callback preserves resolved action events" {
     );
     try std.testing.expect(!observation.previous_adjusted);
     try std.testing.expect(observation.current_adjusted);
+}
+
+test "pixel scroll C boundary publishes both outputs only after commit" {
+    const testing = std.testing;
+    var mutex: std.Io.Mutex = .init;
+    var t: terminal.Terminal = try .init(testing.io, testing.allocator, .{ .cols = 20, .rows = 2 });
+    defer t.deinit(testing.allocator);
+    var stream = t.vtStream();
+    defer stream.deinit();
+    for (0..40) |_| stream.nextSlice("row\r\n");
+    var surface: Surface = undefined;
+    surface.core_surface.id = 42;
+    surface.core_surface.renderer_state = .{ .mutex = &mutex, .terminal = &t };
+    surface.core_surface.renderer_thread.wakeup = try .init();
+    defer surface.core_surface.renderer_thread.wakeup.deinit();
+    const sb = t.screens.active.pages.scrollbar();
+    const revision = surface.core_surface.rowSpaceIdentity(.primary, t.screens.generation(.primary), sb.row_space_revision);
+    var result: CAPI.SurfaceScrollbar = .{ .total = 123, .offset = 456, .len = 789, .row_space_revision = 987 };
+    const unchanged = result;
+    var delta: i64 = 321;
+    try testing.expect(!CAPI.ghostty_surface_scroll_to_row_pixel_if_revision(&surface, 0, 0, revision + 1, &result, &delta));
+    try testing.expectEqualDeep(unchanged, result);
+    try testing.expectEqual(321, delta);
+    try testing.expect(!CAPI.ghostty_surface_scroll_to_row_pixel_if_revision(&surface, 0, std.math.inf(f32), revision, &result, &delta));
+    try testing.expectEqualDeep(unchanged, result);
+    try testing.expectEqual(321, delta);
+    try testing.expect(CAPI.ghostty_surface_scroll_to_row_pixel_if_revision(&surface, sb.total - sb.len - 20, 2.5, revision, &result, &delta));
+    try testing.expectEqual(20, delta);
+    try testing.expectEqual(20, result.total - result.len - result.offset);
+    try testing.expectEqual(2.5, t.screens.active.pages.viewport_pixel_offset);
 }
 
 test "search delivery epoch advances on start and both public stops" {

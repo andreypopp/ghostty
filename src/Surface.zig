@@ -2324,6 +2324,11 @@ pub const AbsoluteScrollSnapshot = struct {
     row_space_revision: u64,
 };
 
+pub const PixelScrollResult = struct {
+    position: AbsoluteScrollSnapshot,
+    viewport_delta: i64,
+};
+
 /// Bound for the fractional pixel scroll offset accepted from embedders.
 /// This is far larger than any cell height; it only guards against wildly
 /// wrong values (the offset is a render-space translation, so an absurd
@@ -2353,7 +2358,7 @@ pub fn scrollToRowPixelIfRevision(
     row: usize,
     pixel_offset: f32,
     expected_row_space_revision: u64,
-) !?AbsoluteScrollSnapshot {
+) ?PixelScrollResult {
     if (!std.math.isFinite(pixel_offset)) return null;
     const clamped = std.math.clamp(
         pixel_offset,
@@ -2361,7 +2366,7 @@ pub fn scrollToRowPixelIfRevision(
         max_viewport_pixel_offset,
     );
 
-    const snapshot: AbsoluteScrollSnapshot = snapshot: {
+    const result: PixelScrollResult = result: {
         self.renderer_state.lockDemand(global.io());
         defer self.renderer_state.unlockDemand(global.io());
 
@@ -2374,6 +2379,8 @@ pub fn scrollToRowPixelIfRevision(
             scrollbar.row_space_revision,
         );
         if (revision != expected_row_space_revision) return null;
+        const history = std.math.cast(i64, scrollbar.total - scrollbar.len) orelse return null;
+        const before = history - @as(i64, @intCast(scrollbar.offset));
 
         // scroll() resets the pixel offset, so set it afterwards while
         // still holding the lock.
@@ -2383,19 +2390,22 @@ pub fn scrollToRowPixelIfRevision(
         }
 
         scrollbar = screens.active.pages.scrollbar();
-        break :snapshot .{
-            .total = @intCast(scrollbar.total),
-            .offset = @intCast(scrollbar.offset),
-            .len = @intCast(scrollbar.len),
-            .row_space_revision = self.rowSpaceIdentity(
-                screen_key,
-                screens.generation(screen_key),
-                scrollbar.row_space_revision,
-            ),
+        break :result .{
+            .viewport_delta = @as(i64, @intCast(scrollbar.total - scrollbar.len)) - @as(i64, @intCast(scrollbar.offset)) - before,
+            .position = .{
+                .total = @intCast(scrollbar.total),
+                .offset = @intCast(scrollbar.offset),
+                .len = @intCast(scrollbar.len),
+                .row_space_revision = self.rowSpaceIdentity(
+                    screen_key,
+                    screens.generation(screen_key),
+                    scrollbar.row_space_revision,
+                ),
+            },
         };
     };
-    try self.queueRender();
-    return snapshot;
+    self.queueRender() catch |err| log.warn("failed to queue render after pixel scroll err={}", .{err});
+    return result;
 }
 
 /// Scroll to an absolute row only while the caller's row-space identity is
@@ -10263,6 +10273,53 @@ test "search lifetime rejects queued obsolete core notifications" {
     try std.testing.expectEqual(2, context.actions);
     try surface.handleMessage(.{ .search_total = .{ .generation = 3, .value = 5 } });
     try std.testing.expectEqual(3, context.actions);
+}
+
+test "pixel scroll returns atomic signed viewport movement" {
+    const testing = std.testing;
+    var mutex: std.Io.Mutex = .init;
+    var t: terminal.Terminal = try .init(testing.io, testing.allocator, .{ .cols = 20, .rows = 2 });
+    defer t.deinit(testing.allocator);
+    var stream = t.vtStream();
+    defer stream.deinit();
+    for (0..100) |i| {
+        var buf: [32]u8 = undefined;
+        const line = try std.fmt.bufPrint(&buf, "row-{d}\r\n", .{i});
+        stream.nextSlice(line);
+    }
+    var surface: Surface = undefined;
+    surface.id = 42;
+    surface.renderer_state = .{ .mutex = &mutex, .terminal = &t };
+    surface.renderer_thread.wakeup = try .init();
+    defer surface.renderer_thread.wakeup.deinit();
+    var sb = t.screens.active.pages.scrollbar();
+    t.screens.active.scroll(.{ .row = sb.total - sb.len - 21 });
+    for (0..10) |_| stream.nextSlice("growth\r\n");
+    sb = t.screens.active.pages.scrollbar();
+    try testing.expectEqual(31, sb.total - sb.len - sb.offset);
+    const revision = surface.rowSpaceIdentity(.primary, t.screens.generation(.primary), sb.row_space_revision);
+    const applied = surface.scrollToRowPixelIfRevision(sb.total - sb.len - 20, 3.5, revision).?;
+    try testing.expectEqual(-11, applied.viewport_delta);
+    try testing.expectEqual(20, applied.position.total - applied.position.len - applied.position.offset);
+    try testing.expectEqual(3.5, t.screens.active.pages.viewport_pixel_offset);
+    const zero = surface.scrollToRowPixelIfRevision(sb.total - sb.len - 20, 0, revision).?;
+    try testing.expectEqual(0, zero.viewport_delta);
+    const positive = surface.scrollToRowPixelIfRevision(sb.total - sb.len - 25, 0, revision).?;
+    try testing.expectEqual(5, positive.viewport_delta);
+    const unchanged = t.screens.active.pages.scrollbar();
+    try testing.expect(surface.scrollToRowPixelIfRevision(0, 1, revision + 1) == null);
+    try testing.expect(surface.scrollToRowPixelIfRevision(0, std.math.nan(f32), revision) == null);
+    try testing.expectEqualDeep(unchanged, t.screens.active.pages.scrollbar());
+    const top = surface.scrollToRowPixelIfRevision(0, 0, revision).?;
+    try testing.expectEqual(@as(i64, @intCast(sb.total - sb.len)) - 25, top.viewport_delta);
+    const bottom = surface.scrollToRowPixelIfRevision(std.math.maxInt(usize), 0, revision).?;
+    try testing.expectEqual(-@as(i64, @intCast(sb.total - sb.len)), bottom.viewport_delta);
+    _ = try t.switchScreen(.alternate);
+    sb = t.screens.active.pages.scrollbar();
+    const alternate_revision = surface.rowSpaceIdentity(.alternate, t.screens.generation(.alternate), sb.row_space_revision);
+    const alternate = surface.scrollToRowPixelIfRevision(10, 3.5, alternate_revision).?;
+    try testing.expectEqual(0, alternate.viewport_delta);
+    try testing.expectEqual(0, t.screens.active.pages.viewport_pixel_offset);
 }
 
 test "current search selection enqueues renderer highlight before host delivery" {
