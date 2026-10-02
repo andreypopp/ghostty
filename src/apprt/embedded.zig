@@ -3498,6 +3498,10 @@ pub const CAPI = struct {
         return true;
     }
 
+    export fn ghostty_surface_search_generation(surface: *Surface) u64 {
+        return surface.core_surface.search_generation;
+    }
+
     const RenderGridStyle = struct {
         id: u32,
         foreground: terminal.color.RGB,
@@ -5898,4 +5902,65 @@ test "font size action callback preserves resolved action events" {
     );
     try std.testing.expect(!observation.previous_adjusted);
     try std.testing.expect(observation.current_adjusted);
+}
+
+test "search delivery epoch advances on start and both public stops" {
+    const testing = std.testing;
+    const Context = struct {
+        surface: *Surface,
+        ended_epoch: u64 = 0,
+        fn wakeup(_: ?*anyopaque) callconv(.c) void {}
+        fn action(app: *App, _: apprt.Target.C, _: apprt.Action.C) callconv(.c) bool {
+            const c: *@This() = @ptrCast(@alignCast(app.opts.userdata.?));
+            c.ended_epoch = CAPI.ghostty_surface_search_generation(c.surface);
+            return true;
+        }
+    };
+    var surface: Surface = undefined;
+    var context: Context = .{ .surface = &surface };
+    var app: App = undefined;
+    app.opts = undefined;
+    app.opts.userdata = &context;
+    app.opts.action = Context.action;
+    app.opts.wakeup = Context.wakeup;
+    var core_app: CoreApp = undefined;
+    core_app.mailbox = .{};
+    core_app.redraw_retry_requested = .init(false);
+    var mutex: std.Io.Mutex = .init;
+    var t: terminal.Terminal = try .init(testing.io, testing.allocator, .{ .cols = 20, .rows = 2 });
+    defer t.deinit(testing.allocator);
+    const core = &surface.core_surface;
+    core.app = &core_app;
+    core.rt_app = &app;
+    core.rt_surface = &surface;
+    core.alloc = testing.allocator;
+    core.search = null;
+    core.search_generation = 0;
+    core.renderer_state = .{ .mutex = &mutex, .terminal = &t };
+    core.renderer_thread.wakeup = try .init();
+    defer core.renderer_thread.wakeup.deinit();
+    var mailbox: renderer.Thread.Mailbox = .{};
+    core.renderer_thread.mailbox = &mailbox;
+    defer while (mailbox.pop(global.io())) |message| switch (message) {
+        .search_selected_match => |v| if (v) |owned| owned.arena.deinit(),
+        .search_viewport_matches => |owned| owned.arena.deinit(),
+        else => {},
+    };
+    defer if (core.search) |*active| active.deinit();
+    try testing.expect(try core.performBindingAction(.{ .search = "world" }));
+    try testing.expectEqual(1, CAPI.ghostty_surface_search_generation(&surface));
+    try testing.expectEqual(1, core.search.?.generation);
+    try testing.expect(try core.performBindingAction(.{ .search = "" }));
+    try testing.expectEqual(2, CAPI.ghostty_surface_search_generation(&surface));
+    try testing.expect(core.search == null);
+    try testing.expect(!(try core.performBindingAction(.{ .search = "" })));
+    try testing.expectEqual(3, CAPI.ghostty_surface_search_generation(&surface));
+    try testing.expect(try core.performBindingAction(.{ .search = "world" }));
+    try testing.expectEqual(4, core.search.?.generation);
+    try testing.expect(try core.performBindingAction(.end_search));
+    try testing.expectEqual(5, CAPI.ghostty_surface_search_generation(&surface));
+    try testing.expectEqual(5, context.ended_epoch);
+    try testing.expect(!(try core.performBindingAction(.end_search)));
+    try testing.expectEqual(6, CAPI.ghostty_surface_search_generation(&surface));
+    try testing.expectEqual(6, context.ended_epoch);
 }

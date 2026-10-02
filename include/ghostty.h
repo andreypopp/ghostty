@@ -1486,6 +1486,10 @@ GHOSTTY_API bool ghostty_surface_scroll_to_row_if_revision(
     uint64_t,
     uint64_t,
     ghostty_surface_scrollbar_s*);
+// Main-thread-only delivery epoch; advances on search start and either public
+// stop, including stops while inactive. Nonempty edits within a search keep it.
+GHOSTTY_API uint64_t ghostty_surface_search_generation(ghostty_surface_t);
+
 // cmux fork: pixel-precise variant of scroll_to_row_if_revision. Atomically
 // scrolls the viewport to the absolute row AND applies a fractional vertical
 // pixel offset in the same critical section; the renderer snapshots the pair

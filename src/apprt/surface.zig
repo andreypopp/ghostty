@@ -114,10 +114,10 @@ pub const Message = union(enum) {
     scrollbar: terminal.Scrollbar,
 
     /// Search progress update
-    search_total: ?usize,
+    search_total: SearchNotification,
 
     /// Selected search index change
-    search_selected: ?usize,
+    search_selected: SearchNotification,
 
     pub const ReportTitleStyle = enum {
         csi_21_t,
@@ -157,6 +157,11 @@ pub const Message = union(enum) {
             .none => void,
         };
     };
+};
+
+pub const SearchNotification = struct {
+    generation: u64,
+    value: ?usize,
 };
 
 /// A surface mailbox.

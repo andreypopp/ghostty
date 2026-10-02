@@ -176,6 +176,7 @@ command_timer: ?std.Io.Timestamp = null,
 
 /// Search state
 search: ?Search = null,
+search_generation: u64 = 0,
 shutdown_probe: if (builtin.is_test) ?struct {
     before_renderer_stop: *const fn (*anyopaque) void,
     userdata: *anyopaque,
@@ -313,6 +314,8 @@ test "font size action event preserves semantic mutation" {
 const Search = struct {
     state: terminal.search.Thread,
     thread: std.Thread,
+    generation: u64 = 0,
+    surface: *Surface,
     stopping: std.atomic.Value(bool) = .init(false),
 
     fn surfaceMessage(self: *Search, mailbox: apprt.surface.Mailbox, message: apprt.surface.Message) void {
@@ -362,14 +365,14 @@ test "search shutdown abandons a full surface mailbox" {
         .app = .{ .rt_app = &rt_app, .mailbox = &queue, .redraw_retry_requested = &retry },
     };
     for (0..64) |_| _ = queue.push(global.io(), .open_config, .instant);
-    search.surfaceMessage(mailbox, .{ .search_total = 1 });
+    search.surfaceMessage(mailbox, .{ .search_total = .{ .generation = 1, .value = 1 } });
     try std.testing.expectEqual(1, context.wakeups);
     try std.testing.expectEqual(64, queue.count(global.io()));
-    search.surfaceMessage(mailbox, .{ .search_selected = null });
+    search.surfaceMessage(mailbox, .{ .search_selected = .{ .generation = 1, .value = null } });
     try std.testing.expectEqual(1, context.wakeups);
     while (queue.pop(global.io())) |_| {}
     search.stopping.store(false, .release);
-    search.surfaceMessage(mailbox, .{ .search_total = 2 });
+    search.surfaceMessage(mailbox, .{ .search_total = .{ .generation = 1, .value = 2 } });
     try std.testing.expectEqual(2, context.wakeups);
     try std.testing.expectEqual(1, queue.count(global.io()));
 }
@@ -403,7 +406,7 @@ fn testShutdownPressure(do_resize: bool) !void {
             const c: *@This() = @ptrCast(@alignCast(ud.?));
             if (event != .quit) return;
             c.released.set(global.io());
-            c.surface.searchCallback_(event) catch unreachable;
+            c.surface.searchCallback_(&c.surface.search.?, event) catch unreachable;
             c.search_done.store(true, .release);
             c.surface.renderer_thread.wakeup.notify() catch unreachable;
         }
@@ -490,7 +493,8 @@ fn testShutdownPressure(do_resize: bool) !void {
                 .event_userdata = &context,
             }),
             .thread = undefined,
-            };
+            .surface = &surface,
+        };
         surface.search.?.thread = try .spawn(.{}, terminal.search.Thread.threadMain, .{&surface.search.?.state});
     }
     surface.io_thr = try .spawn(.{}, Context.ioMain, .{&context});
@@ -1680,18 +1684,22 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
         },
 
         .search_total => |v| {
+            const current = if (self.search) |*current| current else return;
+            if (current.generation != v.generation) return;
             _ = try self.rt_app.performAction(
                 .{ .surface = self },
                 .search_total,
-                .{ .total = v },
+                .{ .total = v.value },
             );
         },
 
         .search_selected => |v| {
+            const current = if (self.search) |*current| current else return;
+            if (current.generation != v.generation) return;
             _ = try self.rt_app.performAction(
                 .{ .surface = self },
                 .search_selected,
-                .{ .selected = v },
+                .{ .selected = v.value },
             );
         },
     }
@@ -1945,14 +1953,15 @@ fn searchCallback(event: terminal.search.Thread.Event, ud: ?*anyopaque) void {
     // to access anything other than values that never change on the surface.
     // The surface is guaranteed to be valid for the lifetime of the search
     // thread.
-    const self: *Surface = @ptrCast(@alignCast(ud.?));
-    self.searchCallback_(event) catch |err| {
+    const search: *Search = @ptrCast(@alignCast(ud.?));
+    search.surface.searchCallback_(search, event) catch |err| {
         log.warn("error in search callback err={}", .{err});
     };
 }
 
 fn searchCallback_(
     self: *Surface,
+    search: *Search,
     event: terminal.search.Thread.Event,
 ) !void {
     // NOTE: This runs on the search thread.
@@ -1994,7 +2003,7 @@ fn searchCallback_(
                 );
 
                 // Send the selected index to the surface mailbox
-                self.search.?.surfaceMessage(self.surfaceMailbox(), .{ .search_selected = sel.idx });
+                search.surfaceMessage(self.surfaceMailbox(), .{ .search_selected = .{ .generation = search.generation, .value = sel.idx } });
             } else {
                 // Reset our selected match
                 _ = self.renderer_thread.mailbox.push(
@@ -2004,14 +2013,14 @@ fn searchCallback_(
                 );
 
                 // Reset the selected index
-                self.search.?.surfaceMessage(self.surfaceMailbox(), .{ .search_selected = null });
+                search.surfaceMessage(self.surfaceMailbox(), .{ .search_selected = .{ .generation = search.generation, .value = null } });
             }
 
             try self.renderer_thread.wakeup.notify();
         },
 
         .total_matches => |total| {
-            self.search.?.surfaceMessage(self.surfaceMailbox(), .{ .search_total = total });
+            search.surfaceMessage(self.surfaceMailbox(), .{ .search_total = .{ .generation = search.generation, .value = total } });
         },
 
         // When we quit, tell our renderer to reset any search state.
@@ -2033,8 +2042,8 @@ fn searchCallback_(
             try self.renderer_thread.wakeup.notify();
 
             // Reset search totals in the surface
-            self.search.?.surfaceMessage(self.surfaceMailbox(), .{ .search_total = null });
-            self.search.?.surfaceMessage(self.surfaceMailbox(), .{ .search_selected = null });
+            search.surfaceMessage(self.surfaceMailbox(), .{ .search_total = .{ .generation = search.generation, .value = null } });
+            search.surfaceMessage(self.surfaceMailbox(), .{ .search_selected = .{ .generation = search.generation, .value = null } });
         },
 
         // Unhandled, so far.
@@ -7233,6 +7242,7 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
         },
 
         .end_search => {
+            self.search_generation += 1;
             // We only return that this was performed if we actually
             // stopped a search, but we also send the apprt end_search so
             // that GUIs can clean up stale stuff.
@@ -7253,24 +7263,33 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
         },
 
         .search => |text| search: {
+            if (text.len == 0) {
+                self.search_generation += 1;
+                const active = if (self.search) |*active| active else return false;
+                active.deinit();
+                self.search = null;
+                break :search;
+            }
             const s: *Search = if (self.search) |*s| s else init: {
-                // If we're stopping the search and we had no prior search,
-                // then there is nothing to do.
-                if (text.len == 0) return false;
-
                 // We need to assign directly to self.search because we need
                 // a stable pointer back to the thread state.
+                self.search_generation += 1;
                 self.search = .{
+                    .surface = self,
+                    .generation = self.search_generation,
                     .state = try .init(self.alloc, .{
                         .mutex = self.renderer_state.mutex,
                         .terminal = self.renderer_state.terminal,
                         .event_cb = &searchCallback,
-                        .event_userdata = self,
                     }),
                     .thread = undefined,
                 };
                 const s: *Search = &self.search.?;
-                errdefer s.state.deinit();
+                errdefer {
+                    s.state.deinit();
+                    self.search = null;
+                }
+                s.state.opts.event_userdata = s;
 
                 s.thread = try .spawn(
                     .{},
@@ -7281,13 +7300,6 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
 
                 break :init s;
             };
-
-            // Zero-length text means stop searching.
-            if (text.len == 0) {
-                s.deinit();
-                self.search = null;
-                break :search;
-            }
 
             try s.state.submit(.{ .change_needle = try .init(self.alloc, text) });
         },
@@ -10215,6 +10227,150 @@ test "Surface: oversized soft-wrapped URL candidate is rejected" {
     }
 }
 
+test "search lifetime rejects queued obsolete core notifications" {
+    const Context = struct {
+        actions: usize = 0,
+        fn action(app: *apprt.App, _: apprt.Target.C, _: apprt.Action.C) callconv(.c) bool {
+            const c: *@This() = @ptrCast(@alignCast(app.opts.userdata.?));
+            c.actions += 1;
+            return true;
+        }
+    };
+    var context: Context = .{};
+    var rt_app: apprt.App = undefined;
+    rt_app.opts = undefined;
+    rt_app.opts.userdata = &context;
+    rt_app.opts.action = Context.action;
+    var rt_surface: apprt.Surface = undefined;
+    var surface: Surface = undefined;
+    surface.rt_app = &rt_app;
+    surface.rt_surface = &rt_surface;
+    surface.search_generation = 2;
+    surface.search = .{ .state = undefined, .thread = undefined, .surface = &surface, .generation = 2 };
+    const storage = &surface.search.?;
+    try surface.handleMessage(.{ .search_selected = .{ .generation = 1, .value = 0 } });
+    try surface.handleMessage(.{ .search_total = .{ .generation = 1, .value = 5 } });
+    try std.testing.expectEqual(0, context.actions);
+    try surface.handleMessage(.{ .search_selected = .{ .generation = 2, .value = 0 } });
+    try surface.handleMessage(.{ .search_total = .{ .generation = 2, .value = 5 } });
+    try std.testing.expectEqual(2, context.actions);
+    surface.search = null;
+    try surface.handleMessage(.{ .search_selected = .{ .generation = 2, .value = 0 } });
+    try std.testing.expectEqual(2, context.actions);
+    surface.search = .{ .state = undefined, .thread = undefined, .surface = &surface, .generation = 3 };
+    try std.testing.expectEqual(storage, &surface.search.?);
+    try surface.handleMessage(.{ .search_total = .{ .generation = 2, .value = 5 } });
+    try std.testing.expectEqual(2, context.actions);
+    try surface.handleMessage(.{ .search_total = .{ .generation = 3, .value = 5 } });
+    try std.testing.expectEqual(3, context.actions);
+}
+
+test "current search selection enqueues renderer highlight before host delivery" {
+    const testing = std.testing;
+    const Context = struct {
+        surface: *Surface,
+        total: std.Io.Event = .unset,
+        selected: std.Io.Event = .unset,
+        actions: usize = 0,
+        fn event(value: terminal.search.Thread.Event, ud: ?*anyopaque) void {
+            const c: *@This() = @ptrCast(@alignCast(ud.?));
+            c.surface.searchCallback_(&c.surface.search.?, value) catch unreachable;
+            switch (value) {
+                .total_matches => |n| if (n > 0) {
+                    c.total.set(global.io());
+                },
+                .selected_match => |v| if (v != null) {
+                    c.selected.set(global.io());
+                },
+                else => {},
+            }
+        }
+        fn wakeup(_: ?*anyopaque) callconv(.c) void {}
+        fn action(app: *apprt.App, _: apprt.Target.C, _: apprt.Action.C) callconv(.c) bool {
+            const c: *@This() = @ptrCast(@alignCast(app.opts.userdata.?));
+            c.actions += 1;
+            return true;
+        }
+    };
+    var surface: Surface = undefined;
+    var context: Context = .{ .surface = &surface };
+    var rt_app: apprt.App = undefined;
+    rt_app.opts = undefined;
+    rt_app.opts.userdata = &context;
+    rt_app.opts.wakeup = Context.wakeup;
+    rt_app.opts.action = Context.action;
+    var app: App = undefined;
+    app.mailbox = .{};
+    app.redraw_retry_requested = .init(false);
+    var rt_surface: apprt.Surface = undefined;
+    surface.rt_app = &rt_app;
+    surface.app = &app;
+    surface.rt_surface = &rt_surface;
+    surface.alloc = testing.allocator;
+    var mutex: std.Io.Mutex = .init;
+    var t: terminal.Terminal = try .init(testing.io, testing.allocator, .{ .cols = 20, .rows = 2 });
+    defer t.deinit(testing.allocator);
+    var stream = t.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("world world");
+    surface.renderer_thread.wakeup = try .init();
+    defer surface.renderer_thread.wakeup.deinit();
+    var mailbox: rendererpkg.Thread.Mailbox = .{};
+    surface.renderer_thread.mailbox = &mailbox;
+    defer while (mailbox.pop(global.io())) |message| switch (message) {
+        .search_selected_match => |v| if (v) |owned| owned.arena.deinit(),
+        .search_viewport_matches => |owned| owned.arena.deinit(),
+        else => {},
+    };
+    surface.search_generation = 2;
+    surface.search = .{
+        .surface = &surface,
+        .generation = 2,
+        .state = try .init(testing.allocator, .{ .mutex = &mutex, .terminal = &t, .event_cb = Context.event, .event_userdata = &context }),
+        .thread = undefined,
+    };
+    surface.search.?.thread = try .spawn(.{}, terminal.search.Thread.threadMain, .{&surface.search.?.state});
+    defer if (surface.search) |*active| active.deinit();
+    try surface.search.?.state.submit(.{ .change_needle = try .init(testing.allocator, @as([]const u8, "world")) });
+    try context.total.waitTimeout(global.io(), .{ .duration = .{ .clock = .awake, .raw = .fromSeconds(2) } });
+    try surface.search.?.state.submit(.{ .select = .next });
+    try context.selected.waitTimeout(global.io(), .{ .duration = .{ .clock = .awake, .raw = .fromSeconds(2) } });
+    var selected = false;
+    while (mailbox.pop(global.io())) |message| switch (message) {
+        .search_selected_match => |v| if (v) |owned| {
+            selected = true;
+            owned.arena.deinit();
+        },
+        .search_viewport_matches => |owned| owned.arena.deinit(),
+        else => {},
+    };
+    try testing.expect(selected);
+    const before = mailbox.count(global.io());
+    try surface.handleMessage(.{ .search_selected = .{ .generation = 1, .value = 0 } });
+    try surface.handleMessage(.{ .search_total = .{ .generation = 1, .value = 2 } });
+    try testing.expectEqual(0, context.actions);
+    try testing.expectEqual(before, mailbox.count(global.io()));
+    try surface.handleMessage(.{ .search_selected = .{ .generation = 2, .value = 0 } });
+    try testing.expectEqual(1, context.actions);
+    try testing.expect(try surface.performBindingAction(.end_search));
+    try testing.expect(surface.search == null);
+    var selected_clear = false;
+    var viewport_clear = false;
+    while (mailbox.pop(global.io())) |message| switch (message) {
+        .search_selected_match => |v| if (v) |owned| {
+            owned.arena.deinit();
+        } else {
+            selected_clear = true;
+        },
+        .search_viewport_matches => |owned| {
+            viewport_clear = viewport_clear or owned.matches.len == 0;
+            owned.arena.deinit();
+        },
+        else => {},
+    };
+    try testing.expect(selected_clear and viewport_clear);
+}
+
 test "search sender accepts input and stops against full app capacity" {
     const testing = std.testing;
     const Context = struct {
@@ -10230,7 +10386,7 @@ test "search sender accepts input and stops against full app capacity" {
             const c: *@This() = @ptrCast(@alignCast(ud.?));
             switch (value) {
                 .total_matches => |n| {
-                    c.search.surfaceMessage(c.mailbox, .{ .search_total = n });
+                    c.search.surfaceMessage(c.mailbox, .{ .search_total = .{ .generation = c.search.generation, .value = n } });
                     if (!c.search.stopping.load(.acquire)) c.delivered.set(global.io());
                 },
                 else => {},
@@ -10255,6 +10411,8 @@ test "search sender accepts input and stops against full app capacity" {
         rt_app.opts.wakeup = Context.wakeup;
         for (0..64) |_| _ = queue.push(global.io(), .open_config, .instant);
         search = .{
+            .surface = &surface,
+            .generation = 1,
             .state = try .init(testing.allocator, .{ .mutex = &mutex, .terminal = &t, .event_cb = Context.event, .event_userdata = &context }),
             .thread = undefined,
         };
