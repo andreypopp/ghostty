@@ -852,17 +852,6 @@ pub fn processOutput(self: *Termio, buf: []const u8) void {
     if (self.pty_tee_cb) |cb| cb(self.pty_tee_userdata, buf.ptr, buf.len);
 }
 
-pub fn trimHistory(self: *Termio, rows: usize) usize {
-    self.renderer_state.mutex.lockUncancelable(global.io());
-    defer self.renderer_state.mutex.unlock(global.io());
-    const count = self.terminal.trimHistory(rows);
-    if (count > 0) {
-        self.terminal.flags.dirty = .{ .clear = true };
-        self.terminal_stream.handler.queueRender() catch unreachable;
-    }
-    return count;
-}
-
 pub fn raiseScrollbackLimit(self: *Termio) void {
     self.renderer_state.mutex.lockUncancelable(global.io());
     defer self.renderer_state.mutex.unlock(global.io());

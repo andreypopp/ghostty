@@ -4972,10 +4972,6 @@ pub const CAPI = struct {
         return screen.viewportLogicalLines();
     }
 
-    export fn ghostty_surface_trim_history(surface: *Surface, rows: usize) usize {
-        return surface.core_surface.io.trimHistory(rows);
-    }
-
     export fn ghostty_surface_raise_scrollback_limit(surface: *Surface) void {
         surface.core_surface.io.raiseScrollbackLimit();
     }
