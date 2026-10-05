@@ -5,6 +5,9 @@
 //! and other irregular formatting so a dedicated parser is created to handle it.
 const osc = @This();
 
+pub const max_clipboard_bytes = 1_048_576;
+pub const max_clipboard_encoded_bytes = std.base64.standard.Encoder.calcSize(max_clipboard_bytes);
+
 const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("terminal_options");
@@ -549,7 +552,7 @@ pub const Parser = struct {
         // If a writer has been initialized, we just accumulate the rest of the
         // OSC sequence in the writer's buffer and skip the state machine.
         if (self.capture) |*cap| {
-            if (self.state == .@"52" and cap.writer.buffered().len >= std.base64.standard.Encoder.calcSize(1048576) + 2) {
+            if (self.state == .@"52" and cap.writer.buffered().len >= max_clipboard_encoded_bytes + 2) {
                 self.state = .invalid;
                 return;
             }

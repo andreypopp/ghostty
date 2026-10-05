@@ -1256,7 +1256,7 @@ pub const StreamHandler = struct {
     }
 
     fn clipboardContents(self: *StreamHandler, kind: u8, data: []const u8) !void {
-        if (self.restoring or data.len > std.base64.standard.Encoder.calcSize(1048576)) return;
+        if (self.restoring or data.len > terminal.osc.max_clipboard_encoded_bytes) return;
 
         const clipboard_type: apprt.Clipboard = switch (kind) {
             'c' => .standard,

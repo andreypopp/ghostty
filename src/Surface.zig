@@ -3985,7 +3985,7 @@ fn clipboardWrite(self: *const Surface, data: []const u8, loc: apprt.Clipboard) 
         // Should not be reachable but don't want to risk it.
         else => return,
     };
-    if (size > 1048576) return;
+    if (size > terminal.osc.max_clipboard_bytes) return;
     var buf = try self.alloc.allocSentinel(u8, size, 0);
     defer self.alloc.free(buf);
     buf[buf.len] = 0;
