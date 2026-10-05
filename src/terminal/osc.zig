@@ -549,6 +549,10 @@ pub const Parser = struct {
         // If a writer has been initialized, we just accumulate the rest of the
         // OSC sequence in the writer's buffer and skip the state machine.
         if (self.capture) |*cap| {
+            if (self.state == .@"52" and cap.writer.buffered().len >= std.base64.standard.Encoder.calcSize(1048576) + 2) {
+                self.state = .invalid;
+                return;
+            }
             cap.writer.writeByte(c) catch |err| switch (err) {
                 // We have overflowed our buffer or had some other error, set the
                 // state to invalid so that we discard any further input.

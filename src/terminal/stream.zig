@@ -505,6 +505,14 @@ pub fn Stream(comptime H: type) type {
             return self;
         }
 
+        pub fn resetParser(self: *Self) void {
+            const alloc = self.parser.osc_parser.alloc;
+            self.parser.deinit();
+            self.parser = .init();
+            self.parser.osc_parser.alloc = alloc;
+            self.utf8decoder = .{};
+        }
+
         pub fn deinit(self: *Self) void {
             self.parser.deinit();
             self.handler.deinit();
@@ -2784,6 +2792,29 @@ test Action {
     // Forces the C type to be reified when the target is C, ensuring
     // all our types are C ABI compatible.
     _ = Action.C;
+}
+
+test "OSC52 parser reset from pending OSC restores RIS and pending capture bytes" {
+    const Handler = struct {
+        resets: usize = 0,
+        operations: usize = 0,
+        pub fn vt(self: *@This(), comptime action: Action.Key, _: Action.Value(action)) void {
+            switch (action) {
+                .full_reset => self.resets += 1,
+                .clipboard_contents => self.operations += 1,
+                else => {},
+            }
+        }
+    };
+    var stream: Stream(Handler) = .initAlloc(std.testing.allocator, .{});
+    defer stream.parser.deinit();
+    stream.nextSlice("\x1b]52;c;old");
+    stream.resetParser();
+    stream.nextSlice("\x1bc\x1b]52;s;?");
+    try std.testing.expectEqual(1, stream.handler.resets);
+    try std.testing.expectEqual(0, stream.handler.operations);
+    stream.nextSlice("\x1b\\");
+    try std.testing.expectEqual(1, stream.handler.operations);
 }
 
 test "stream: print" {

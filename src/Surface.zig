@@ -3985,6 +3985,7 @@ fn clipboardWrite(self: *const Surface, data: []const u8, loc: apprt.Clipboard) 
         // Should not be reachable but don't want to risk it.
         else => return,
     };
+    if (size > 1048576) return;
     var buf = try self.alloc.allocSentinel(u8, size, 0);
     defer self.alloc.free(buf);
     buf[buf.len] = 0;
@@ -4001,6 +4002,7 @@ fn clipboardWrite(self: *const Surface, data: []const u8, loc: apprt.Clipboard) 
         },
     };
     assert(buf[buf.len] == 0);
+    if (std.mem.indexOfScalar(u8, buf, 0) != null) return;
 
     // When clipboard-write is "ask" a prompt is displayed to the user asking
     // them to confirm the clipboard access. Each app runtime handles this

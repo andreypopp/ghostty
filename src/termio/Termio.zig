@@ -828,6 +828,15 @@ pub fn focusGained(self: *Termio, td: *ThreadData, focused: bool) !void {
     try self.backend.focusGained(td, focused);
 }
 
+pub fn restoreOutput(self: *Termio, buf: []const u8) void {
+    self.renderer_state.mutex.lockUncancelable(global.io());
+    defer self.renderer_state.mutex.unlock(global.io());
+    self.terminal_stream.resetParser();
+    self.terminal_stream.handler.restoring = true;
+    defer self.terminal_stream.handler.restoring = false;
+    processOutputAndAdvanceLocked(self, buf);
+}
+
 /// Process output from the pty. This is the manual API that users can
 /// call with pty data but it is also called by the read thread when using
 /// an exec subprocess.

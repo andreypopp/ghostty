@@ -152,6 +152,7 @@ pub const StreamHandler = struct {
     /// When another terminal core owns the PTY protocol, Ghostty is only a
     /// render/input mirror and must not emit a second copy of protocol replies.
     suppress_terminal_responses: bool = false,
+    restoring: bool = false,
 
     //---------------------------------------------------------------
     // Internal state
@@ -1255,9 +1256,7 @@ pub const StreamHandler = struct {
     }
 
     fn clipboardContents(self: *StreamHandler, kind: u8, data: []const u8) !void {
-        // Note: we ignore the "kind" field and always use the standard clipboard.
-        // iTerm also appears to do this but other terminals seem to only allow
-        // certain. Let's investigate more.
+        if (self.restoring or data.len > std.base64.standard.Encoder.calcSize(1048576)) return;
 
         const clipboard_type: apprt.Clipboard = switch (kind) {
             'c' => .standard,
@@ -1861,6 +1860,70 @@ test "pwd change keeps scrollbar from OSC stream position" {
     try std.testing.expectEqual(@as(usize, 0), marker_scrollbar.offset);
     try std.testing.expectEqual(.primary, marker.pwd_change.screen_key);
     try std.testing.expectEqual(@as(usize, 0), marker.pwd_change.screen_generation);
+}
+
+test "OSC52 restore suppresses complete operations but live terminators complete pending OSC" {
+    const testing = std.testing;
+    var app: apprt.App = undefined;
+    app.opts = undefined;
+    app.opts.wakeup = struct {
+        fn wakeup(_: ?*anyopaque) callconv(.c) void {}
+    }.wakeup;
+    var surface: @import("../Surface.zig") = undefined;
+    var queue: @import("../App.zig").Mailbox.Queue = .{};
+    var retry = std.atomic.Value(bool).init(false);
+    var handler: StreamHandler = undefined;
+    handler.alloc = testing.allocator;
+    handler.surface_mailbox = .{ .surface = &surface, .app = .{ .rt_app = &app, .mailbox = &queue, .redraw_retry_requested = &retry } };
+    handler.restoring = false;
+    var stream: terminal.Stream(*StreamHandler) = .initAlloc(testing.allocator, &handler);
+    defer stream.parser.deinit();
+
+    stream.nextSlice("\x1b]52;c;Y29weQ==\x07");
+    try testing.expectEqual(1, queue.count(global.io()));
+    discardSurfaceMessage(queue.pop(global.io()).?.surface_message.message);
+    stream.nextSlice("\x1b]52;p;?\x1b\\");
+    const read = queue.pop(global.io()).?.surface_message.message;
+    try testing.expectEqual(.primary, read.clipboard_read);
+
+    for (0..2) |_| {
+        stream.resetParser();
+        handler.restoring = true;
+        stream.nextSlice("\x1b]52;c;Y29weQ==\x07\x1b]52;s;?\x1b\\");
+        try testing.expectEqual(0, queue.count(global.io()));
+    }
+
+    stream.resetParser();
+    stream.nextSlice("\x1b]52;c;Y29weQ==\x1b");
+    handler.restoring = false;
+    stream.nextSlice("\\");
+    try testing.expectEqual(0, queue.count(global.io()));
+
+    stream.nextSlice("\x1b]52;s;?\x1b");
+    try testing.expectEqual(1, queue.count(global.io()));
+    stream.resetParser();
+    handler.restoring = true;
+    stream.nextSlice("\x1b]52;s;?\x1b");
+    handler.restoring = false;
+    stream.nextSlice("\\");
+    try testing.expectEqual(1, queue.count(global.io()));
+    try testing.expectEqual(.selection, queue.pop(global.io()).?.surface_message.message.clipboard_read);
+
+    stream.resetParser();
+    handler.restoring = true;
+    stream.nextSlice("\x1b]52;c;Y29weQ==");
+    handler.restoring = false;
+    stream.nextSlice("\x07");
+    try testing.expectEqual(1, queue.count(global.io()));
+    discardSurfaceMessage(queue.pop(global.io()).?.surface_message.message);
+    stream.nextSlice("\x1b]52;s;?");
+    stream.resetParser();
+    handler.restoring = true;
+    stream.nextSlice("\x1b]52;p;?");
+    handler.restoring = false;
+    stream.nextSlice("\x1b\\");
+    try testing.expectEqual(1, queue.count(global.io()));
+    try testing.expectEqual(.primary, queue.pop(global.io()).?.surface_message.message.clipboard_read);
 }
 
 test "stopping parser frees owning messages against full app capacity" {

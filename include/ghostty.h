@@ -1597,6 +1597,9 @@ GHOSTTY_API void ghostty_surface_preedit(ghostty_surface_t, const char*, uintptr
 // cmux fork: upstream already has internal Termio.processOutput. Delete this
 // C bridge when upstream exports an equivalent surface output API.
 GHOSTTY_API void ghostty_surface_process_output(ghostty_surface_t, const char*, uintptr_t);
+GHOSTTY_API void ghostty_surface_restore_output(ghostty_surface_t, const char*, uintptr_t);
+GHOSTTY_API ghostty_clipboard_request_e ghostty_clipboard_request_kind(void*);
+GHOSTTY_API void ghostty_surface_cancel_clipboard_request(ghostty_surface_t, void*);
 
 typedef struct {
   uint32_t primary;

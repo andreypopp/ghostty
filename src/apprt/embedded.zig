@@ -4944,6 +4944,10 @@ pub const CAPI = struct {
         surface.core_surface.io.processOutput(ptr[0..len]);
     }
 
+    export fn ghostty_surface_restore_output(surface: *Surface, ptr: [*]const u8, len: usize) void {
+        surface.core_surface.io.restoreOutput(ptr[0..len]);
+    }
+
     export fn ghostty_surface_viewport_anchor(surface: *Surface, text: *Text) usize {
         const state = &surface.core_surface.renderer_state;
         state.mutex.lockUncancelable(global.io());
@@ -5274,6 +5278,14 @@ pub const CAPI = struct {
             state,
             confirmed,
         );
+    }
+
+    export fn ghostty_clipboard_request_kind(state: *const apprt.ClipboardRequest) apprt.ClipboardRequestType {
+        return std.meta.activeTag(state.*);
+    }
+
+    export fn ghostty_surface_cancel_clipboard_request(ptr: *Surface, state: *apprt.ClipboardRequest) void {
+        ptr.app.core_app.alloc.destroy(state);
     }
 
     export fn ghostty_surface_inspector(ptr: *Surface) ?*Inspector {
