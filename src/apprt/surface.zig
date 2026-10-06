@@ -160,6 +160,16 @@ pub const Message = union(enum) {
     /// Renderer pushed a new frame, redraw this surface.
     redraw,
 
+    pub fn deinit(self: Message) void {
+        switch (self) {
+            .clipboard_write => |value| value.req.deinit(),
+            .pwd_change => |value| value.deinit(),
+            .kitty_clipboard_read => |value| value.destroy(),
+            .kitty_clipboard_write => |value| value.destroy(),
+            else => {},
+        }
+    }
+
     pub const ReportTitleStyle = enum {
         csi_21_t,
 
@@ -187,6 +197,13 @@ pub const Message = union(enum) {
 pub const Mailbox = struct {
     surface: *Surface,
     app: App.Mailbox,
+
+    pub fn pushUntilStopped(self: Mailbox, msg: Message, stopping: *const std.atomic.Value(bool)) bool {
+        while (!stopping.load(.acquire)) {
+            if (self.push(msg, .{ .ns = 10 * std.time.ns_per_ms }) != 0) return true;
+        }
+        return false;
+    }
 
     /// Send a message to the surface.
     pub fn push(

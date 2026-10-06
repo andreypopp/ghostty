@@ -183,6 +183,10 @@ command_timer: ?std.Io.Timestamp = null,
 
 /// Search state
 search: ?Search = null,
+shutdown_probe: if (builtin.is_test) ?struct {
+    before_renderer_stop: *const fn (*anyopaque) void,
+    userdata: *anyopaque,
+} else void = if (builtin.is_test) null else {},
 
 /// Used to rate limit BEL handling.
 last_bell_time: ?std.Io.Timestamp = null,
@@ -272,7 +276,14 @@ const Search = struct {
     state: terminal.search.Thread,
     thread: std.Thread,
 
+    stopping: std.atomic.Value(bool) = .init(false),
+
+    fn surfaceMessage(self: *Search, mailbox: apprt.surface.Mailbox, message: apprt.surface.Message) void {
+        _ = mailbox.pushUntilStopped(message, &self.stopping);
+    }
+
     pub fn deinit(self: *Search) void {
+        self.stopping.store(true, .release);
         // Notify the thread to stop
         self.state.stop.notify() catch |err| log.err(
             "error notifying search thread to stop, may stall err={}",
@@ -632,82 +643,88 @@ pub fn init(
 
     // Create our terminal grid with the initial size
     const app_mailbox: App.Mailbox = .{ .rt_app = rt_app, .mailbox = &app.mailbox };
-    var renderer_impl = renderer: {
-        // Renderer.init takes ownership of the config only on success, after
-        // which the errdefer below frees it, so this errdefer must end here.
-        var renderer_config = try Renderer.DerivedConfig.init(alloc, config);
-        errdefer renderer_config.deinit();
+    {
+        var renderer_impl = renderer: {
+            // Renderer.init takes ownership of the config only on success, after
+            // which the errdefer below frees it, so this errdefer must end here.
+            var renderer_config = try Renderer.DerivedConfig.init(alloc, config);
+            errdefer renderer_config.deinit();
 
-        break :renderer try Renderer.init(alloc, .{
-            .device = render_device,
-            .config = renderer_config,
-            .font_grid = font_grid,
-            .size = size,
-            .surface_mailbox = .{ .surface = self, .app = app_mailbox },
+            break :renderer try Renderer.init(alloc, .{
+                .device = render_device,
+                .config = renderer_config,
+                .font_grid = font_grid,
+                .size = size,
+                .surface_mailbox = .{ .surface = self, .app = app_mailbox },
+                .rt_surface = rt_surface,
+                .thread = &self.renderer_thread,
+            });
+        };
+        errdefer renderer_impl.deinit();
+
+        // The mutex used to protect our renderer state.
+        const mutex = try alloc.create(std.Io.Mutex);
+        mutex.* = .init;
+        errdefer alloc.destroy(mutex);
+
+        // Create the renderer thread
+        var render_thread = try rendererpkg.Thread.init(
+            alloc,
+            config,
+            rt_surface,
+            &self.renderer,
+            &self.renderer_state,
+        );
+        errdefer render_thread.deinit();
+
+        // Create the IO thread
+        var io_thread = try termio.Thread.init(alloc);
+        errdefer io_thread.deinit();
+
+        self.* = .{
+            .id = id: {
+                while (true) {
+                    const candidate = candidate: {
+                        const rng_impl: std.Random.IoSource = .{ .io = global.io() };
+                        const rng = rng_impl.interface();
+                        break :candidate rng.int(u64);
+                    };
+                    if (candidate == 0) continue;
+                    break :id candidate;
+                }
+            },
+            .alloc = alloc,
+            .app = app,
+            .rt_app = rt_app,
             .rt_surface = rt_surface,
-            .thread = &self.renderer_thread,
-        });
-    };
-    errdefer renderer_impl.deinit();
+            .font_grid_key = font_grid_key,
+            .font_size = font_size,
+            .font_size_adjusted = false,
+            .font_metrics = font_grid.metrics,
+            .renderer = renderer_impl,
+            .renderer_thread = render_thread,
+            .renderer_state = .{
+                .mutex = mutex,
+                .terminal = &self.io.terminal,
+            },
+            .renderer_thr = undefined,
+            .mouse = .{},
+            .keyboard = .{},
+            .io = undefined,
+            .io_thread = io_thread,
+            .io_thr = undefined,
+            .size = size,
+            .config = derived_config,
 
-    // The mutex used to protect our renderer state.
-    const mutex = try alloc.create(std.Io.Mutex);
-    mutex.* = .init;
-    errdefer alloc.destroy(mutex);
-
-    // Create the renderer thread
-    var render_thread = try rendererpkg.Thread.init(
-        alloc,
-        config,
-        rt_surface,
-        &self.renderer,
-        &self.renderer_state,
-    );
-    errdefer render_thread.deinit();
-
-    // Create the IO thread
-    var io_thread = try termio.Thread.init(alloc);
-    errdefer io_thread.deinit();
-
-    self.* = .{
-        .id = id: {
-            while (true) {
-                const candidate = candidate: {
-                    const rng_impl: std.Random.IoSource = .{ .io = global.io() };
-                    const rng = rng_impl.interface();
-                    break :candidate rng.int(u64);
-                };
-                if (candidate == 0) continue;
-                break :id candidate;
-            }
-        },
-        .alloc = alloc,
-        .app = app,
-        .rt_app = rt_app,
-        .rt_surface = rt_surface,
-        .font_grid_key = font_grid_key,
-        .font_size = font_size,
-        .font_size_adjusted = false,
-        .font_metrics = font_grid.metrics,
-        .renderer = renderer_impl,
-        .renderer_thread = render_thread,
-        .renderer_state = .{
-            .mutex = mutex,
-            .terminal = &self.io.terminal,
-        },
-        .renderer_thr = undefined,
-        .mouse = .{},
-        .keyboard = .{},
-        .io = undefined,
-        .io_thread = io_thread,
-        .io_thr = undefined,
-        .size = size,
-        .config = derived_config,
-
-        // Our conditional state is initialized to the app state. This
-        // lets us get the most likely correct color theme and so on.
-        .config_conditional_state = app.config_conditional_state,
-    };
+            // Our conditional state is initialized to the app state. This
+            // lets us get the most likely correct color theme and so on.
+            .config_conditional_state = app.config_conditional_state,
+        };
+    }
+    errdefer self.renderer.deinit();
+    errdefer alloc.destroy(self.renderer_state.mutex);
+    errdefer self.renderer_thread.deinit();
+    errdefer self.io_thread.deinit();
 
     // The command we're going to execute
     const command: ?configpkg.Command = command: {
@@ -783,8 +800,8 @@ pub fn init(
                 false,
             .mailbox = io_mailbox,
             .renderer_state = &self.renderer_state,
-            .renderer_wakeup = render_thread.wakeup,
-            .renderer_mailbox = render_thread.mailbox,
+            .renderer_wakeup = self.renderer_thread.wakeup,
+            .renderer_mailbox = self.renderer_thread.mailbox,
             .surface_mailbox = .{ .surface = self, .app = app_mailbox },
         });
     }
@@ -824,6 +841,12 @@ pub fn init(
         rendererpkg.Thread.threadMain,
         .{&self.renderer_thread},
     );
+    errdefer {
+        self.renderer.prepareShutdown();
+        self.renderer_thread.stop.notify() catch |err|
+            log.err("error notifying renderer thread to stop, may stall err={}", .{err});
+        self.renderer_thr.join();
+    }
     self.renderer_thr.setName(global.io(), "renderer") catch {};
 
     // Start our IO thread
@@ -832,6 +855,12 @@ pub fn init(
         termio.Thread.threadMain,
         .{ &self.io_thread, &self.io },
     );
+    errdefer {
+        self.io.terminal_stream.handler.stopping.store(true, .release);
+        self.io_thread.stop.notify() catch |err|
+            log.err("error notifying io thread to stop, may stall err={}", .{err});
+        self.io_thr.join();
+    }
     self.io_thr.setName(global.io(), "io") catch {};
 
     // Determine our initial window size if configured. We need to do this
@@ -894,23 +923,21 @@ pub fn init(
     app.first = false;
 }
 
+fn stopThreads(self: *Surface) void {
+    self.io.terminal_stream.handler.stopping.store(true, .release);
+    self.io_thread.stop.notify() catch |err|
+        log.err("error notifying io thread to stop, may stall err={}", .{err});
+    if (self.search) |*search| search.deinit();
+    self.io_thr.join();
+    if (comptime builtin.is_test) if (self.shutdown_probe) |probe| probe.before_renderer_stop(probe.userdata);
+    self.renderer_thread.stop.notify() catch |err|
+        log.err("error notifying renderer thread to stop, may stall err={}", .{err});
+    self.renderer_thr.join();
+}
+
 pub fn deinit(self: *Surface) void {
-    // Stop search thread
-    if (self.search) |*s| s.deinit();
-
-    // Stop rendering thread
-    {
-        self.renderer_thread.stop.notify() catch |err|
-            log.err("error notifying renderer thread to stop, may stall err={}", .{err});
-        self.renderer_thr.join();
-    }
-
-    // Stop our IO thread
-    {
-        self.io_thread.stop.notify() catch |err|
-            log.err("error notifying io thread to stop, may stall err={}", .{err});
-        self.io_thr.join();
-    }
+    self.renderer.prepareShutdown();
+    self.stopThreads();
 
     // We need to deinit AFTER everything is stopped, since there are
     // shared values between the two threads.
@@ -1551,6 +1578,23 @@ fn passwordInput(self: *Surface, v: bool) !void {
     try self.queueRender();
 }
 
+fn retireSearch(self: *Surface, reset: *const fn (*Surface) void) void {
+    if (self.search) |*search| {
+        search.deinit();
+        self.search = null;
+        reset(self);
+    }
+}
+
+fn resetSearchHost(self: *Surface) void {
+    _ = self.rt_app.performAction(.{ .surface = self }, .search_total, .{ .total = null }) catch |err| {
+        log.warn("failed to reset search total err={}", .{err});
+    };
+    _ = self.rt_app.performAction(.{ .surface = self }, .search_selected, .{ .selected = null }) catch |err| {
+        log.warn("failed to reset search selection err={}", .{err});
+    };
+}
+
 fn searchCallback(event: terminal.search.Thread.Event, ud: ?*anyopaque) void {
     // IMPORTANT: This function is run on the SEARCH THREAD! It is NOT SAFE
     // to access anything other than values that never change on the surface.
@@ -1570,46 +1614,40 @@ fn searchCallback_(
 
     switch (event) {
         .viewport_matches => |matches_unowned| {
-            var arena: ArenaAllocator = .init(self.alloc);
-            errdefer arena.deinit();
-            const alloc = arena.allocator();
-
-            const matches = try alloc.dupe(terminal.highlight.Flattened, matches_unowned);
-            for (matches) |*m| m.* = try m.clone(alloc);
-
+            try self.renderer_thread.wakeup.notify();
+            const owned: rendererpkg.Message.SearchMatches = owned: {
+                var arena: ArenaAllocator = .init(self.alloc);
+                errdefer arena.deinit();
+                const alloc = arena.allocator();
+                const matches = try alloc.dupe(terminal.highlight.Flattened, matches_unowned);
+                for (matches) |*match| match.* = try match.clone(alloc);
+                break :owned .{ .arena = arena, .matches = matches };
+            };
             _ = self.renderer_thread.mailbox.push(
                 global.io(),
-                .{ .search_viewport_matches = .{
-                    .arena = arena,
-                    .matches = matches,
-                } },
+                .{ .search_viewport_matches = owned },
                 .forever,
             );
             try self.renderer_thread.wakeup.notify();
         },
 
         .selected_match => |selected_| {
+            try self.renderer_thread.wakeup.notify();
             if (selected_) |sel| {
-                // Copy the flattened match.
-                var arena: ArenaAllocator = .init(self.alloc);
-                errdefer arena.deinit();
-                const alloc = arena.allocator();
-                const match = try sel.highlight.clone(alloc);
-
+                const owned: rendererpkg.Message.SearchMatch = owned: {
+                    var arena: ArenaAllocator = .init(self.alloc);
+                    errdefer arena.deinit();
+                    const match = try sel.highlight.clone(arena.allocator());
+                    break :owned .{ .arena = arena, .match = match };
+                };
                 _ = self.renderer_thread.mailbox.push(
                     global.io(),
-                    .{ .search_selected_match = .{
-                        .arena = arena,
-                        .match = match,
-                    } },
+                    .{ .search_selected_match = owned },
                     .forever,
                 );
 
                 // Send the selected index to the surface mailbox
-                _ = self.surfaceMailbox().push(
-                    .{ .search_selected = sel.idx },
-                    .forever,
-                );
+                self.search.?.surfaceMessage(self.surfaceMailbox(), .{ .search_selected = sel.idx });
             } else {
                 // Reset our selected match
                 _ = self.renderer_thread.mailbox.push(
@@ -1619,24 +1657,19 @@ fn searchCallback_(
                 );
 
                 // Reset the selected index
-                _ = self.surfaceMailbox().push(
-                    .{ .search_selected = null },
-                    .forever,
-                );
+                self.search.?.surfaceMessage(self.surfaceMailbox(), .{ .search_selected = null });
             }
 
             try self.renderer_thread.wakeup.notify();
         },
 
         .total_matches => |total| {
-            _ = self.surfaceMailbox().push(
-                .{ .search_total = total },
-                .forever,
-            );
+            self.search.?.surfaceMessage(self.surfaceMailbox(), .{ .search_total = total });
         },
 
         // When we quit, tell our renderer to reset any search state.
         .quit => {
+            try self.renderer_thread.wakeup.notify();
             _ = self.renderer_thread.mailbox.push(
                 global.io(),
                 .{ .search_selected_match = null },
@@ -1653,14 +1686,8 @@ fn searchCallback_(
             try self.renderer_thread.wakeup.notify();
 
             // Reset search totals in the surface
-            _ = self.surfaceMailbox().push(
-                .{ .search_total = null },
-                .forever,
-            );
-            _ = self.surfaceMailbox().push(
-                .{ .search_selected = null },
-                .forever,
-            );
+            self.search.?.surfaceMessage(self.surfaceMailbox(), .{ .search_total = null });
+            self.search.?.surfaceMessage(self.surfaceMailbox(), .{ .search_selected = null });
         },
 
         // Unhandled, so far.
@@ -5161,10 +5188,7 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             // that GUIs can clean up stale stuff.
             const performed = self.search != null;
 
-            if (self.search) |*s| {
-                s.deinit();
-                self.search = null;
-            }
+            self.retireSearch(resetSearchHost);
 
             _ = try self.rt_app.performAction(
                 .{ .surface = self },
@@ -5207,8 +5231,7 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
 
             // Zero-length text means stop searching.
             if (text.len == 0) {
-                s.deinit();
-                self.search = null;
+                self.retireSearch(resetSearchHost);
                 break :search;
             }
 
@@ -6935,4 +6958,214 @@ test "font size action event preserves semantic mutation" {
             false,
         ) == null,
     );
+}
+
+test "surface shutdown keeps renderer alive for search quit" {
+    try testShutdownPressure(false);
+}
+
+test "surface shutdown keeps renderer alive for IO resize" {
+    try testShutdownPressure(true);
+}
+
+fn testShutdownPressure(do_resize: bool) !void {
+    const testing = std.testing;
+    const Context = struct {
+        surface: *Surface,
+        resize: bool,
+        released: std.Io.Event = .unset,
+        search_done: std.atomic.Value(bool) = .init(false),
+        io_done: std.atomic.Value(bool) = .init(false),
+        renderer_done: std.atomic.Value(bool) = .init(false),
+        order_ok: bool = false,
+
+        fn beforeStop(ud: *anyopaque) void {
+            const c: *@This() = @ptrCast(@alignCast(ud));
+            c.order_ok = c.search_done.load(.acquire) and c.io_done.load(.acquire);
+            c.renderer_done.store(true, .release);
+            c.released.set(global.io());
+        }
+        fn searchEvent(event: terminal.search.Thread.Event, ud: ?*anyopaque) void {
+            const c: *@This() = @ptrCast(@alignCast(ud.?));
+            if (event != .quit) return;
+            c.released.set(global.io());
+            c.surface.searchCallback_(event) catch unreachable;
+            c.search_done.store(true, .release);
+            c.surface.renderer_thread.wakeup.notify() catch unreachable;
+        }
+        fn ioMain(c: *@This()) void {
+            var loop = &c.surface.io_thread.loop;
+            var completion: global.xev.Completion = .{};
+            c.surface.io_thread.stop.wait(loop, &completion, @This(), c, ioStop);
+            loop.run(.until_done) catch unreachable;
+        }
+        fn ioStop(c_: ?*@This(), loop: *global.xev.Loop, _: *global.xev.Completion, _: global.xev.Async.WaitError!void) global.xev.CallbackAction {
+            const c = c_.?;
+            c.released.set(global.io());
+            var td: termio.Termio.ThreadData = undefined;
+            if (c.resize) c.surface.io.resize(&td, .{
+                .screen = .{ .width = 200, .height = 40 },
+                .cell = .{ .width = 10, .height = 20 },
+                .padding = .{},
+            }) catch unreachable;
+            c.io_done.store(true, .release);
+            c.surface.renderer_thread.wakeup.notify() catch unreachable;
+            loop.stop();
+            return .disarm;
+        }
+        fn drain(c: *@This(), loop: *global.xev.Loop) void {
+            while (c.surface.renderer_thread.mailbox.pop(global.io())) |message| switch (message) {
+                .search_selected_match => |v| if (v) |owned| owned.arena.deinit(),
+                .search_viewport_matches => |owned| owned.arena.deinit(),
+                else => {},
+            };
+            if (c.renderer_done.load(.acquire)) loop.stop();
+        }
+        fn rendererWake(c_: ?*@This(), loop: *global.xev.Loop, _: *global.xev.Completion, _: global.xev.Async.WaitError!void) global.xev.CallbackAction {
+            c_.?.drain(loop);
+            return .rearm;
+        }
+        fn rendererMain(c: *@This()) void {
+            c.released.waitTimeout(global.io(), .{ .duration = .{ .clock = .awake, .raw = .fromSeconds(5) } }) catch unreachable;
+            var loop = global.xev.Loop.init(.{}) catch unreachable;
+            defer loop.deinit();
+            var wake: global.xev.Completion = .{};
+            var stop: global.xev.Completion = .{};
+            c.surface.renderer_thread.wakeup.wait(&loop, &wake, @This(), c, rendererWake);
+            c.surface.renderer_thread.stop.wait(&loop, &stop, @This(), c, rendererWake);
+            c.drain(&loop);
+            loop.run(.until_done) catch unreachable;
+        }
+    };
+    var surface: Surface = undefined;
+    var context: Context = .{ .surface = &surface, .resize = do_resize, .search_done = .init(do_resize) };
+    var app: App = undefined;
+    app.mailbox = .{};
+    var rt_app: apprt.App = undefined;
+    surface.app = &app;
+    surface.rt_app = &rt_app;
+    surface.shutdown_probe = .{ .before_renderer_stop = Context.beforeStop, .userdata = &context };
+    surface.alloc = testing.allocator;
+    var mutex: std.Io.Mutex = .init;
+    surface.io.terminal = try .init(testing.io, testing.allocator, .{ .cols = 20, .rows = 2 });
+    defer surface.io.terminal.deinit(testing.allocator);
+    surface.renderer_state = .{ .mutex = &mutex, .terminal = &surface.io.terminal };
+    surface.io.renderer_state = &surface.renderer_state;
+    surface.io.alloc = testing.allocator;
+    surface.io.backend = .{ .manual = try .init(testing.allocator, .{}) };
+    surface.io.terminal_stream.handler.stopping = .init(false);
+    surface.io_thread = try .init(testing.allocator);
+    defer surface.io_thread.deinit();
+    surface.renderer_thread.stop = try .init();
+    defer surface.renderer_thread.stop.deinit();
+    surface.renderer_thread.wakeup = try .init();
+    defer surface.renderer_thread.wakeup.deinit();
+    var mailbox: rendererpkg.Thread.Mailbox = .{};
+    surface.renderer_thread.mailbox = &mailbox;
+    surface.io.renderer_mailbox = &mailbox;
+    surface.io.renderer_wakeup = surface.renderer_thread.wakeup;
+    for (0..64) |_| _ = mailbox.push(global.io(), .{ .search_selected_match = null }, .instant);
+    try testing.expectEqual(@as(rendererpkg.Thread.Mailbox.Size, 0), mailbox.push(global.io(), .{ .search_selected_match = null }, .instant));
+    surface.search = null;
+    if (!do_resize) {
+        surface.search = .{
+            .state = try .init(testing.allocator, .{
+                .mutex = &mutex,
+                .terminal = &surface.io.terminal,
+                .event_cb = Context.searchEvent,
+                .event_userdata = &context,
+            }),
+            .thread = undefined,
+        };
+        surface.search.?.thread = try .spawn(.{}, terminal.search.Thread.threadMain, .{&surface.search.?.state});
+    }
+    surface.io_thr = try .spawn(.{}, Context.ioMain, .{&context});
+    surface.renderer_thr = try .spawn(.{}, Context.rendererMain, .{&context});
+    surface.stopThreads();
+    try testing.expect(context.order_ok);
+    try testing.expect(mailbox.pop(global.io()) == null);
+}
+
+test "live search retirement with full app capacity publishes final reset" {
+    const testing = std.testing;
+    const Context = struct {
+        surface: *Surface,
+        worker_id: std.Thread.Id = 0,
+        reset_calls: usize = 0,
+        fn event(value: terminal.search.Thread.Event, ud: ?*anyopaque) void {
+            const c: *@This() = @ptrCast(@alignCast(ud.?));
+            c.worker_id = std.Thread.getCurrentId();
+            c.surface.searchCallback_(value) catch unreachable;
+        }
+        fn reset(surface: *Surface) void {
+            const c: *@This() = @ptrCast(@alignCast(surface.rt_surface));
+            std.debug.assert(surface.search == null);
+            std.debug.assert(c.worker_id != std.Thread.getCurrentId());
+            c.reset_calls += 1;
+        }
+    };
+    var app: App = undefined;
+    app.mailbox = .{};
+    for (0..64) |_| _ = app.mailbox.push(global.io(), .{ .open_config = .os_open }, .instant);
+    var rt_app: apprt.App = undefined;
+    var surface: Surface = undefined;
+    surface.app = &app;
+    surface.rt_app = &rt_app;
+    surface.alloc = testing.allocator;
+    var context: Context = .{ .surface = &surface };
+    surface.rt_surface = @ptrCast(&context);
+    var terminal_state = try terminal.Terminal.init(testing.io, testing.allocator, .{ .cols = 20, .rows = 2 });
+    defer terminal_state.deinit(testing.allocator);
+    var mutex: std.Io.Mutex = .init;
+    surface.renderer_state = .{ .mutex = &mutex, .terminal = &terminal_state };
+    surface.renderer_thread.wakeup = try .init();
+    defer surface.renderer_thread.wakeup.deinit();
+    var mailbox: rendererpkg.Thread.Mailbox = .{};
+    surface.renderer_thread.mailbox = &mailbox;
+    defer while (mailbox.pop(global.io())) |message| switch (message) {
+        .search_viewport_matches => |owned| owned.arena.deinit(),
+        .search_selected_match => |value| if (value) |owned| owned.arena.deinit(),
+        else => {},
+    };
+    surface.search = .{
+        .state = try .init(testing.allocator, .{
+            .mutex = &mutex,
+            .terminal = &terminal_state,
+            .event_cb = Context.event,
+            .event_userdata = &context,
+        }),
+        .thread = undefined,
+    };
+    surface.search.?.thread = try .spawn(.{}, terminal.search.Thread.threadMain, .{&surface.search.?.state});
+    surface.retireSearch(Context.reset);
+    try testing.expectEqual(@as(usize, 1), context.reset_calls);
+    surface.retireSearch(Context.reset);
+    try testing.expectEqual(@as(usize, 1), context.reset_calls);
+    var resets: usize = 0;
+    while (app.mailbox.pop(global.io())) |message| switch (message) {
+        .surface_message => |value| switch (value.message) {
+            .search_total, .search_selected => resets += 1,
+            else => {},
+        },
+        else => {},
+    };
+    try testing.expectEqual(@as(usize, 0), resets);
+}
+
+test "surface shutdown cancels search sends against full app capacity" {
+    const testing = std.testing;
+    var search: Search = undefined;
+    search.stopping = .init(true);
+    var app: apprt.App = undefined;
+    var surface: Surface = undefined;
+    var queue: App.Mailbox.Queue = .{};
+    const mailbox: apprt.surface.Mailbox = .{ .surface = &surface, .app = .{ .rt_app = &app, .mailbox = &queue } };
+    for (0..64) |_| _ = queue.push(global.io(), .{ .open_config = .os_open }, .instant);
+    search.surfaceMessage(mailbox, .{ .search_total = 1 });
+    var count: usize = 0;
+    while (queue.pop(global.io())) |_| count += 1;
+    try testing.expectEqual(@as(usize, 64), count);
+    search.stopping.store(false, .release);
+    search.surfaceMessage(mailbox, .{ .search_total = 2 });
+    try testing.expectEqual(@as(?usize, 2), queue.pop(global.io()).?.surface_message.message.search_total);
 }
