@@ -711,6 +711,10 @@ pub const Surface = struct {
         return self.size;
     }
 
+    pub fn suppressTerminalResponses(self: *const Surface) bool {
+        return self.io_mode.suppressesTerminalResponses();
+    }
+
     pub fn usesManualIo(self: *const Surface) bool {
         return self.io_mode.usesManualIo();
     }

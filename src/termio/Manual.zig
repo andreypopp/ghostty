@@ -137,15 +137,28 @@ test "manual queueWrite preserves encoded user input" {
 pub const IoMode = enum(c_int) {
     exec = 0,
     manual = 1,
+    manual_mirror = 2,
 
     pub fn usesManualIo(self: IoMode) bool {
         return switch (self) {
             .exec => false,
-            .manual => true,
+            .manual, .manual_mirror => true,
         };
     }
 
+    pub fn suppressesTerminalResponses(self: IoMode) bool {
+        return self == .manual_mirror;
+    }
 };
+
+test "manual mirror IO mode distinguishes transport and response ownership" {
+    try std.testing.expectEqual(@as(c_int, 2), @intFromEnum(IoMode.manual_mirror));
+    try std.testing.expect(!IoMode.exec.usesManualIo());
+    try std.testing.expect(IoMode.manual.usesManualIo());
+    try std.testing.expect(IoMode.manual_mirror.usesManualIo());
+    try std.testing.expect(!IoMode.manual.suppressesTerminalResponses());
+    try std.testing.expect(IoMode.manual_mirror.suppressesTerminalResponses());
+}
 
 test {
     _ = @import("../apprt/embedded_grid.zig");
