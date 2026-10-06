@@ -16,6 +16,71 @@ const posix = std.posix;
 
 const log = std.log.scoped(.io_handler);
 
+fn suppressTerminalResponse(enabled: bool, msg: termio.Message) bool {
+    if (!enabled) return false;
+    switch (msg) {
+        .write_small,
+        .write_stable,
+        .color_scheme_report,
+        .size_report,
+        .focused,
+        .visibility_report,
+        => return true,
+        .write_alloc => |req| {
+            req.alloc.free(req.data);
+            return true;
+        },
+        else => return false,
+    }
+}
+
+test "terminal response suppression drops every parser reply class" {
+    const testing = std.testing;
+
+    // Device attributes and status reports use the stable and small write
+    // variants respectively.
+    try testing.expect(suppressTerminalResponse(
+        true,
+        .{ .write_stable = "\x1b[?62;22c" },
+    ));
+
+    var dsr: termio.Message = .{ .write_small = .{} };
+    const dsr_bytes = "\x1b[12;34R";
+    @memcpy(dsr.write_small.data[0..dsr_bytes.len], dsr_bytes);
+    dsr.write_small.len = dsr_bytes.len;
+    try testing.expect(suppressTerminalResponse(true, dsr));
+
+    // OSC and DCS replies can exceed the inline message storage and therefore
+    // exercise the allocating variant. The suppression path owns and frees it.
+    const long_osc_reply: []const u8 = "\x1b]4;0;rgb:00/00/00;1;rgb:ff/ff/ff;2;rgb:00/00/00;3;rgb:ff/ff/ff\x1b\\";
+    const osc = try termio.Message.writeReq(testing.allocator, long_osc_reply);
+    try testing.expect(suppressTerminalResponse(true, osc));
+
+    try testing.expect(!suppressTerminalResponse(
+        false,
+        .{ .write_stable = "reply" },
+    ));
+    try testing.expect(suppressTerminalResponse(
+        true,
+        .{ .size_report = .csi_18_t },
+    ));
+    try testing.expect(suppressTerminalResponse(
+        true,
+        .{ .color_scheme_report = .{ .force = true } },
+    ));
+    try testing.expect(suppressTerminalResponse(
+        true,
+        .{ .focused = true },
+    ));
+
+    // State-changing parser messages are never terminal replies and must
+    // continue to reach the Termio side in mirror mode.
+    try testing.expect(!suppressTerminalResponse(
+        true,
+        .{ .linefeed_mode = true },
+    ));
+}
+
 /// This is used as the handler for the terminal.Stream type. This is
 /// stateful and is expected to live for the entire lifetime of the terminal.
 /// It is NOT VALID to stop a stream handler, create a new one, and use that
@@ -58,6 +123,10 @@ pub const StreamHandler = struct {
     /// Whether DECRQCRA may report the checksum of an area of the screen,
     /// and XTCHECKSUM may change how it's calculated.
     xt_checksum_report: bool,
+
+    /// When another terminal core owns the PTY protocol, Ghostty is only a
+    /// render/input mirror and must not emit a second copy of protocol replies.
+    suppress_terminal_responses: bool = false,
 
     //---------------------------------------------------------------
     // Internal state
@@ -147,6 +216,8 @@ pub const StreamHandler = struct {
     }
 
     inline fn messageWriter(self: *StreamHandler, msg: termio.Message) void {
+        if (suppressTerminalResponse(self.suppress_terminal_responses, msg))
+            return;
         self.termio_mailbox.send(msg, self.renderer_state.mutex);
         self.termio_messaged = true;
     }
@@ -1057,6 +1128,7 @@ pub const StreamHandler = struct {
         self: *StreamHandler,
         v: terminal.osc.Command.KittyClipboardProtocol,
     ) error{ OutOfMemory, WriteFailed }!void {
+        if (self.suppress_terminal_responses) return;
         const kitty_clipboard = terminal.kitty.clipboard;
 
         // Decode and validate the metadata. Malformed structure drops
@@ -2000,4 +2072,15 @@ test "kitty clipboard write: oversized text replies EFBIG" {
     // Teardown leaves no transaction that could be committed and
     // forwarded to the macOS clipboard path.
     try testing.expect(mailbox.spsc.queue.pop(global.io()) == null);
+}
+
+
+test "manual mirror rejects Kitty clipboard packets without replies or host access" {
+    var handler: StreamHandler = undefined;
+    handler.suppress_terminal_responses = true;
+    handler.kitty_clipboard_write = null;
+    for ([_][]const u8{ "type=read", "type=write", "type=wdata", "type=walias" }) |metadata| {
+        try handler.kittyClipboard(.{ .metadata = metadata, .payload = "SGVsbG8=", .terminator = .st });
+        try std.testing.expect(handler.kitty_clipboard_write == null);
+    }
 }
