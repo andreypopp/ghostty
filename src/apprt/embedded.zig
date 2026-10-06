@@ -2332,6 +2332,10 @@ pub const CAPI = struct {
         surface.core_surface.io.raiseScrollbackLimit();
     }
 
+    export fn ghostty_surface_restore_output(surface: *Surface, ptr: [*]const u8, len: usize) void {
+        surface.core_surface.io.restoreOutput(ptr[0..len]);
+    }
+
     export fn ghostty_surface_viewport_anchor(surface: *Surface, text: *Text) usize {
         const state = &surface.core_surface.renderer_state;
         state.mutex.lockUncancelable(global.io());

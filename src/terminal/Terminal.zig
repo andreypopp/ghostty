@@ -3878,6 +3878,59 @@ pub fn eraseDisplay(
     }
 }
 
+test "Terminal clearScreen prompt history and alternate policies" {
+    for ([_]bool{ false, true }) |prompt| {
+        for ([_]bool{ false, true }) |history| {
+            var t = try init(testing.io, testing.allocator, .{ .cols = 10, .rows = 3 });
+            defer t.deinit(testing.allocator);
+            for (0..10) |_| {
+                try t.printString("output");
+                t.carriageReturn();
+                try t.linefeed();
+            }
+            if (prompt) try t.semanticPrompt(.init(.fresh_line_new_prompt));
+            try t.printString(if (prompt) "$ " else "live");
+            try testing.expectEqual(prompt, t.clearScreen(history));
+            if (history) try testing.expectEqual(@as(usize, t.rows), t.screens.active.pages.total_rows);
+            const text = try t.plainString(testing.allocator);
+            defer testing.allocator.free(text);
+            try testing.expectEqualStrings(if (prompt) "" else if (history) "live" else "\n\nlive", text);
+            _ = try t.switchScreen(.alternate);
+            try t.printString("alternate");
+            try testing.expect(!t.clearScreen(history));
+            const alt = try t.plainString(testing.allocator);
+            defer testing.allocator.free(alt);
+            try testing.expectEqualStrings("alternate", alt);
+        }
+    }
+}
+
+pub fn clearScreen(self: *Terminal, history: bool) bool {
+    if (self.screens.active_key == .alternate) return false;
+    self.screens.active.clearSelection();
+    if (self.cursorIsAtPrompt()) {
+        self.eraseDisplay(.complete, false);
+        if (history) self.eraseDisplay(.scrollback, false);
+        return true;
+    }
+    if (history) self.eraseDisplay(.scrollback, false);
+    if (self.screens.active.cursor.y > 0) {
+        const above = self.screens.active.cursor.y - 1;
+        if (history) {
+            self.screens.active.eraseActive(above);
+        } else {
+            self.screens.active.clearRows(.{ .active = .{} }, .{ .active = .{ .y = above } }, false);
+        }
+    }
+    if (comptime build_options.kitty_graphics) self.screens.active.kitty_images.delete(
+        self.io(),
+        self.screens.active.alloc,
+        self,
+        .{ .all = true },
+    );
+    return false;
+}
+
 /// Resets all margins and fills the whole screen with the character 'E'
 ///
 /// Sets the cursor to the top left corner.
