@@ -191,6 +191,67 @@ last_bell_time: ?std.Io.Timestamp = null,
 /// the appropriate action after an input event. For example, key
 /// input can be forwarded to the OS for further processing if it
 /// wasn't handled in any way by Ghostty.
+/// The semantic font mutation performed by one binding action.
+pub const FontSizeActionKind = enum(c_int) {
+    increase = 0,
+    decrease = 1,
+    reset = 2,
+    set = 3,
+};
+
+/// The resolved native state surrounding one performed font binding action.
+pub const FontSizeActionEvent = struct {
+    kind: FontSizeActionKind,
+    previous_points: f32,
+    current_points: f32,
+    previous_adjusted: bool,
+    current_adjusted: bool,
+};
+
+fn fontSizeActionEvent(
+    action: input.Binding.Action,
+    previous_points: f32,
+    current_points: f32,
+    previous_adjusted: bool,
+    current_adjusted: bool,
+) ?FontSizeActionEvent {
+    const kind: FontSizeActionKind = switch (action) {
+        .increase_font_size => .increase,
+        .decrease_font_size => .decrease,
+        .reset_font_size => .reset,
+        .set_font_size => .set,
+        else => return null,
+    };
+    return .{
+        .kind = kind,
+        .previous_points = previous_points,
+        .current_points = current_points,
+        .previous_adjusted = previous_adjusted,
+        .current_adjusted = current_adjusted,
+    };
+}
+
+fn fontSizeActionDidPerform(
+    self: *Surface,
+    action: input.Binding.Action,
+    previous_points: f32,
+    previous_adjusted: bool,
+) void {
+    if (comptime @hasDecl(
+        apprt.runtime.Surface,
+        "fontSizeActionDidPerform",
+    )) {
+        const event = fontSizeActionEvent(
+            action,
+            previous_points,
+            self.font_size.points,
+            previous_adjusted,
+            self.font_size_adjusted,
+        ) orelse return;
+        self.rt_surface.fontSizeActionDidPerform(event);
+    }
+}
+
 pub const InputEffect = enum {
     /// The input was not handled in any way by Ghostty and should be
     /// forwarded to other subsystems (i.e. the OS) for further
@@ -5224,6 +5285,9 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
         )) == .started,
 
         .increase_font_size => |delta| {
+            const previous_points = self.font_size.points;
+            const previous_adjusted = self.font_size_adjusted;
+
             // Max delta is somewhat arbitrary.
             const clamped_delta = @max(0, @min(255, delta));
 
@@ -5236,9 +5300,17 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
 
             // Mark that we manually adjusted the font size
             self.font_size_adjusted = true;
+            self.fontSizeActionDidPerform(
+                action,
+                previous_points,
+                previous_adjusted,
+            );
         },
 
         .decrease_font_size => |delta| {
+            const previous_points = self.font_size.points;
+            const previous_adjusted = self.font_size_adjusted;
+
             // Max delta is somewhat arbitrary.
             const clamped_delta = @max(0, @min(255, delta));
 
@@ -5250,9 +5322,17 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
 
             // Mark that we manually adjusted the font size
             self.font_size_adjusted = true;
+            self.fontSizeActionDidPerform(
+                action,
+                previous_points,
+                previous_adjusted,
+            );
         },
 
         .reset_font_size => {
+            const previous_points = self.font_size.points;
+            const previous_adjusted = self.font_size_adjusted;
+
             log.debug("reset font size", .{});
 
             var size = self.font_size;
@@ -5261,9 +5341,17 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
 
             // Reset font size also resets the manual adjustment state
             self.font_size_adjusted = false;
+            self.fontSizeActionDidPerform(
+                action,
+                previous_points,
+                previous_adjusted,
+            );
         },
 
         .set_font_size => |points| {
+            const previous_points = self.font_size.points;
+            const previous_adjusted = self.font_size_adjusted;
+
             log.debug("set font size={d}", .{points});
 
             var size = self.font_size;
@@ -5272,6 +5360,11 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
 
             // Mark that we manually adjusted the font size
             self.font_size_adjusted = true;
+            self.fontSizeActionDidPerform(
+                action,
+                previous_points,
+                previous_adjusted,
+            );
         },
 
         .prompt_surface_title => return try self.rt_app.performAction(
@@ -6745,4 +6838,49 @@ test "promptClickRelativeRow" {
         );
         try testing.expectEqual(case.expected, promptClickRelativeRow(&pages, prompt, click));
     }
+}
+
+test "font size action event preserves semantic mutation" {
+    const absolute = fontSizeActionEvent(
+        .{ .set_font_size = 400 },
+        12,
+        255,
+        false,
+        true,
+    ).?;
+    try std.testing.expectEqual(
+        FontSizeActionKind.set,
+        absolute.kind,
+    );
+    try std.testing.expectEqual(@as(f32, 12), absolute.previous_points);
+    try std.testing.expectEqual(@as(f32, 255), absolute.current_points);
+    try std.testing.expect(!absolute.previous_adjusted);
+    try std.testing.expect(absolute.current_adjusted);
+
+    const clamped_relative = fontSizeActionEvent(
+        .{ .increase_font_size = 1 },
+        255,
+        255,
+        false,
+        true,
+    ).?;
+    try std.testing.expectEqual(
+        FontSizeActionKind.increase,
+        clamped_relative.kind,
+    );
+    try std.testing.expectEqual(
+        clamped_relative.previous_points,
+        clamped_relative.current_points,
+    );
+    try std.testing.expect(clamped_relative.current_adjusted);
+
+    try std.testing.expect(
+        fontSizeActionEvent(
+            .copy_title_to_clipboard,
+            12,
+            12,
+            false,
+            false,
+        ) == null,
+    );
 }

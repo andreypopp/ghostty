@@ -183,7 +183,10 @@ pub fn updateConfig(self: *App, rt_app: *apprt.App, config: *const Config) !void
     for (self.surfaces.items) |surface| {
         try surface.core().handleMessage(.{ .change_config = config });
     }
+    try self.updateConfigWithoutSurfacePropagation(rt_app, config);
+}
 
+pub fn updateConfigWithoutSurfacePropagation(self: *App, rt_app: *apprt.App, config: *const Config) !void {
     // Apply our conditional state. If we fail to apply the conditional state
     // then we log and attempt to move forward with the old config.
     // We only apply this to the app-level config because the surface
