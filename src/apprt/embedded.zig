@@ -2176,6 +2176,10 @@ pub const CAPI = struct {
         if (resolved) |result| result.* = ghostty_surface_size(surface);
         return true;
     }
+    export fn ghostty_surface_search_generation(surface: *Surface) u64 {
+        return surface.core_surface.search_generation;
+    }
+
     export fn ghostty_surface_is_alternate_screen(surface: *Surface) bool {
         surface.core_surface.renderer_state.lockDemand(global.io());
         defer surface.core_surface.renderer_state.unlockDemand(global.io());
