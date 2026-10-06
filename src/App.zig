@@ -536,15 +536,51 @@ pub fn performAllAction(
 
 /// Handle a window message
 fn surfaceMessage(self: *App, surface: *Surface, msg: apprt.surface.Message) !void {
-    // We want to ensure our window is still active. Window messages
-    // are quite rare and we normally don't have many windows so we do
-    // a simple linear search here.
-    if (self.hasSurface(surface)) {
-        try surface.handleMessage(msg);
-    }
+    const message = messageForSurface(self.hasSurface(surface), msg) orelse return;
+    try surface.handleMessage(message);
+}
 
-    // Window was not found, it probably quit before we handled the message.
-    // Not a problem.
+test "missing surface releases accepted owning messages" {
+    const testing = std.testing;
+    const Requests = struct {
+        fn create(comptime T: type, alloc: Allocator) !*T {
+            var arena = std.heap.ArenaAllocator.init(alloc);
+            errdefer arena.deinit();
+            const result = try arena.allocator().create(T);
+            result.* = undefined;
+            result.arena = arena;
+            return result;
+        }
+    };
+    const bytes = [_]u8{'a'} ** 300;
+    for (0..4) |case| {
+        var gpa: std.heap.DebugAllocator(.{}) = .init;
+        defer _ = gpa.deinit();
+        const alloc = gpa.allocator();
+        const message: apprt.surface.Message = switch (case) {
+            0 => .{ .clipboard_write = .{ .clipboard_type = .standard, .req = try .init(alloc, @as([]const u8, &bytes)) } },
+            1 => .{ .pwd_change = try .init(alloc, @as([]const u8, &bytes)) },
+            2 => .{ .kitty_clipboard_read = try Requests.create(apprt.ClipboardRequest.KittyRead, alloc) },
+            3 => .{ .kitty_clipboard_write = try Requests.create(apprt.ClipboardRequest.KittyWrite, alloc) },
+            else => unreachable,
+        };
+        var mailbox: Mailbox.Queue = .{};
+        try testing.expect(mailbox.push(global.io(), .{ .surface_message = .{ .surface = undefined, .message = message } }, .instant) != 0);
+        const accepted = mailbox.pop(global.io()).?.surface_message.message;
+        try testing.expect(messageForSurface(false, accepted) == null);
+        const leaked = gpa.detectLeaks() != 0;
+        if (leaked) accepted.deinit();
+        try testing.expect(!leaked);
+    }
+    const live = messageForSurface(true, .{ .pwd_change = try .init(testing.allocator, @as([]const u8, &bytes)) }).?;
+    defer live.deinit();
+    try testing.expectEqualStrings(&bytes, live.pwd_change.slice());
+}
+
+fn messageForSurface(live: bool, message: apprt.surface.Message) ?apprt.surface.Message {
+    if (live) return message;
+    message.deinit();
+    return null;
 }
 
 fn hasSurface(self: *const App, surface: *const Surface) bool {
