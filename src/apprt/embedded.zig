@@ -444,6 +444,10 @@ pub const EnvVar = extern struct {
     value: [*:0]const u8,
 };
 
+pub const IoMode = @import("../termio/Manual.zig").IoMode;
+
+pub const IoWriteCallback = *const fn (?*anyopaque, [*]const u8, usize) callconv(.c) void;
+
 pub const Surface = struct {
     app: *App,
     platform: Platform,
@@ -453,6 +457,9 @@ pub const Surface = struct {
     size: apprt.SurfaceSize,
     cursor_pos: apprt.CursorPos,
     inspector: ?*Inspector = null,
+    io_mode: IoMode = .exec,
+    io_write_cb: ?IoWriteCallback = null,
+    io_write_userdata: ?*anyopaque = null,
 
     /// The current title of the surface. The embedded apprt saves this so
     /// that getTitle works without the implementer needing to save it.
@@ -499,6 +506,15 @@ pub const Surface = struct {
 
         /// Context for the new surface
         context: apprt.surface.NewSurfaceContext = .window,
+
+        /// IO mode for the surface.
+        io_mode: IoMode = .exec,
+
+        /// Callback invoked when Ghostty wants to write to the backend.
+        io_write_cb: ?IoWriteCallback = null,
+
+        /// Userdata passed to io_write_cb.
+        io_write_userdata: ?*anyopaque = null,
     };
 
     pub fn init(self: *Surface, app: *App, opts: Options) !void {
@@ -513,6 +529,9 @@ pub const Surface = struct {
             },
             .size = .{ .width = 800, .height = 600 },
             .cursor_pos = .{ .x = -1, .y = -1 },
+            .io_mode = opts.io_mode,
+            .io_write_cb = opts.io_write_cb,
+            .io_write_userdata = opts.io_write_userdata,
         };
 
         // Add ourselves to the list of surfaces on the app.
@@ -690,6 +709,18 @@ pub const Surface = struct {
 
     pub fn getSize(self: *const Surface) !apprt.SurfaceSize {
         return self.size;
+    }
+
+    pub fn usesManualIo(self: *const Surface) bool {
+        return self.io_mode.usesManualIo();
+    }
+
+    pub fn ioWriteCallback(self: *const Surface) ?IoWriteCallback {
+        return self.io_write_cb;
+    }
+
+    pub fn ioWriteUserdata(self: *const Surface) ?*anyopaque {
+        return self.io_write_userdata;
     }
 
     pub fn getTitle(self: *Surface) ?[:0]const u8 {
@@ -1040,6 +1071,32 @@ pub const Surface = struct {
         };
     }
 
+    pub fn updateGridSize(self: *Surface, columns: u16, rows: u16) bool {
+        const requested: renderer.GridSize = .{
+            .columns = columns,
+            .rows = rows,
+        };
+        const screen = self.core_surface.size.screenForGrid(requested) orelse
+            return false;
+        self.updateSize(screen.width, screen.height);
+
+        // Padding balancing may be recomputed by the core resize. Re-resolve
+        // once with that authoritative padding if necessary.
+        if (!self.core_surface.size.grid().equals(requested)) {
+            const adjusted = self.core_surface.size.screenForGrid(requested) orelse
+                return false;
+            self.updateSize(adjusted.width, adjusted.height);
+        }
+
+        if (!self.core_surface.size.grid().equals(requested)) return false;
+        if (self.usesManualIo()) {
+            self.core_surface.renderer_state.lockDemand(global.io());
+            defer self.core_surface.renderer_state.unlockDemand(global.io());
+            const t = self.core_surface.renderer_state.terminal;
+            return t.cols == columns and t.rows == rows;
+        }
+        return true;
+    }
     pub fn colorSchemeCallback(self: *Surface, scheme: apprt.ColorScheme) void {
         self.core_surface.colorSchemeCallback(scheme) catch |err| {
             log.err("error setting color scheme err={}", .{err});
@@ -1133,6 +1190,13 @@ pub const Surface = struct {
         };
     }
 
+    pub fn textInputCallback(self: *Surface, text: []const u8) void {
+        _ = self.core_surface.textInputCallback(text) catch |err| {
+            log.err("error in text input callback err={}", .{err});
+            return;
+        };
+    }
+
     pub fn focusCallback(self: *Surface, focused: bool) void {
         self.core_surface.focusCallback(focused) catch |err| {
             log.err("error in focus callback err={}", .{err});
@@ -1175,6 +1239,9 @@ pub const Surface = struct {
             .font_size = font_size,
             .working_directory = working_directory,
             .context = context,
+            .io_mode = self.io_mode,
+            .io_write_cb = self.io_write_cb,
+            .io_write_userdata = self.io_write_userdata,
         };
     }
 
@@ -1499,6 +1566,9 @@ pub const CAPI = struct {
             };
         }
     };
+
+    const SurfaceGridMetrics = @import("embedded_grid.zig").Metrics;
+    const surfaceGridMetricsSnapshot = @import("embedded_grid.zig").snapshot;
 
     const SurfaceSize = extern struct {
         columns: u16,
@@ -1958,6 +2028,34 @@ pub const CAPI = struct {
     }
 
     /// Return the size information a surface has.
+    export fn ghostty_surface_grid_metrics(
+        surface: *Surface,
+        result: *SurfaceGridMetrics,
+    ) bool {
+        surface.core_surface.renderer_state.lockDemand(global.io());
+        defer surface.core_surface.renderer_state.unlockDemand(global.io());
+        const screen = surface.core_surface
+            .renderer_state
+            .terminal
+            .screens
+            .active;
+        result.* = surfaceGridMetricsSnapshot(
+            surface.core_surface.size,
+            surface.content_scale,
+            screen,
+        ) orelse return false;
+        return true;
+    }
+    export fn ghostty_surface_set_grid_size(
+        surface: *Surface,
+        columns: u16,
+        rows: u16,
+        resolved: ?*SurfaceSize,
+    ) bool {
+        if (!surface.updateGridSize(columns, rows)) return false;
+        if (resolved) |result| result.* = ghostty_surface_size(surface);
+        return true;
+    }
     export fn ghostty_surface_size(surface: *Surface) SurfaceSize {
         const grid_size = surface.core_surface.size.grid();
         return .{
@@ -2075,6 +2173,17 @@ pub const CAPI = struct {
         surface.textCallback(ptr[0..len]);
     }
 
+    /// Send committed text input to the terminal. This is treated like
+    /// typed text, not a paste. Newlines are normalized to carriage
+    /// returns and bracketed paste mode is not used.
+    export fn ghostty_surface_text_input(
+        surface: *Surface,
+        ptr: [*]const u8,
+        len: usize,
+    ) void {
+        surface.textInputCallback(ptr[0..len]);
+    }
+
     /// Set the preedit text for the surface. This is used for IME
     /// composition. If the length is 0, then the preedit text is cleared.
     export fn ghostty_surface_preedit(
@@ -2083,6 +2192,16 @@ pub const CAPI = struct {
         len: usize,
     ) void {
         surface.preeditCallback(if (len == 0) null else ptr[0..len]);
+    }
+
+    /// Process output bytes as if they were read from the PTY.
+    export fn ghostty_surface_process_output(
+        surface: *Surface,
+        ptr: [*]const u8,
+        len: usize,
+    ) void {
+        if (len == 0) return;
+        surface.core_surface.io.processOutput(ptr[0..len]);
     }
 
     /// Returns true if the surface currently has mouse capturing
