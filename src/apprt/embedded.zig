@@ -1978,6 +1978,21 @@ pub const CAPI = struct {
         return surface.core_surface.child_exited;
     }
 
+    export fn ghostty_surface_scrollbar(surface: *Surface, result: *CoreSurface.AbsoluteScrollSnapshot) bool {
+        const core = &surface.core_surface;
+        core.renderer_state.lockDemand(global.io());
+        defer core.renderer_state.unlockDemand(global.io());
+        const screens = &core.renderer_state.terminal.screens;
+        const scrollbar = screens.active.pages.scrollbar();
+        result.* = .{
+            .total = @intCast(scrollbar.total),
+            .offset = @intCast(scrollbar.offset),
+            .len = @intCast(scrollbar.len),
+            .row_space_revision = core.rowSpaceIdentity(screens.active_key, screens.generation(screens.active_key), scrollbar.row_space_revision),
+        };
+        return true;
+    }
+
     export fn ghostty_surface_set_renderer_realized(surface: *Surface, realized: bool) bool {
         return surface.core_surface.renderer_thread.publishRendererRealized(realized);
     }
