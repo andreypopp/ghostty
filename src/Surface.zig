@@ -1810,6 +1810,22 @@ pub fn updateRendererHealth(self: *Surface, health: rendererpkg.Health) void {
 }
 
 /// Called when the scrollbar state changes.
+pub fn rowSpaceIdentity(self: *const Surface, key: terminal.ScreenSet.Key, generation: usize, revision: u64) u64 {
+    var hash = std.hash.Wyhash.init(self.id);
+    const key_value: u8 = @intFromEnum(key);
+    hash.update(std.mem.asBytes(&key_value));
+    hash.update(std.mem.asBytes(&generation));
+    hash.update(std.mem.asBytes(&revision));
+    return hash.final();
+}
+
+pub const AbsoluteScrollSnapshot = extern struct {
+    total: u64,
+    offset: u64,
+    len: u64,
+    row_space_revision: u64,
+};
+
 fn updateScrollbar(self: *Surface, scrollbar: terminal.Scrollbar) void {
     _ = self.rt_app.performAction(
         .{ .surface = self },
