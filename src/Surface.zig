@@ -141,6 +141,12 @@ inspector: ?*inspectorpkg.Inspector = null,
 /// All our sizing information.
 size: rendererpkg.Size,
 
+/// Guards every write of `size` and the resize that follows it, so the
+/// threads of a surface with manual IO (the main thread and the one that
+/// feeds the terminal) cannot interleave. The lock order is `size_mutex`,
+/// then `renderer_state.mutex`.
+size_mutex: std.Io.Mutex = .init,
+
 /// The configuration derived from the main config. We "derive" it so that
 /// we don't have a shared pointer hanging around that we need to worry about
 /// the lifetime of. This makes updating config at runtime easier.
@@ -662,43 +668,46 @@ pub fn init(
     // This separate block ({}) is important because our errdefers must
     // be scoped here to be valid.
     {
-        // Exec.init takes ownership of the env even if it fails, so the
-        // errdefer for it must not reach past the call.
-        const env = termio_env: {
-            var env = rt_surface.defaultTermioEnv() catch |err| env: {
-                // If an error occurs, we don't want to block surface startup.
-                log.warn("error getting env map for surface err={}", .{err});
-                break :env global.environMap() catch std.process.Environ.Map.init(alloc);
+        const use_manual_io = if (comptime @hasDecl(apprt.runtime.Surface, "usesManualIo")) rt_surface.usesManualIo() else false;
+        var io_backend: termio.Backend = if (use_manual_io) .{ .manual = try termio.Manual.init(alloc, .{
+            .write_cb = rt_surface.ioWriteCallback(),
+            .write_userdata = rt_surface.ioWriteUserdata(),
+        }) } else exec: {
+            const env = termio_env: {
+                var env = rt_surface.defaultTermioEnv() catch |err| env: {
+                    // If an error occurs, we don't want to block surface startup.
+                    log.warn("error getting env map for surface err={}", .{err});
+                    break :env global.environMap() catch std.process.Environ.Map.init(alloc);
+                };
+                errdefer env.deinit();
+
+                // don't leak GHOSTTY_LOG to any subprocesses
+                _ = env.orderedRemove("GHOSTTY_LOG");
+
+                var buf: [18]u8 = undefined;
+                try env.put(
+                    "GHOSTTY_SURFACE_ID",
+                    std.mem.print(&buf, "0x{x:0>16}", .{self.id}) catch unreachable,
+                );
+                break :termio_env env;
             };
-            errdefer env.deinit();
 
-            // don't leak GHOSTTY_LOG to any subprocesses
-            _ = env.orderedRemove("GHOSTTY_LOG");
-
-            var buf: [18]u8 = undefined;
-            try env.put(
-                "GHOSTTY_SURFACE_ID",
-                std.mem.print(&buf, "0x{x:0>16}", .{self.id}) catch unreachable,
-            );
-
-            break :termio_env env;
+            const io_exec = try termio.Exec.init(alloc, .{
+                .command = command,
+                .env = env,
+                .env_override = config.env,
+                .shell_integration = config.@"shell-integration",
+                .shell_integration_features = config.@"shell-integration-features",
+                .cursor_blink = config.@"cursor-style-blink",
+                .working_directory = if (config.@"working-directory") |wd| wd.value() else null,
+                .resources_dir = global.resourcesDir().host(),
+                .term = config.term,
+                .rt_pre_exec_info = .init(config),
+                .rt_post_fork_info = .init(config),
+            });
+            break :exec .{ .exec = io_exec };
         };
-
-        // Initialize our IO backend
-        var io_exec = try termio.Exec.init(alloc, .{
-            .command = command,
-            .env = env,
-            .env_override = config.env,
-            .shell_integration = config.@"shell-integration",
-            .shell_integration_features = config.@"shell-integration-features",
-            .cursor_blink = config.@"cursor-style-blink",
-            .working_directory = if (config.@"working-directory") |wd| wd.value() else null,
-            .resources_dir = global.resourcesDir().host(),
-            .term = config.term,
-            .rt_pre_exec_info = .init(config),
-            .rt_post_fork_info = .init(config),
-        });
-        errdefer io_exec.deinit();
+        errdefer io_backend.deinit();
 
         // Initialize our IO mailbox
         var io_mailbox = try termio.Mailbox.initSPSC(alloc);
@@ -712,7 +721,11 @@ pub fn init(
             .size = size,
             .full_config = config,
             .config = io_config,
-            .backend = .{ .exec = io_exec },
+            .backend = io_backend,
+            .suppress_terminal_responses = if (comptime @hasDecl(apprt.runtime.Surface, "usesManualIo"))
+                rt_surface.suppressTerminalResponses()
+            else
+                false,
             .mailbox = io_mailbox,
             .renderer_state = &self.renderer_state,
             .renderer_wakeup = render_thread.wakeup,
@@ -1254,8 +1267,9 @@ fn selectionScrollTick(self: *Surface) !void {
         return;
     }
 
+    const size = self.sizeSnapshot();
     const pos = try self.rt_surface.getCursorPos();
-    const pos_vp = self.posToViewport(pos.x, pos.y);
+    const pos_vp = posToViewport(size, pos.x, pos.y);
 
     // We need our locked state for the remainder
     self.renderer_state.mutex.lockUncancelable(global.io());
@@ -1269,10 +1283,10 @@ fn selectionScrollTick(self: *Surface) !void {
         .rectangle = SurfaceMouse.isRectangleSelectState(self.mouse.mods),
         .word_boundary_codepoints = self.config.selection_word_chars,
         .geometry = .{
-            .columns = @intCast(self.size.grid().columns),
-            .cell_width = self.size.cell.width,
-            .padding_left = self.size.padding.left,
-            .screen_height = self.size.screen.height,
+            .columns = @intCast(size.grid().columns),
+            .cell_width = size.cell.width,
+            .padding_left = size.padding.left,
+            .screen_height = size.screen.height,
         },
     });
 
@@ -1384,9 +1398,10 @@ fn childExitedAbnormally(
     const alloc = arena.allocator();
 
     // Build up our command for the error message
-    const command = try std.mem.join(alloc, " ", switch (self.io.backend) {
-        .exec => |*exec| exec.subprocess.args,
-    });
+    const command = switch (self.io.backend) {
+        .exec => |*exec| try std.mem.join(alloc, " ", exec.subprocess.args),
+        .manual => "manual backend",
+    };
     const runtime_str = try alloc.print("{d} ms", .{info.runtime_ms});
 
     self.renderer_state.mutex.lockUncancelable(global.io());
@@ -1644,6 +1659,7 @@ fn mouseRefreshLinks(
     pos: apprt.CursorPos,
     pos_vp: terminal.point.Coordinate,
     over_link: bool,
+    size: rendererpkg.Size,
 ) !void {
     // If the position is outside our viewport, do nothing
     if (pos.x < 0 or pos.y < 0) return;
@@ -1681,7 +1697,7 @@ fn mouseRefreshLinks(
             }
         }
 
-        const link = (try self.linkAtPos(pos)) orelse break :link .{ null, false };
+        const link = (try self.linkAtPos(pos, size)) orelse break :link .{ null, false };
         switch (link.action) {
             .open => {
                 const str = try self.io.terminal.screens.active.selectionString(alloc, .{
@@ -1827,8 +1843,13 @@ pub fn updateConfig(
         log.err("error updating configuration err={}", .{err});
         return;
     };
-    self.config.deinit();
-    self.config = derived;
+    {
+        // The feeding thread reads the padding settings when it resizes.
+        self.size_mutex.lockUncancelable(global.io());
+        defer self.size_mutex.unlock(global.io());
+        self.config.deinit();
+        self.config = derived;
+    }
 
     // If our mouse is hidden but we disabled mouse hiding, then show it again.
     if (!self.config.mouse_hide_while_typing and self.mouse.hidden) {
@@ -1921,16 +1942,17 @@ fn recomputeInitialSize(
     if (self.config.window_height <= 0 or
         self.config.window_width <= 0) return;
 
+    const size = self.sizeSnapshot();
     const scale = self.rt_surface.getContentScale() catch
         return error.ContentScaleUnavailable;
     const height = @max(
         self.config.window_height,
         min_window_height_cells,
-    ) * self.size.cell.height;
+    ) * size.cell.height;
     const width = @max(
         self.config.window_width,
         min_window_width_cells,
-    ) * self.size.cell.width;
+    ) * size.cell.width;
     const width_f32: f32 = @floatFromInt(width);
     const height_f32: f32 = @floatFromInt(height);
 
@@ -1938,12 +1960,12 @@ fn recomputeInitialSize(
     // account for the padding so we get the exact correct grid size.
     const final_width: u32 =
         @as(u32, @intFromFloat(@ceil(width_f32 / scale.x))) +
-        self.size.padding.left +
-        self.size.padding.right;
+        size.padding.left +
+        size.padding.right;
     const final_height: u32 =
         @as(u32, @intFromFloat(@ceil(height_f32 / scale.y))) +
-        self.size.padding.top +
-        self.size.padding.bottom;
+        size.padding.top +
+        size.padding.bottom;
 
     _ = self.rt_app.performAction(
         .{ .surface = self },
@@ -2032,9 +2054,10 @@ pub fn dumpText(
     alloc: Allocator,
     sel: terminal.Selection,
 ) !Text {
+    const size = self.sizeSnapshot();
     self.renderer_state.mutex.lockUncancelable(global.io());
     defer self.renderer_state.mutex.unlock(global.io());
-    return try self.dumpTextLocked(alloc, sel);
+    return try self.dumpTextLocked(alloc, size, sel);
 }
 
 /// Same as `dumpText` but assumes the renderer state mutex is already
@@ -2042,6 +2065,7 @@ pub fn dumpText(
 pub fn dumpTextLocked(
     self: *Surface,
     alloc: Allocator,
+    size: rendererpkg.Size,
     sel: terminal.Selection,
 ) !Text {
     // Read out the text
@@ -2111,10 +2135,10 @@ pub fn dumpTextLocked(
         const content_scale = self.rt_surface.getContentScale() catch .{ .x = 1, .y = 1 };
         const x: f64 = x: {
             // Simple x * cell width gives the left
-            var x: f64 = @floatFromInt(tl_coord.x * self.size.cell.width);
+            var x: f64 = @floatFromInt(tl_coord.x * size.cell.width);
 
             // Add padding
-            x += @floatFromInt(self.size.padding.left);
+            x += @floatFromInt(size.padding.left);
 
             // Scale
             x /= content_scale.x;
@@ -2123,14 +2147,14 @@ pub fn dumpTextLocked(
         };
         const y: f64 = y: {
             // Simple y * cell height gives the top
-            var y: f64 = @floatFromInt(tl_coord.y * self.size.cell.height);
+            var y: f64 = @floatFromInt(tl_coord.y * size.cell.height);
 
             // We want the text baseline
-            y += @floatFromInt(self.size.cell.height);
+            y += @floatFromInt(size.cell.height);
             y -= @floatFromInt(self.font_metrics.cell_baseline);
 
             // Add padding
-            y += @floatFromInt(self.size.padding.top);
+            y += @floatFromInt(size.padding.top);
 
             // Scale
             y /= content_scale.y;
@@ -2220,6 +2244,7 @@ pub fn imePoint(self: *const Surface) apprt.IMEPos {
 /// Same as `imePoint`, but divides our sizes by the given scale instead
 /// of the content scale.
 pub fn imePointScaled(self: *const Surface, scale: apprt.ContentScale) apprt.IMEPos {
+    const size = self.sizeSnapshot();
     self.renderer_state.mutex.lockUncancelable(global.io());
     const cursor = self.renderer_state.terminal.screens.active.cursor;
     const preedit_width: usize = if (self.renderer_state.preedit) |preedit| preedit.width() else 0;
@@ -2232,10 +2257,10 @@ pub fn imePointScaled(self: *const Surface, scale: apprt.ContentScale) apprt.IME
 
     const x: f64 = x: {
         // Simple x * cell width gives the top-left corner, then add padding offset
-        var x: f64 = @floatFromInt(cursor.x * self.size.cell.width + self.size.padding.left);
+        var x: f64 = @floatFromInt(cursor.x * size.cell.width + size.padding.left);
 
         // We want the midpoint
-        x += @as(f64, @floatFromInt(self.size.cell.width)) / 2;
+        x += @as(f64, @floatFromInt(size.cell.width)) / 2;
 
         // And scale it
         x /= scale.x;
@@ -2245,10 +2270,10 @@ pub fn imePointScaled(self: *const Surface, scale: apprt.ContentScale) apprt.IME
 
     const y: f64 = y: {
         // Simple y * cell height gives the top-left corner, then add padding offset
-        var y: f64 = @floatFromInt(cursor.y * self.size.cell.height + self.size.padding.top);
+        var y: f64 = @floatFromInt(cursor.y * size.cell.height + size.padding.top);
 
         // We want the bottom
-        y += @floatFromInt(self.size.cell.height);
+        y += @floatFromInt(size.cell.height);
 
         // And scale it
         y /= scale.y;
@@ -2259,18 +2284,18 @@ pub fn imePointScaled(self: *const Surface, scale: apprt.ContentScale) apprt.IME
     // Our height for now is always just the cell height because our preedit
     // rendering only renders in a single line.
     const height: f64 = height: {
-        var height: f64 = @floatFromInt(self.size.cell.height);
+        var height: f64 = @floatFromInt(size.cell.height);
         height /= scale.y;
         break :height height;
     };
     const width: f64 = width: {
-        var width: f64 = @floatFromInt(preedit_width * self.size.cell.width);
+        var width: f64 = @floatFromInt(preedit_width * size.cell.width);
 
         // Our max width is the remaining screen width after the cursor.
         // We don't have to deal with wrapping because the preedit doesn't
         // wrap right now.
-        const screen_width: f64 = @floatFromInt(self.size.terminal().width);
-        const x_offset: f64 = @floatFromInt((cursor.x + 1) * self.size.cell.width);
+        const screen_width: f64 = @floatFromInt(size.terminal().width);
+        const x_offset: f64 = @floatFromInt((cursor.x + 1) * size.cell.width);
         const max = screen_width - x_offset;
         width = @min(width, max);
 
@@ -2508,12 +2533,22 @@ fn setSelectionAndCopy(self: *Surface, sel: terminal.Selection) !void {
 /// Change the cell size for the terminal grid. This can happen as
 /// a result of changing the font size at runtime.
 fn setCellSize(self: *Surface, size: rendererpkg.CellSize) !void {
-    // Update our cell size within our size struct
-    self.size.cell = size;
-    self.balancePaddingIfNeeded();
+    {
+        self.size_mutex.lockUncancelable(global.io());
+        defer self.size_mutex.unlock(global.io());
 
-    // Notify the terminal
-    self.queueIo(.{ .resize = self.size }, .unlocked);
+        // Update our cell size within our size struct. With manual IO the
+        // grid belongs to the feeder, so only the cell moves.
+        const grid = self.size.grid();
+        self.size.cell = size;
+        switch (self.io.backend) {
+            .manual => self.fitScreenToGrid(grid),
+            .exec => self.balancePaddingIfNeeded(),
+        }
+
+        // Notify the terminal
+        self.queueIo(.{ .resize = self.size }, .unlocked);
+    }
 
     // Update our terminal default size if necessary.
     self.recomputeInitialSize() catch |err| {
@@ -2598,6 +2633,12 @@ pub fn displayUnrealized(self: *Surface) void {
 }
 
 pub fn sizeCallback(self: *Surface, size: apprt.SurfaceSize) !void {
+    self.size_mutex.lockUncancelable(global.io());
+    defer self.size_mutex.unlock(global.io());
+    try self.sizeCallbackLocked(size);
+}
+
+pub fn sizeCallbackLocked(self: *Surface, size: apprt.SurfaceSize) !void {
     // Crash metadata in case we crash in here
     crash.sentry.thread_state = self.crashThreadState();
     defer crash.sentry.thread_state = null;
@@ -2615,6 +2656,44 @@ pub fn sizeCallback(self: *Surface, size: apprt.SurfaceSize) !void {
     try self.resize(new_screen_size);
 }
 
+/// The screen size, without insets, that gives `grid` at the current cell,
+/// padding and insets. Balanced padding can move with the screen, so it
+/// resolves twice. The caller holds `size_mutex`.
+pub fn screenForGrid(self: *Surface, grid: rendererpkg.GridSize) ?rendererpkg.ScreenSize {
+    var probe = self.size;
+    for (0..2) |_| {
+        const screen = probe.screenForGrid(grid) orelse return null;
+        probe.screen = .{
+            .width = screen.width,
+            .height = screen.height +| probe.top_inset +| probe.bottom_inset,
+        };
+        self.balancePaddingOf(&probe);
+        if (probe.grid().equals(grid)) return screen;
+    }
+    return null;
+}
+
+/// Keeps `grid` through a change of cell or padding. The caller holds
+/// `size_mutex`.
+fn fitScreenToGrid(self: *Surface, grid: rendererpkg.GridSize) void {
+    const screen = self.screenForGrid(grid) orelse return;
+    self.size.screen = .{
+        .width = screen.width,
+        .height = screen.height +| self.size.top_inset +| self.size.bottom_inset,
+    };
+    self.balancePaddingIfNeeded();
+}
+
+/// A copy of the size for a reader that runs while the feeding thread can
+/// resize. A caller that takes the renderer lock takes the copy first.
+pub fn sizeSnapshot(self: *const Surface) rendererpkg.Size {
+    const mutex: *std.Io.Mutex = @constCast(&self.size_mutex);
+    mutex.lockUncancelable(global.io());
+    defer mutex.unlock(global.io());
+    return self.size;
+}
+
+/// The caller holds `size_mutex`.
 fn resize(self: *Surface, size: rendererpkg.ScreenSize) !void {
     // Save our screen size
     self.size.screen = size;
@@ -2650,11 +2729,15 @@ fn resize(self: *Surface, size: rendererpkg.ScreenSize) !void {
 
 /// Recalculate the balanced padding if needed.
 fn balancePaddingIfNeeded(self: *Surface) void {
+    self.balancePaddingOf(&self.size);
+}
+
+fn balancePaddingOf(self: *Surface, size: *rendererpkg.Size) void {
     if (self.config.window_padding_balance == .false) return;
     const content_scale = try self.rt_surface.getContentScale();
     const x_dpi = content_scale.x * font.face.default_dpi;
     const y_dpi = content_scale.y * font.face.default_dpi;
-    self.size.balancePadding(self.config.scaledPadding(x_dpi, y_dpi), self.config.window_padding_balance);
+    size.balancePadding(self.config.scaledPadding(x_dpi, y_dpi), self.config.window_padding_balance);
 }
 
 /// Called to set the preedit state for character input. Preedit is used
@@ -2871,12 +2954,14 @@ pub fn keyCallback(
         {
             // Refresh our link state
             const pos = self.rt_surface.getCursorPos() catch break :mouse_mods;
+            const size = self.sizeSnapshot();
             self.renderer_state.mutex.lockUncancelable(global.io());
             defer self.renderer_state.mutex.unlock(global.io());
             self.mouseRefreshLinks(
                 pos,
-                self.posToViewport(pos.x, pos.y),
+                posToViewport(size, pos.x, pos.y),
                 self.mouse.over_link,
+                size,
             ) catch |err| {
                 log.warn("failed to refresh links err={}", .{err});
                 break :mouse_mods;
@@ -3431,6 +3516,15 @@ pub fn textCallback(self: *Surface, text: []const u8) !void {
     try self.completeClipboardPaste(text, true);
 }
 
+/// Sends committed text input to the terminal without keyboard protocol
+pub fn textInputCallback(self: *Surface, text: []const u8) !void {
+    // Crash metadata in case we crash in here
+    crash.sentry.thread_state = self.crashThreadState();
+    defer crash.sentry.thread_state = null;
+
+    try self.completeTextInput(text);
+}
+
 /// Callback for when the surface is fully visible or not, regardless
 /// of focus state. This is used to pause rendering when the surface
 /// is not visible, and also re-render when it becomes visible again.
@@ -3786,11 +3880,16 @@ pub fn contentScaleCallback(self: *Surface, content_scale: apprt.ContentScale) !
 
     try self.setFontSize(size);
 
+    self.size_mutex.lockUncancelable(global.io());
+    defer self.size_mutex.unlock(global.io());
+
     // Update our padding which is dependent on DPI. We only do this for
     // unbalanced padding since balanced padding is not dependent on DPI.
+    const grid = self.size.grid();
     if (self.config.window_padding_balance == .false) {
         self.size.padding = self.config.scaledPadding(x_dpi, y_dpi);
     }
+    if (self.io.backend == .manual) self.fitScreenToGrid(grid);
 
     // Force a resize event because the change in padding will affect
     // pixel-level changes to the renderer and viewport.
@@ -3816,6 +3915,7 @@ fn mouseReport(
     action: input.MouseAction,
     mods: input.Mods,
     pos: apprt.CursorPos,
+    size: rendererpkg.Size,
 ) void {
     // Mouse reporting must be enabled by both config and terminal state
     assert(self.config.mouse_reporting);
@@ -3826,7 +3926,7 @@ fn mouseReport(
         // Terminal and size state.
         var opts: input.mouse_encode.Options = .fromTerminal(
             &self.io.terminal,
-            self.size,
+            size,
         );
 
         // Whether any button is pressed at all.
@@ -3924,6 +4024,7 @@ pub fn mouseButtonCallback(
     // Crash metadata in case we crash in here
     crash.sentry.thread_state = self.crashThreadState();
     defer crash.sentry.thread_state = null;
+    const size = self.sizeSnapshot();
 
     // log.debug("mouse action={} button={} mods={}", .{ action, button, mods });
 
@@ -3996,7 +4097,7 @@ pub fn mouseButtonCallback(
         // gesture can conservatively treat the release as having moved away
         // from the pressed cell.
         const release_pin: ?terminal.Pin = if (release_pos) |pos| pin: {
-            const release_vp = self.posToViewport(pos.x, pos.y);
+            const release_vp = posToViewport(size, pos.x, pos.y);
             break :pin self.io.terminal.screens.active.pages.pin(.{ .viewport = .{
                 .x = release_vp.x,
                 .y = release_vp.y,
@@ -4037,7 +4138,7 @@ pub fn mouseButtonCallback(
             // We are holding the renderer lock, but this should just be
             // a cached value.
             const pos = release_pos orelse try self.rt_surface.getCursorPos();
-            if (self.processLinks(pos)) |processed| {
+            if (self.processLinks(pos, size)) |processed| {
                 if (processed) return true;
             } else |err| {
                 log.warn("error processing links err={}", .{err});
@@ -4047,7 +4148,7 @@ pub fn mouseButtonCallback(
         // Handle prompt clicking. If we released our mouse on a prompt
         // and we support some kind of click events, then we need to
         // move to it.
-        if (self.maybePromptClick()) |handled| {
+        if (self.maybePromptClick(size)) |handled| {
             if (handled) return true;
         } else |err| {
             log.warn("error processing prompt click err={}", .{err});
@@ -4085,6 +4186,7 @@ pub fn mouseButtonCallback(
                 report_action,
                 self.mouse.mods,
                 pos,
+                size,
             );
 
             // If we're doing mouse reporting, we do not support any other
@@ -4103,7 +4205,7 @@ pub fn mouseButtonCallback(
 
         const pos = try self.rt_surface.getCursorPos();
         const pin = pin: {
-            const pt_viewport = self.posToViewport(pos.x, pos.y);
+            const pt_viewport = posToViewport(size, pos.x, pos.y);
             const pin = screen.pages.pin(.{
                 .viewport = .{
                     .x = pt_viewport.x,
@@ -4203,7 +4305,7 @@ pub fn mouseButtonCallback(
         const screen: *terminal.Screen = self.renderer_state.terminal.screens.active;
         const pos = try self.rt_surface.getCursorPos();
         const pin = pin: {
-            const pt_viewport = self.posToViewport(pos.x, pos.y);
+            const pt_viewport = posToViewport(size, pos.x, pos.y);
             const pin = screen.pages.pin(.{
                 .viewport = .{
                     .x = pt_viewport.x,
@@ -4231,7 +4333,7 @@ pub fn mouseButtonCallback(
 
                 // If there is a link at this position, we want to
                 // select the link. Otherwise, select the word.
-                if (try self.linkAtPos(pos)) |link| {
+                if (try self.linkAtPos(pos, size)) |link| {
                     try self.setSelectionAndCopy(link.selection);
                 } else {
                     const sel = screen.selectWord(
@@ -4297,7 +4399,7 @@ pub fn mouseButtonCallback(
 }
 
 /// Requires the renderer state mutex is held.
-fn maybePromptClick(self: *Surface) !bool {
+fn maybePromptClick(self: *Surface, size: rendererpkg.Size) !bool {
     const t: *terminal.Terminal = self.renderer_state.terminal;
     const screen: *terminal.Screen = t.screens.active;
 
@@ -4326,7 +4428,7 @@ fn maybePromptClick(self: *Surface) !bool {
 
     // Get the pin for our mouse click.
     const pos = try self.rt_surface.getCursorPos();
-    const pos_vp = self.posToViewport(pos.x, pos.y);
+    const pos_vp = posToViewport(size, pos.x, pos.y);
     const click_pin: terminal.Pin = pin: {
         const pin = screen.pages.pin(.{
             .viewport = .{
@@ -4446,11 +4548,12 @@ const Link = struct {
 fn linkAtPos(
     self: *Surface,
     pos: apprt.CursorPos,
+    size: rendererpkg.Size,
 ) !?Link {
     // Convert our cursor position to a screen point.
     const screen: *terminal.Screen = self.renderer_state.terminal.screens.active;
     const mouse_pin: terminal.Pin = mouse_pin: {
-        const point = self.posToViewport(pos.x, pos.y);
+        const point = posToViewport(size, pos.x, pos.y);
         const pin = screen.pages.pin(.{ .viewport = point }) orelse {
             log.warn("failed to get pin for clicked point", .{});
             return null;
@@ -4550,8 +4653,8 @@ fn mouseModsWithCapture(self: *Surface, mods: input.Mods) input.Mods {
 /// given position.
 ///
 /// Requires the renderer state mutex is held.
-fn processLinks(self: *Surface, pos: apprt.CursorPos) !bool {
-    const link = try self.linkAtPos(pos) orelse return false;
+fn processLinks(self: *Surface, pos: apprt.CursorPos, size: rendererpkg.Size) !bool {
+    const link = try self.linkAtPos(pos, size) orelse return false;
     switch (link.action) {
         .open => {
             const str = try self.io.terminal.screens.active.selectionString(self.alloc, .{
@@ -4683,6 +4786,7 @@ pub fn cursorPosCallback(
     // Crash metadata in case we crash in here
     crash.sentry.thread_state = self.crashThreadState();
     defer crash.sentry.thread_state = null;
+    const size = self.sizeSnapshot();
 
     // log.debug("cursor pos x={} y={} mods={?}", .{ pos.x, pos.y, mods });
 
@@ -4724,7 +4828,7 @@ pub fn cursorPosCallback(
     if (mods) |v| self.modsChanged(v);
 
     // The mouse position in the viewport
-    const pos_vp = self.posToViewport(pos.x, pos.y);
+    const pos_vp = posToViewport(size, pos.x, pos.y);
 
     // We always reset the over link status because it will be reprocessed
     // below. But we need the old value to know if we need to undo mouse
@@ -4772,7 +4876,7 @@ pub fn cursorPosCallback(
     {
         // If we were previously over a link, we always update. We do this so that if the text
         // changed underneath us, even if the mouse didn't move, we update the URL hints and state
-        try self.mouseRefreshLinks(pos, pos_vp, over_link);
+        try self.mouseRefreshLinks(pos, pos_vp, over_link, size);
     }
 
     // Do a mouse report
@@ -4793,7 +4897,7 @@ pub fn cursorPosCallback(
                 break :button @fromBackingInt(@intCast(i));
         } else null;
 
-        self.mouseReport(button, .motion, self.mouse.mods, pos);
+        self.mouseReport(button, .motion, self.mouse.mods, pos, size);
 
         // If we're doing mouse motion tracking, we do not support text
         // selection.
@@ -4838,10 +4942,10 @@ pub fn cursorPosCallback(
             .rectangle = SurfaceMouse.isRectangleSelectState(self.mouse.mods),
             .word_boundary_codepoints = self.config.selection_word_chars,
             .geometry = .{
-                .columns = @intCast(self.size.grid().columns),
-                .cell_width = self.size.cell.width,
-                .padding_left = self.size.padding.left,
-                .screen_height = self.size.screen.height,
+                .columns = @intCast(size.grid().columns),
+                .cell_width = size.cell.width,
+                .padding_left = size.padding.left,
+                .screen_height = size.screen.height,
             },
         });
 
@@ -4889,10 +4993,10 @@ pub fn colorSchemeCallback(self: *Surface, scheme: apprt.ColorScheme) !void {
     self.queueIo(.{ .color_scheme_report = .{ .force = false } }, .unlocked);
 }
 
-pub fn posToViewport(self: Surface, xpos: f64, ypos: f64) terminal.point.Coordinate {
+pub fn posToViewport(size: rendererpkg.Size, xpos: f64, ypos: f64) terminal.point.Coordinate {
     // Get our grid cell
     const coord: rendererpkg.Coordinate = .{ .surface = .{ .x = xpos, .y = ypos } };
-    const grid = coord.convert(.grid, self.size).grid;
+    const grid = coord.convert(.grid, size).grid;
     return .{ .x = grid.x, .y = grid.y };
 }
 
@@ -5190,10 +5294,11 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             // If the mouse isn't over a link, nothing we can do.
             if (!self.mouse.over_link) return false;
             const pos = try self.rt_surface.getCursorPos();
+            const size = self.sizeSnapshot();
 
             self.renderer_state.mutex.lockUncancelable(global.io());
             defer self.renderer_state.mutex.unlock(global.io());
-            if (try self.linkAtPos(pos)) |link_info| {
+            if (try self.linkAtPos(pos, size)) |link_info| {
                 const url_text = switch (link_info.action) {
                     .open => url_text: {
                         // For regex links, get the text from selection
@@ -5399,21 +5504,21 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
         },
 
         .scroll_page_up => {
-            const rows: isize = @intCast(self.size.grid().rows);
+            const rows: isize = @intCast(self.sizeSnapshot().grid().rows);
             self.queueIo(.{
                 .scroll_viewport = .{ .delta = -1 * rows },
             }, .unlocked);
         },
 
         .scroll_page_down => {
-            const rows: isize = @intCast(self.size.grid().rows);
+            const rows: isize = @intCast(self.sizeSnapshot().grid().rows);
             self.queueIo(.{
                 .scroll_viewport = .{ .delta = rows },
             }, .unlocked);
         },
 
         .scroll_page_fractional => |fraction| {
-            const rows: f32 = @floatFromInt(self.size.grid().rows);
+            const rows: f32 = @floatFromInt(self.sizeSnapshot().grid().rows);
             const delta: isize = @intFromFloat(@trunc(fraction * rows));
             self.queueIo(.{
                 .scroll_viewport = .{ .delta = delta },
@@ -5499,7 +5604,7 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
                 .left => .left,
                 .down => .down,
                 .up => .up,
-                .auto => if (self.size.screen.width > self.size.screen.height)
+                .auto => if (self.sizeSnapshot().screen.width > self.sizeSnapshot().screen.height)
                     .right
                 else
                     .down,
@@ -6395,6 +6500,43 @@ fn completeClipboardPasteEvent(
         .data = try aw.toOwnedSlice(),
     } }, .locked);
     return true;
+}
+
+fn completeTextInput(
+    self: *Surface,
+    data: []const u8,
+) !void {
+    if (data.len == 0) return;
+
+    var message = try termio.Message.writeReq(self.alloc, data);
+    var queued = false;
+    defer if (!queued) message.deinit();
+    switch (message) {
+        .write_small => |*v| std.mem.replaceScalar(u8, v.data[0..v.len], '\n', '\r'),
+        .write_alloc => |v| std.mem.replaceScalar(u8, v.data, '\n', '\r'),
+        else => unreachable,
+    }
+
+    if (self.child_exited) {
+        self.close();
+        return;
+    }
+
+    self.queueIo(message, .unlocked);
+    queued = true;
+
+    self.renderer_state.mutex.lockUncancelable(global.io());
+    defer self.renderer_state.mutex.unlock(global.io());
+
+    if (self.config.selection_clear_on_typing) {
+        try self.setSelection(null);
+    }
+
+    if (self.config.scroll_to_bottom.keystroke) {
+        self.io.terminal.scrollViewport(.bottom);
+    }
+
+    try self.queueRender();
 }
 
 fn completeClipboardReadOSC52(
