@@ -448,6 +448,15 @@ pub const IoMode = @import("../termio/Manual.zig").IoMode;
 
 pub const IoWriteCallback = *const fn (?*anyopaque, [*]const u8, usize) callconv(.c) void;
 
+pub const FontSizeActionCallback = *const fn (
+    ?*anyopaque,
+    CoreSurface.FontSizeActionKind,
+    f32,
+    f32,
+    bool,
+    bool,
+) callconv(.c) void;
+
 pub const Surface = struct {
     app: *App,
     platform: Platform,
@@ -460,6 +469,9 @@ pub const Surface = struct {
     io_mode: IoMode = .exec,
     io_write_cb: ?IoWriteCallback = null,
     io_write_userdata: ?*anyopaque = null,
+
+    font_size_action_cb: ?FontSizeActionCallback = null,
+    font_size_action_userdata: ?*anyopaque = null,
 
     /// The current title of the surface. The embedded apprt saves this so
     /// that getTitle works without the implementer needing to save it.
@@ -709,6 +721,21 @@ pub const Surface = struct {
 
     pub fn getSize(self: *const Surface) !apprt.SurfaceSize {
         return self.size;
+    }
+
+    pub fn fontSizeActionDidPerform(
+        self: *Surface,
+        event: CoreSurface.FontSizeActionEvent,
+    ) void {
+        const callback = self.font_size_action_cb orelse return;
+        callback(
+            self.font_size_action_userdata,
+            event.kind,
+            event.previous_points,
+            event.current_points,
+            event.previous_adjusted,
+            event.current_adjusted,
+        );
     }
 
     pub fn suppressTerminalResponses(self: *const Surface) bool {
@@ -1847,6 +1874,18 @@ pub const CAPI = struct {
         };
     }
 
+    /// Update app-scoped configuration state without synchronously walking
+    /// surfaces. The embedder must propagate `config` to every live surface.
+    export fn ghostty_app_update_config_without_surface_propagation(
+        v: *App,
+        config: *const Config,
+    ) void {
+        v.core_app.updateConfigWithoutSurfacePropagation(v, config) catch |err| {
+            log.err("error updating app config err={}", .{err});
+            return;
+        };
+    }
+
     /// Returns true if the app needs to confirm quitting.
     export fn ghostty_app_needs_confirm_quit(v: *App) bool {
         return v.core_app.needsConfirmQuit();
@@ -1931,6 +1970,22 @@ pub const CAPI = struct {
     /// Returns true if the surface process has exited.
     export fn ghostty_surface_process_exited(surface: *Surface) bool {
         return surface.core_surface.child_exited;
+    }
+
+    export fn ghostty_surface_set_font_size_action_callback(
+        surface: *Surface,
+        callback: ?FontSizeActionCallback,
+        userdata: ?*anyopaque,
+    ) bool {
+        const registered_callback = callback orelse return false;
+        if (surface.font_size_action_cb != null) return false;
+
+        surface.font_size_action_cb = registered_callback;
+        surface.font_size_action_userdata = userdata;
+        return true;
+    }
+    export fn ghostty_surface_font_size(surface: *Surface) f32 {
+        return surface.core_surface.font_size.points;
     }
 
     /// Returns true if the surface has a selection.
@@ -2059,6 +2114,11 @@ pub const CAPI = struct {
         if (!surface.updateGridSize(columns, rows)) return false;
         if (resolved) |result| result.* = ghostty_surface_size(surface);
         return true;
+    }
+    export fn ghostty_surface_is_alternate_screen(surface: *Surface) bool {
+        surface.core_surface.renderer_state.lockDemand(global.io());
+        defer surface.core_surface.renderer_state.unlockDemand(global.io());
+        return surface.core_surface.io.terminal.screens.active_key == .alternate;
     }
     export fn ghostty_surface_size(surface: *Surface) SurfaceSize {
         const grid_size = surface.core_surface.size.grid();
