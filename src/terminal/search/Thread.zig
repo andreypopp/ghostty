@@ -16,7 +16,6 @@ const Mutex = std.Io.Mutex;
 const global = @import("../../global.zig");
 const xev = global.xev;
 const internal_os = @import("../../os/main.zig");
-const BlockingQueue = @import("../../datastruct/main.zig").BlockingQueue;
 const MessageData = @import("../../datastruct/main.zig").MessageData;
 const point = @import("../point.zig");
 const FlattenedHighlight = @import("../highlight.zig").Flattened;
@@ -47,7 +46,11 @@ alloc: std.mem.Allocator,
 
 /// The mailbox that can be used to send this thread messages. Note
 /// this is a blocking queue so if it is full you will get errors (or block).
-mailbox: *Mailbox,
+mailbox: struct {
+    mutex: Mutex = .init,
+    pending: std.ArrayList(Message) = .empty,
+    batch: std.ArrayList(Message) = .empty,
+} = .{},
 
 /// The event loop for the search thread.
 loop: xev.Loop,
@@ -82,10 +85,6 @@ opts: Options,
 /// up all the internal state necessary prior to starting the thread. It
 /// is up to the caller to start the thread with the threadMain entrypoint.
 pub fn init(alloc: Allocator, opts: Options) !Thread {
-    // The mailbox for messaging this thread
-    var mailbox = try Mailbox.create(alloc);
-    errdefer mailbox.destroy(alloc);
-
     // Create our event loop.
     var loop = try xev.Loop.init(.{});
     errdefer loop.deinit();
@@ -104,13 +103,22 @@ pub fn init(alloc: Allocator, opts: Options) !Thread {
 
     return .{
         .alloc = alloc,
-        .mailbox = mailbox,
         .loop = loop,
         .wakeup = wakeup_h,
         .stop = stop_h,
         .refresh = refresh_h,
         .opts = opts,
     };
+}
+
+pub fn submit(self: *Thread, message: Message) !void {
+    errdefer message.deinit();
+    {
+        self.mailbox.mutex.lockUncancelable(global.io());
+        defer self.mailbox.mutex.unlock(global.io());
+        try self.mailbox.pending.append(self.alloc, message);
+    }
+    self.wakeup.notify() catch {};
 }
 
 /// Clean up the thread. This is only safe to call once the thread
@@ -120,8 +128,10 @@ pub fn deinit(self: *Thread) void {
     self.wakeup.deinit();
     self.stop.deinit();
     self.loop.deinit();
-    // Nothing can possibly access the mailbox anymore, destroy it.
-    self.mailbox.destroy(self.alloc);
+    for (self.mailbox.pending.items) |message| message.deinit();
+    self.mailbox.pending.deinit(self.alloc);
+    for (self.mailbox.batch.items) |message| message.deinit();
+    self.mailbox.batch.deinit(self.alloc);
 
     if (self.search) |*s| {
         self.opts.mutex.lockUncancelable(global.io());
@@ -183,13 +193,7 @@ fn threadMain_(self: *Thread) !void {
     // while also listening for messages.
     while (true) {
         // If our loop is canceled then we drain our messages and quit.
-        if (self.loop.stopped()) {
-            while (self.mailbox.pop(global.io())) |message| {
-                log.debug("mailbox message ignored during shutdown={}", .{message});
-            }
-
-            return;
-        }
+        if (self.loop.stopped()) return;
 
         const s: *TerminalSearch = if (self.search) |*s| s else {
             // If we're not actively searching, we can block the loop
@@ -255,11 +259,19 @@ fn feedLocked(self: *Thread, s: *TerminalSearch) void {
 
 /// Drain the mailbox.
 fn drainMailbox(self: *Thread) !void {
-    while (self.mailbox.pop(global.io())) |message| {
+    {
+        self.mailbox.mutex.lockUncancelable(global.io());
+        defer self.mailbox.mutex.unlock(global.io());
+        std.mem.swap(std.ArrayList(Message), &self.mailbox.pending, &self.mailbox.batch);
+    }
+    defer {
+        for (self.mailbox.batch.items) |message| message.deinit();
+        self.mailbox.batch.clearRetainingCapacity();
+    }
+    for (self.mailbox.batch.items) |message| {
         log.debug("mailbox message={}", .{message});
         switch (message) {
             .change_needle => |v| {
-                defer v.deinit();
                 try self.changeNeedle(v.slice());
             },
             .select => |v| try self.select(v),
@@ -520,9 +532,6 @@ pub const Options = struct {
 
 pub const EventCallback = *const fn (event: Event, userdata: ?*anyopaque) void;
 
-/// The type used for sending messages to the thread.
-pub const Mailbox = BlockingQueue(Message, 64);
-
 /// The messages that can be sent to the thread.
 pub const Message = union(enum) {
     /// Represents a write request. Magic number comes from the max size
@@ -536,6 +545,13 @@ pub const Message = union(enum) {
 
     /// Select a search result.
     select: ScreenSearch.Select,
+
+    fn deinit(self: Message) void {
+        switch (self) {
+            .change_needle => |v| v.deinit(),
+            .select => {},
+        }
+    }
 };
 
 /// Events that can be emitted from the search thread. The caller
@@ -619,6 +635,32 @@ const TestUserData = struct {
     }
 };
 
+test "search requests FIFO exceeds bounded capacity without waiting" {
+    var t = try Terminal.init(testing.io, testing.allocator, .{ .cols = 20, .rows = 2 });
+    defer t.deinit(testing.allocator);
+    var mutex: Mutex = .init;
+    var thread = try init(testing.allocator, .{ .mutex = &mutex, .terminal = &t });
+    defer thread.deinit();
+    const large: []const u8 = "x" ** 300;
+    for (0..256) |i| {
+        try thread.submit(.{ .change_needle = try .init(testing.allocator, if (i == 255) "last" else large) });
+        try thread.submit(.{ .select = .next });
+    }
+    try testing.expectEqual(@as(usize, 512), thread.mailbox.pending.items.len);
+    for (thread.mailbox.pending.items, 0..) |message, i| {
+        if (i % 2 == 0) {
+            try testing.expectEqualStrings(if (i == 510) "last" else large, message.change_needle.slice());
+        } else try testing.expect(message.select == .next);
+    }
+    try thread.drainMailbox();
+    try testing.expectEqual(@as(usize, 0), thread.mailbox.batch.items.len);
+    try testing.expectEqualStrings("last", thread.search.?.needle());
+    try thread.submit(.{ .change_needle = try .init(testing.allocator, @as([]const u8, "again")) });
+    try thread.drainMailbox();
+    try testing.expectEqualStrings("again", thread.search.?.needle());
+    try thread.submit(.{ .change_needle = try .init(testing.allocator, large) });
+}
+
 test {
     const alloc = testing.allocator;
     const io = testing.io;
@@ -647,15 +689,7 @@ test {
     );
 
     // Start our search
-    _ = thread.mailbox.push(
-        io,
-        .{ .change_needle = try .init(
-            alloc,
-            @as([]const u8, "world"),
-        ) },
-        .forever,
-    );
-    try thread.wakeup.notify();
+    try thread.submit(.{ .change_needle = try .init(alloc, @as([]const u8, "world")) });
 
     // Wait for completion
     try ud.reset.waitTimeout(testing.io, .{ .duration = .{ .clock = .awake, .raw = .fromMilliseconds(100) } });
