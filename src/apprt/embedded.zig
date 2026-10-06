@@ -2562,6 +2562,14 @@ pub const CAPI = struct {
         ptr.completeClipboardRequest(complete, state);
     }
 
+    export fn ghostty_clipboard_request_kind(state: *const apprt.ClipboardRequest) c_int {
+        return @intCast(@intFromEnum(std.meta.activeTag(state.*)));
+    }
+
+    export fn ghostty_surface_cancel_clipboard_request(ptr: *Surface, state: *apprt.ClipboardRequest) void {
+        state.destroy(ptr.app.core_app.alloc);
+    }
+
     /// Deny a clipboard read request started via the read callback,
     /// e.g. because the user rejected a confirmation prompt. Request
     /// types whose protocol expects an answer have their denial reply
