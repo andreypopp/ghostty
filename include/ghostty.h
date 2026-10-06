@@ -1270,6 +1270,9 @@ GHOSTTY_API bool ghostty_surface_set_grid_size(ghostty_surface_t,
                                                uint16_t columns,
                                                uint16_t rows,
                                                ghostty_surface_size_s* resolved);
+GHOSTTY_API size_t ghostty_surface_prepend_history(ghostty_surface_t, const char*, size_t);
+GHOSTTY_API void ghostty_surface_raise_scrollback_limit(ghostty_surface_t);
+GHOSTTY_API size_t ghostty_surface_viewport_anchor(ghostty_surface_t, ghostty_text_s*);
 GHOSTTY_API uint64_t ghostty_surface_search_generation(ghostty_surface_t);
 GHOSTTY_API bool ghostty_surface_is_alternate_screen(ghostty_surface_t);
 GHOSTTY_API ghostty_string_s ghostty_config_serialize(ghostty_config_t);
