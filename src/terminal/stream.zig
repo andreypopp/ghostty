@@ -585,6 +585,15 @@ pub fn Stream(comptime H: type) type {
             };
         }
 
+        pub fn resetParser(self: *Self) void {
+            const alloc = self.parser.osc_parser.alloc;
+            self.parser.deinit();
+            self.parser = .init();
+            self.parser.osc_parser.alloc = alloc;
+            self.utf8decoder = .{};
+            if (self.continuation) |*tracker| tracker.reset();
+        }
+
         pub fn deinit(self: *Self) void {
             if (self.continuation) |*tracker| tracker.deinit();
             self.parser.deinit();
