@@ -61,9 +61,14 @@ size: renderer.Size,
 /// The mailbox implementation to use.
 mailbox: termio.Mailbox,
 
+manual_linefeed_mode: std.atomic.Value(bool) = .{ .raw = false },
+
 /// The stream parser. This parses the stream of escape codes and so on
 /// from the child process and calls callbacks in the stream handler.
 terminal_stream: StreamHandler.Stream,
+
+/// True when another terminal core owns protocol replies for this PTY.
+suppress_terminal_responses: bool,
 
 /// Last time the cursor was reset. This is used to prevent message
 /// flooding with cursor resets.
@@ -325,6 +330,7 @@ pub fn init(self: *Termio, alloc: Allocator, opts: termio.Options) !void {
         .clipboard_write_limit = opts.config.clipboard_write_limit,
         .enquiry_response = opts.config.enquiry_response,
         .xt_checksum_report = opts.config.xt_checksum_report,
+        .suppress_terminal_responses = opts.suppress_terminal_responses,
     };
 
     const thread_enter_state = try ThreadEnterState.create(
@@ -348,6 +354,7 @@ pub fn init(self: *Termio, alloc: Allocator, opts: termio.Options) !void {
             .handler = handler,
         }),
         .thread_enter_state = thread_enter_state,
+        .suppress_terminal_responses = opts.suppress_terminal_responses,
     };
 }
 
@@ -439,11 +446,106 @@ pub fn queueMessage(
     msg: termio.Message,
     mutex: MutexState,
 ) void {
+    switch (self.backend) {
+        .manual => {
+            self.queueMessageManual(msg);
+            return;
+        },
+        .exec => {},
+    }
+
     self.mailbox.send(msg, switch (mutex) {
         .locked => self.renderer_state.mutex,
         .unlocked => null,
     });
     self.mailbox.notify();
+}
+
+fn queueMessageManual(self: *Termio, msg: termio.Message) void {
+    var td: ThreadData = .{
+        .alloc = self.alloc,
+        .loop = undefined,
+        .renderer_state = self.renderer_state,
+        .surface_mailbox = self.surface_mailbox,
+        .backend = .{ .manual = .{} },
+        .mailbox = &self.mailbox,
+    };
+
+    switch (msg) {
+        .color_scheme_report => |v| self.colorSchemeReport(&td, v.force) catch |err| {
+            log.warn("manual inline color_scheme_report failed err={}", .{err});
+        },
+        .crash => @panic("crash request, crashing intentionally"),
+        .change_config => |config| {
+            defer config.alloc.destroy(config.ptr);
+            self.changeConfig(&td, config.ptr) catch |err| {
+                log.warn("manual inline change_config failed err={}", .{err});
+            };
+        },
+        .inspector => {},
+        .visibility_report => |v| self.visibilityReport(&td, v.visible, v.force) catch |err| {
+            log.warn("manual visibility report failed err={}", .{err});
+        },
+        .kitty_clipboard_grant_read => |v| {
+            defer v.alloc.free(v.pw);
+            if (!self.suppress_terminal_responses) self.kittyClipboardGrant(v.pw, .read) catch |err| {
+                log.warn("manual clipboard grant failed err={}", .{err});
+            };
+        },
+        .kitty_clipboard_grant_write => |v| {
+            defer v.alloc.free(v.pw);
+            if (!self.suppress_terminal_responses) self.kittyClipboardGrant(v.pw, .write) catch |err| {
+                log.warn("manual clipboard grant failed err={}", .{err});
+            };
+        },
+        .resize => |v| self.resize(&td, v) catch |err| {
+            log.warn("manual inline resize failed err={}", .{err});
+        },
+        .size_report => |v| self.sizeReport(&td, v) catch |err| {
+            log.warn("manual inline size_report failed err={}", .{err});
+        },
+        .clear_screen => |v| self.clearScreen(&td, v.history) catch |err| {
+            log.warn("manual inline clear_screen failed err={}", .{err});
+        },
+        .scroll_viewport => |v| self.scrollViewport(v),
+        .selection_scroll => {},
+        .jump_to_prompt => |v| self.jumpToPrompt(v) catch |err| {
+            log.warn("manual inline jump_to_prompt failed err={}", .{err});
+        },
+        .start_synchronized_output => {},
+        .linefeed_mode => |v| self.manual_linefeed_mode.store(v, .monotonic),
+        .focused => |v| self.focusGained(&td, v) catch |err| {
+            log.warn("manual inline focused failed err={}", .{err});
+        },
+        .write_small => |v| self.queueWriteManual(
+            &td,
+            v.data[0..v.len],
+        ) catch |err| {
+            log.warn("manual inline write_small failed err={}", .{err});
+        },
+        .write_stable => |v| self.queueWriteManual(&td, v) catch |err| {
+            log.warn("manual inline write_stable failed err={}", .{err});
+        },
+        .write_alloc => |v| {
+            defer v.alloc.free(v.data);
+            self.queueWriteManual(&td, v.data) catch |err| {
+                log.warn("manual inline write_alloc failed err={}", .{err});
+            };
+        },
+    }
+
+    self.renderer_wakeup.notify() catch |err| {
+        log.warn("manual inline renderer wakeup failed err={}", .{err});
+    };
+}
+
+fn queueWriteManual(
+    self: *Termio,
+    td: *ThreadData,
+    data: []const u8,
+) !void {
+    const linefeed = self.manual_linefeed_mode.load(.monotonic);
+    try self.queueWrite(td, data, linefeed);
 }
 
 /// Queue a write directly to the pty.
@@ -571,6 +673,7 @@ pub fn sizeReport(self: *Termio, td: *ThreadData, style: termio.Message.SizeRepo
 }
 
 fn sizeReportLocked(self: *Termio, td: *ThreadData, style: termio.Message.SizeReport) !void {
+    if (self.suppress_terminal_responses) return;
     const grid_size = self.size.grid();
     const report_size: terminalpkg.size_report.Size = .{
         .rows = grid_size.rows,
@@ -685,7 +788,7 @@ pub fn focusGained(self: *Termio, td: *ThreadData, focused: bool) !void {
     self.renderer_state.mutex.unlock(global.io());
 
     // If we have focus events enabled, we send the focus event.
-    if (focus_event) {
+    if (focus_event and !self.suppress_terminal_responses) {
         var buf: [terminalpkg.focus.max_encode_size]u8 = undefined;
         var writer: std.Io.Writer = .fixed(&buf);
         terminalpkg.focus.encode(&writer, if (focused) .gained else .lost) catch |err| {
@@ -783,6 +886,7 @@ pub fn colorSchemeReport(self: *Termio, td: *ThreadData, force: bool) !void {
 }
 
 pub fn colorSchemeReportLocked(self: *Termio, td: *ThreadData, force: bool) !void {
+    if (self.suppress_terminal_responses) return;
     if (!force and !self.renderer_state.terminal.modes.get(.report_color_scheme)) {
         return;
     }
@@ -805,6 +909,7 @@ pub fn visibilityReport(
     visible: bool,
     force: bool,
 ) !void {
+    if (self.suppress_terminal_responses) return;
     self.renderer_state.mutex.lockUncancelable(global.io());
     defer self.renderer_state.mutex.unlock(global.io());
 
@@ -856,4 +961,70 @@ pub const ThreadData = struct {
 /// not available on a particular platform.
 pub fn getProcessInfo(self: *Termio, comptime info: ProcessInfo) ?ProcessInfo.Type(info) {
     return self.backend.getProcessInfo(info);
+}
+
+test "manual process_output parses split UTF-8 and resizes inline" {
+    const testing = std.testing;
+    var config = try configpkg.Config.default(testing.allocator);
+    defer config.deinit();
+    var io: Termio = undefined;
+    var mutex: std.Io.Mutex = .init;
+    var state: renderer.State = .{ .mutex = &mutex, .terminal = &io.terminal };
+    var wakeup = try xev.Async.init();
+    defer wakeup.deinit();
+    const render_mailbox = try renderer.Thread.Mailbox.create(testing.allocator);
+    defer render_mailbox.destroy(testing.allocator);
+    const size: renderer.Size = .{
+        .screen = .{ .width = 80, .height = 48 },
+        .cell = .{ .width = 8, .height = 16 },
+        .padding = .{},
+    };
+    io = .{
+        .alloc = testing.allocator,
+        .terminal = try terminalpkg.Terminal.init(testing.io, testing.allocator, .{ .cols = 10, .rows = 3 }),
+        .size = size,
+        .config = try DerivedConfig.init(testing.allocator, &config),
+        .backend = .{ .manual = try .init(testing.allocator, .{}) },
+        .suppress_terminal_responses = true,
+        .mailbox = try termio.Mailbox.initSPSC(testing.allocator),
+        .renderer_state = &state,
+        .renderer_wakeup = wakeup,
+        .renderer_mailbox = render_mailbox,
+        .surface_mailbox = undefined,
+        .terminal_stream = .init(.{ .allocator = testing.allocator, .handler = .{
+            .alloc = testing.allocator,
+            .terminal = &io.terminal,
+            .size = &io.size,
+            .renderer_state = &state,
+            .renderer_wakeup = wakeup,
+            .renderer_mailbox = render_mailbox,
+            .surface_mailbox = undefined,
+            .termio_mailbox = &io.mailbox,
+            .osc_color_report_format = config.@"osc-color-report-format",
+            .clipboard_write = .deny,
+            .clipboard_write_limit = 1024,
+            .enquiry_response = "",
+            .xt_checksum_report = false,
+            .suppress_terminal_responses = true,
+        } }),
+    };
+    defer io.deinit();
+    io.processOutput("\xce");
+    io.processOutput("\xbb\x1b[6n\x1b[c\x1b]5522;type=read;\x1b\\");
+    const cell = io.terminal.screens.active.pages.getCell(.{ .active = .{} }).?.cell;
+    try testing.expectEqual(@as(u21, 0x3bb), cell.codepoint());
+    try testing.expect(io.mailbox.spsc.queue.pop(testing.io) == null);
+    io.terminal_stream.handler.suppress_terminal_responses = false;
+    io.processOutput("\x1b[6n");
+    const reply = io.mailbox.spsc.queue.pop(testing.io).?;
+    defer reply.deinit();
+    try testing.expectEqual(std.meta.Tag(termio.Message).write_small, std.meta.activeTag(reply));
+    io.terminal_stream.handler.suppress_terminal_responses = true;
+    try testing.expectEqual(termio.backend.Kind.manual, std.meta.activeTag(io.backend));
+    var resized = size;
+    resized.screen = .{ .width = 160, .height = 96 };
+    io.queueMessage(.{ .resize = resized }, .unlocked);
+    try testing.expectEqual(@as(u16, 20), io.terminal.cols);
+    try testing.expectEqual(@as(u16, 6), io.terminal.rows);
+    try testing.expect(io.terminal_stream.handler.kitty_clipboard_write == null);
 }
