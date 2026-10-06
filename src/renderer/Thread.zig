@@ -953,4 +953,12 @@ test "renderer request preserves forced rebuild and single token admission" {
     try testing.expect(thread.takePending().presentation == null);
     try testing.expect(thread.requestDrawWithPresentation(presentation));
     _ = thread.takePending();
+    thread.flags = .{ .focused = false };
+    var zero = presentation;
+    zero.token = 0;
+    try testing.expect(thread.requestDrawWithPresentation(zero));
+    try testing.expectEqual(@as(u64, 0), thread.takePending().presentation.?.token);
+    thread.flags.focused = true;
+    try testing.expect(thread.requestDrawWithPresentation(zero));
+    try testing.expectEqual(@as(u64, 0), thread.takePending().presentation.?.token);
 }
