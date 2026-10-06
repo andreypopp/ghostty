@@ -8,6 +8,7 @@ const Config = @import("Config.zig");
 const c_get = @import("c_get.zig");
 const edit = @import("edit.zig");
 const Key = @import("key.zig").Key;
+const FileFormatter = @import("formatter_file.zig").FileFormatter;
 
 const log = std.log.scoped(.config);
 
@@ -35,6 +36,37 @@ export fn ghostty_config_free(ptr: ?*Config) void {
 }
 
 /// Deep clone the configuration.
+export fn ghostty_config_serialize(self: *const Config) String {
+    const serialized = serializeConfig(global.alloc(), self) catch |err| {
+        log.err("error serializing config err={}", .{err});
+        return .empty;
+    };
+    return .fromSlice(serialized);
+}
+fn serializeConfig(alloc: std.mem.Allocator, self: *const Config) ![]u8 {
+    var output: std.Io.Writer.Allocating = .init(alloc);
+    defer output.deinit();
+
+    var defaults = try Config.default(alloc);
+    defer defaults.deinit();
+    if (!defaults.@"command-palette-entry".equal(self.@"command-palette-entry")) {
+        try output.writer.writeAll("command-palette-entry = clear\n");
+        if (self.@"command-palette-entry".value.items.len > 0) {
+            try @import("formatter.zig").formatEntry(@TypeOf(self.@"command-palette-entry"), "command-palette-entry", self.@"command-palette-entry", &output.writer);
+        }
+    }
+    var snapshot = self.*;
+    snapshot.@"command-palette-entry" = defaults.@"command-palette-entry";
+
+    const formatter: FileFormatter = .{
+        .alloc = alloc,
+        .config = &snapshot,
+        .docs = false,
+        .changed = true,
+    };
+    try formatter.format(&output.writer);
+    return try output.toOwnedSlice();
+}
 export fn ghostty_config_clone(self: *Config) ?*Config {
     const result = global.alloc().create(Config) catch |err| {
         log.err("error allocating config err={}", .{err});
@@ -72,6 +104,22 @@ export fn ghostty_config_load_file(self: *Config, path: [*:0]const u8) void {
     const path_slice = std.mem.span(path);
     self.loadFile(global.alloc(), path_slice) catch |err| {
         log.err("error loading config from file path={s} err={}", .{ path_slice, err });
+    };
+}
+
+/// Load the configuration from in-memory contents.
+/// The path is only used as a synthetic source path for diagnostics and
+/// relative path expansion.
+export fn ghostty_config_load_string(
+    self: *Config,
+    contents: [*]const u8,
+    contents_len: usize,
+    path: [*:0]const u8,
+) void {
+    const contents_slice = contents[0..contents_len];
+    const path_slice = std.mem.span(path);
+    self.loadString(global.alloc(), contents_slice, path_slice) catch |err| {
+        log.err("error loading config from string path={s} err={}", .{ path_slice, err });
     };
 }
 
@@ -276,5 +324,58 @@ test "ghostty_config_trigger: default keybind" {
         const trigger = try config_trigger_(&cfg, "adjust_selection:left");
         try testing.expectEqual(.physical, trigger.tag);
         try testing.expectEqual(.unidentified, trigger.key.physical);
+    }
+}
+
+test "ghostty_config_serialize round trips effective values" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var source = try Config.default(alloc);
+    defer source.deinit();
+    source.@"font-size" = 23.5;
+    source.@"window-theme" = .dark;
+    source.@"cursor-opacity" = 0.375;
+
+    const serialized = try serializeConfig(alloc, &source);
+    defer alloc.free(serialized);
+    try testing.expect(std.mem.indexOf(u8, serialized, "font-size = 23.5") != null);
+    try testing.expect(std.mem.indexOf(u8, serialized, "window-theme = dark") != null);
+
+    var restored = try Config.default(alloc);
+    defer restored.deinit();
+    try restored.loadString(
+        alloc,
+        serialized,
+        "/tmp/ghostty-effective-config",
+    );
+    try restored.finalize();
+
+    try testing.expectEqual(source.@"font-size", restored.@"font-size");
+    try testing.expectEqual(source.@"window-theme", restored.@"window-theme");
+    try testing.expectEqual(source.@"cursor-opacity", restored.@"cursor-opacity");
+    try testing.expectEqual(@as(usize, 0), restored._diagnostics.items().len);
+    try testing.expectEqual(source.@"command-palette-entry".value.items.len, restored.@"command-palette-entry".value.items.len);
+    for (source.@"command-palette-entry".value.items, restored.@"command-palette-entry".value.items) |a, b| {
+        try testing.expectEqualStrings(a.title, b.title);
+        try testing.expectEqualStrings(a.description, b.description);
+        try testing.expectEqual(a.action.hash(), b.action.hash());
+    }
+}
+
+test "ghostty_config_serialize preserves customized and empty command palette" {
+    const testing = std.testing;
+    for ([_]bool{ false, true }) |empty| {
+        var source = try Config.default(testing.allocator);
+        defer source.deinit();
+        try source.loadString(testing.allocator, "command-palette-entry = clear\n", "/tmp/config");
+        if (!empty) try source.loadString(testing.allocator, "command-palette-entry = title:Custom,action:set_font_size:23\n", "/tmp/config");
+        const serialized = try serializeConfig(testing.allocator, &source);
+        defer testing.allocator.free(serialized);
+        var restored = try Config.default(testing.allocator);
+        defer restored.deinit();
+        try restored.loadString(testing.allocator, serialized, "/tmp/config");
+        try testing.expect(source.@"command-palette-entry".equal(restored.@"command-palette-entry"));
+        try testing.expectEqual(@as(usize, 0), restored._diagnostics.items().len);
     }
 }
