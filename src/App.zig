@@ -146,6 +146,7 @@ pub fn deinit(self: *App) void {
     // Clean up all our surfaces
     for (self.surfaces.items) |surface| surface.deinit();
     self.surfaces.deinit(self.alloc);
+    self.discardMailbox();
 
     // Clean up our font group cache
     // We should have zero items in the grid set at this point because
@@ -532,6 +533,24 @@ pub fn performAllAction(
             };
         },
     }
+}
+
+fn discardMailbox(self: *App) void {
+    while (self.mailbox.pop(global.io())) |message| switch (message) {
+        .surface_message => |v| v.message.deinit(),
+        else => {},
+    };
+}
+
+test "app shutdown releases queued owning surface payloads" {
+    var app: App = undefined;
+    app.mailbox = .{};
+    var surface: Surface = undefined;
+    const bytes = "x" ** 300;
+    const message: apprt.surface.Message = .{ .clipboard_write = .{ .clipboard_type = .standard, .req = try .init(std.testing.allocator, @as([]const u8, bytes)) } };
+    try std.testing.expectEqual(@as(Mailbox.Queue.Size, 1), app.mailbox.push(global.io(), .{ .surface_message = .{ .surface = &surface, .message = message } }, .instant));
+    app.discardMailbox();
+    try std.testing.expect(app.mailbox.pop(global.io()) == null);
 }
 
 /// Handle a window message
