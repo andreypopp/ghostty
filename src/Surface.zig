@@ -183,6 +183,7 @@ command_timer: ?std.Io.Timestamp = null,
 
 /// Search state
 search: ?Search = null,
+search_generation: u64 = 0,
 shutdown_probe: if (builtin.is_test) ?struct {
     before_renderer_stop: *const fn (*anyopaque) void,
     userdata: *anyopaque,
@@ -275,6 +276,7 @@ pub const InputEffect = enum {
 const Search = struct {
     state: terminal.search.Thread,
     thread: std.Thread,
+    generation: u64 = 0,
 
     stopping: std.atomic.Value(bool) = .init(false),
 
@@ -1268,18 +1270,20 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
         },
 
         .search_total => |v| {
+            if (!self.searchValueCurrent(v)) return;
             _ = try self.rt_app.performAction(
                 .{ .surface = self },
                 .search_total,
-                .{ .total = v },
+                .{ .total = v.value },
             );
         },
 
         .search_selected => |v| {
+            if (!self.searchValueCurrent(v)) return;
             _ = try self.rt_app.performAction(
                 .{ .surface = self },
                 .search_selected,
-                .{ .selected = v },
+                .{ .selected = v.value },
             );
         },
     }
@@ -1528,7 +1532,13 @@ fn passwordInput(self: *Surface, v: bool) !void {
     try self.queueRender();
 }
 
+fn searchValueCurrent(self: *const Surface, value: apprt.surface.Message.SearchValue) bool {
+    const search = self.search orelse return false;
+    return value.generation == search.generation;
+}
+
 fn retireSearch(self: *Surface, reset: *const fn (*Surface) void) void {
+    self.search_generation +%= 1;
     if (self.search) |*search| {
         search.deinit();
         self.search = null;
@@ -1597,7 +1607,7 @@ fn searchCallback_(
                 );
 
                 // Send the selected index to the surface mailbox
-                self.search.?.surfaceMessage(self.surfaceMailbox(), .{ .search_selected = sel.idx });
+                self.search.?.surfaceMessage(self.surfaceMailbox(), .{ .search_selected = .{ .generation = self.search.?.generation, .value = sel.idx } });
             } else {
                 // Reset our selected match
                 _ = self.renderer_thread.mailbox.push(
@@ -1607,14 +1617,14 @@ fn searchCallback_(
                 );
 
                 // Reset the selected index
-                self.search.?.surfaceMessage(self.surfaceMailbox(), .{ .search_selected = null });
+                self.search.?.surfaceMessage(self.surfaceMailbox(), .{ .search_selected = .{ .generation = self.search.?.generation, .value = null } });
             }
 
             try self.renderer_thread.wakeup.notify();
         },
 
         .total_matches => |total| {
-            self.search.?.surfaceMessage(self.surfaceMailbox(), .{ .search_total = total });
+            self.search.?.surfaceMessage(self.surfaceMailbox(), .{ .search_total = .{ .generation = self.search.?.generation, .value = total } });
         },
 
         // When we quit, tell our renderer to reset any search state.
@@ -1636,8 +1646,8 @@ fn searchCallback_(
             try self.renderer_thread.wakeup.notify();
 
             // Reset search totals in the surface
-            self.search.?.surfaceMessage(self.surfaceMailbox(), .{ .search_total = null });
-            self.search.?.surfaceMessage(self.surfaceMailbox(), .{ .search_selected = null });
+            self.search.?.surfaceMessage(self.surfaceMailbox(), .{ .search_total = .{ .generation = self.search.?.generation, .value = null } });
+            self.search.?.surfaceMessage(self.surfaceMailbox(), .{ .search_selected = .{ .generation = self.search.?.generation, .value = null } });
         },
 
         // Unhandled, so far.
@@ -5258,7 +5268,9 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
 
                 // We need to assign directly to self.search because we need
                 // a stable pointer back to the thread state.
+                self.search_generation +%= 1;
                 self.search = .{
+                    .generation = self.search_generation,
                     .state = try .init(self.alloc, .{
                         .mutex = self.renderer_state.mutex,
                         .terminal = self.renderer_state.terminal,
@@ -5286,28 +5298,15 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
                 break :search;
             }
 
-            _ = s.state.mailbox.push(
-                global.io(),
-                .{ .change_needle = try .init(
-                    self.alloc,
-                    text,
-                ) },
-                .forever,
-            );
-            s.state.wakeup.notify() catch {};
+            try s.state.submit(.{ .change_needle = try .init(self.alloc, text) });
         },
 
         .navigate_search => |nav| {
             const s: *Search = if (self.search) |*s| s else return false;
-            _ = s.state.mailbox.push(
-                global.io(),
-                .{ .select = switch (nav) {
-                    .next => .next,
-                    .previous => .prev,
-                } },
-                .forever,
-            );
-            s.state.wakeup.notify() catch {};
+            try s.state.submit(.{ .select = switch (nav) {
+                .next => .next,
+                .previous => .prev,
+            } });
         },
 
         .copy_to_clipboard => |format| {
@@ -7126,6 +7125,29 @@ fn testShutdownPressure(do_resize: bool) !void {
     try testing.expect(mailbox.pop(global.io()) == null);
 }
 
+test "search delivery epochs reject accepted events after live reset" {
+    const testing = std.testing;
+    var surface: Surface = undefined;
+    surface.search = .{ .state = undefined, .thread = undefined, .generation = 1 };
+    surface.search_generation = 1;
+    const accepted: apprt.surface.Message.SearchValue = .{ .generation = 1, .value = 12 };
+    var queue: App.Mailbox.Queue = .{};
+    try testing.expect(queue.push(global.io(), .{ .surface_message = .{ .surface = &surface, .message = .{ .search_total = accepted } } }, .instant) != 0);
+    try testing.expect(queue.push(global.io(), .{ .surface_message = .{ .surface = &surface, .message = .{ .search_selected = accepted } } }, .instant) != 0);
+    try testing.expect(surface.searchValueCurrent(accepted));
+    surface.search = null;
+    surface.search_generation = 2;
+    while (queue.pop(global.io())) |message| switch (message.surface_message.message) {
+        .search_total, .search_selected => |value| try testing.expect(!surface.searchValueCurrent(value)),
+        else => unreachable,
+    };
+    try testing.expect(!surface.searchValueCurrent(accepted));
+    surface.search = .{ .state = undefined, .thread = undefined, .generation = 3 };
+    surface.search_generation = 3;
+    try testing.expect(!surface.searchValueCurrent(accepted));
+    try testing.expect(surface.searchValueCurrent(.{ .generation = 3, .value = null }));
+}
+
 test "live search retirement with full app capacity publishes final reset" {
     const testing = std.testing;
     const Context = struct {
@@ -7154,6 +7176,7 @@ test "live search retirement with full app capacity publishes final reset" {
     surface.alloc = testing.allocator;
     var context: Context = .{ .surface = &surface };
     surface.rt_surface = @ptrCast(&context);
+    surface.search_generation = 0;
     var terminal_state = try terminal.Terminal.init(testing.io, testing.allocator, .{ .cols = 20, .rows = 2 });
     defer terminal_state.deinit(testing.allocator);
     var mutex: std.Io.Mutex = .init;
@@ -7201,11 +7224,11 @@ test "surface shutdown cancels search sends against full app capacity" {
     var queue: App.Mailbox.Queue = .{};
     const mailbox: apprt.surface.Mailbox = .{ .surface = &surface, .app = .{ .rt_app = &app, .mailbox = &queue } };
     for (0..64) |_| _ = queue.push(global.io(), .{ .open_config = .os_open }, .instant);
-    search.surfaceMessage(mailbox, .{ .search_total = 1 });
+    search.surfaceMessage(mailbox, .{ .search_total = .{ .generation = 1, .value = 1 } });
     var count: usize = 0;
     while (queue.pop(global.io())) |_| count += 1;
     try testing.expectEqual(@as(usize, 64), count);
     search.stopping.store(false, .release);
-    search.surfaceMessage(mailbox, .{ .search_total = 2 });
-    try testing.expectEqual(@as(?usize, 2), queue.pop(global.io()).?.surface_message.message.search_total);
+    search.surfaceMessage(mailbox, .{ .search_total = .{ .generation = 1, .value = 2 } });
+    try testing.expectEqual(@as(?usize, 2), queue.pop(global.io()).?.surface_message.message.search_total.value);
 }
