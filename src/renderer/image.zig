@@ -334,7 +334,7 @@ pub const State = struct {
                 .image_id = .{ .kitty = image.id },
                 .layer = p.layer,
                 .x = p.x,
-                .y = p.y,
+                .y = p.y + @as(i32, render_state.overscan.above),
                 .z = p.z,
                 .width = p.width,
                 .height = p.height,
@@ -1423,4 +1423,41 @@ test "kitty renderer uploads the current animation frame" {
         &.{ 0, 0, 255, 255 },
         entry.image.pending.dataSlice(),
     );
+}
+
+test "kitty renderer aligns images with captured overscan cells" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+    var t = try terminal.Terminal.init(io, alloc, .{ .rows = 3, .cols = 3 });
+    defer t.deinit(alloc);
+    t.width_px = 30;
+    t.height_px = 30;
+    var stream = t.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("a\r\nb\r\nc\r\nd\r\ne");
+    t.screens.active.pages.viewport_pixel_offset = 3;
+    var state: State = .empty;
+    defer state.deinit(alloc);
+    var render_state: terminal.RenderState = .empty;
+    defer render_state.deinit(alloc);
+    render_state.overscan_request = .{ .above = 2 };
+    const storage = &t.screens.active.kitty_images;
+    const pixels = try alloc.alloc(u8, 4);
+    @memset(pixels, 0);
+    try storage.addImage(io, alloc, t.screens.active, .{
+        .id = 1,
+        .width = 1,
+        .height = 1,
+        .format = .rgba,
+        .data = .{ .complete = pixels },
+    });
+    const pin = try t.screens.active.pages.trackPin(t.screens.active.pages.getTopLeft(.viewport));
+    try storage.addPlacement(io, alloc, t.screens.active, 1, 1, .{ .location = .{ .pin = pin } });
+    try render_state.update(alloc, &t);
+    state.kittyUpdate(alloc, &t, &render_state);
+    try testing.expectEqual(@as(f32, 3), render_state.pixel_offset);
+    try testing.expectEqual(@as(u16, 2), render_state.overscan.above);
+    try testing.expectEqual(@as(usize, 1), state.kitty_placements.items.len);
+    try testing.expectEqual(@as(i32, 2), state.kitty_placements.items[0].y);
 }
