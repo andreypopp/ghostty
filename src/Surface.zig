@@ -1230,8 +1230,6 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
 
         .redraw => self.redraw(),
 
-        .renderer_health => |health| self.updateRendererHealth(health),
-
         .scrollbar => |scrollbar| self.updateScrollbar(scrollbar),
 
         .present_surface => try self.presentSurface(),
@@ -1830,7 +1828,7 @@ fn mouseRefreshLinks(
 }
 
 /// Called when our renderer health state changes.
-fn updateRendererHealth(self: *Surface, health: rendererpkg.Health) void {
+pub fn updateRendererHealth(self: *Surface, health: rendererpkg.Health) void {
     log.warn("renderer health status change status={}", .{health});
     _ = self.rt_app.performAction(
         .{ .surface = self },
