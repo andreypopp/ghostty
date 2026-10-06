@@ -1106,6 +1106,20 @@ typedef bool (*ghostty_runtime_action_cb)(ghostty_app_t,
                                           ghostty_target_s,
                                           ghostty_action_s);
 
+typedef enum {
+  GHOSTTY_FONT_SIZE_ACTION_INCREASE = 0,
+  GHOSTTY_FONT_SIZE_ACTION_DECREASE = 1,
+  GHOSTTY_FONT_SIZE_ACTION_RESET = 2,
+  GHOSTTY_FONT_SIZE_ACTION_SET = 3,
+} ghostty_font_size_action_e;
+typedef void (*ghostty_font_size_action_cb)(
+    void* userdata,
+    ghostty_font_size_action_e action,
+    float previous_points,
+    float current_points,
+    bool previous_adjusted,
+    bool current_adjusted);
+
 typedef struct {
   uint16_t columns;
   uint16_t rows;
@@ -1175,6 +1189,7 @@ GHOSTTY_API void ghostty_config_free(ghostty_config_t);
 GHOSTTY_API ghostty_config_t ghostty_config_clone(ghostty_config_t);
 GHOSTTY_API void ghostty_config_load_cli_args(ghostty_config_t);
 GHOSTTY_API void ghostty_config_load_file(ghostty_config_t, const char*);
+GHOSTTY_API void ghostty_config_load_string(ghostty_config_t, const char*, uintptr_t, const char*);
 GHOSTTY_API void ghostty_config_load_default_files(ghostty_config_t);
 GHOSTTY_API void ghostty_config_load_recursive_files(ghostty_config_t);
 GHOSTTY_API void ghostty_config_finalize(ghostty_config_t);
@@ -1197,6 +1212,11 @@ GHOSTTY_API bool ghostty_app_key(ghostty_app_t, ghostty_input_key_s);
 GHOSTTY_API void ghostty_app_keyboard_changed(ghostty_app_t);
 GHOSTTY_API void ghostty_app_open_config(ghostty_app_t);
 GHOSTTY_API void ghostty_app_update_config(ghostty_app_t, ghostty_config_t);
+// Updates app-scoped configuration without synchronously propagating it to
+// surfaces. The embedder must update every live surface separately.
+GHOSTTY_API void ghostty_app_update_config_without_surface_propagation(
+    ghostty_app_t,
+    ghostty_config_t);
 GHOSTTY_API bool ghostty_app_needs_confirm_quit(ghostty_app_t);
 GHOSTTY_API bool ghostty_app_has_global_keybinds(ghostty_app_t);
 GHOSTTY_API void ghostty_app_set_color_scheme(ghostty_app_t, ghostty_color_scheme_e);
@@ -1205,11 +1225,19 @@ GHOSTTY_API ghostty_surface_config_s ghostty_surface_config_new();
 
 GHOSTTY_API ghostty_surface_t ghostty_surface_new(ghostty_app_t,
                                                      const ghostty_surface_config_s*);
+// One-shot registration. Runs synchronously on the GUI thread after mutation;
+// it must not destroy or reenter the surface. Userdata lives until destruction.
+GHOSTTY_API bool ghostty_surface_set_font_size_action_callback(
+    ghostty_surface_t,
+    ghostty_font_size_action_cb,
+    void* userdata);
 GHOSTTY_API bool ghostty_surface_grid_metrics(ghostty_surface_t, ghostty_surface_grid_metrics_s*);
 GHOSTTY_API bool ghostty_surface_set_grid_size(ghostty_surface_t,
                                                uint16_t columns,
                                                uint16_t rows,
                                                ghostty_surface_size_s* resolved);
+GHOSTTY_API bool ghostty_surface_is_alternate_screen(ghostty_surface_t);
+GHOSTTY_API ghostty_string_s ghostty_config_serialize(ghostty_config_t);
 GHOSTTY_API void ghostty_surface_free(ghostty_surface_t);
 GHOSTTY_API void* ghostty_surface_userdata(ghostty_surface_t);
 GHOSTTY_API ghostty_app_t ghostty_surface_app(ghostty_surface_t);
@@ -1217,6 +1245,8 @@ GHOSTTY_API ghostty_surface_config_s ghostty_surface_inherited_config(ghostty_su
 GHOSTTY_API void ghostty_surface_update_config(ghostty_surface_t, ghostty_config_t);
 GHOSTTY_API bool ghostty_surface_needs_confirm_quit(ghostty_surface_t);
 GHOSTTY_API bool ghostty_surface_process_exited(ghostty_surface_t);
+// Returns the app-thread-owned live font size without reading renderer state.
+GHOSTTY_API float ghostty_surface_font_size(ghostty_surface_t);
 GHOSTTY_API void ghostty_surface_refresh(ghostty_surface_t);
 GHOSTTY_API void ghostty_surface_draw(ghostty_surface_t);
 GHOSTTY_API void ghostty_surface_set_content_scale(ghostty_surface_t, double, double);
