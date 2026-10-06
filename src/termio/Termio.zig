@@ -699,58 +699,12 @@ pub fn resetSynchronizedOutput(self: *Termio) void {
 
 /// Clear the screen.
 pub fn clearScreen(self: *Termio, td: *ThreadData, history: bool) !void {
-    {
+    const at_prompt = at_prompt: {
         self.renderer_state.mutex.lockUncancelable(global.io());
         defer self.renderer_state.mutex.unlock(global.io());
-
-        // If we're on the alternate screen, we do not clear. Since this is an
-        // emulator-level screen clear, this messes up the running programs
-        // knowledge of where the cursor is and causes rendering issues. So,
-        // for alt screen, we do nothing.
-        if (self.terminal.screens.active_key == .alternate) return;
-
-        // Clear our selection
-        self.terminal.screens.active.clearSelection();
-
-        // Clear our scrollback
-        if (history) self.terminal.eraseDisplay(.scrollback, false);
-
-        // If we're not at a prompt, we just delete above the cursor.
-        if (!self.terminal.cursorIsAtPrompt()) {
-            if (self.terminal.screens.active.cursor.y > 0) {
-                self.terminal.screens.active.eraseActive(
-                    self.terminal.screens.active.cursor.y - 1,
-                );
-            }
-
-            // Clear all Kitty graphics state for this screen. This copies
-            // Kitty's behavior when Cmd+K deletes all Kitty graphics. I
-            // didn't spend time researching whether it only deletes Kitty
-            // graphics that are placed above the cursor or if it deletes
-            // all of them. We delete all of them for now but if this behavior
-            // isn't fully correct we should fix this later.
-            self.terminal.screens.active.kitty_images.delete(
-                self.terminal.io(),
-                self.terminal.screens.active.alloc,
-                &self.terminal,
-                .{ .all = true },
-            );
-
-            return;
-        }
-
-        // At a prompt, we want to first fully clear the screen, and then after
-        // send a FF (0x0C) to the shell so that it can repaint the screen.
-        // Mark the current row as a not a prompt so we can properly
-        // clear the full screen in the next eraseDisplay call.
-        // TODO: fix this
-        // self.terminal.markSemanticPrompt(.command);
-        // assert(!self.terminal.cursorIsAtPrompt());
-        self.terminal.eraseDisplay(.complete, false);
-    }
-
-    // If we reached here it means we're at a prompt, so we send a form-feed.
-    try self.queueWrite(td, &[_]u8{0x0C}, false);
+        break :at_prompt self.terminal.clearScreen(history);
+    };
+    if (at_prompt) try self.queueWrite(td, &[_]u8{0x0C}, false);
 }
 
 pub fn raiseScrollbackLimit(self: *Termio) void {
@@ -828,6 +782,15 @@ pub fn focusGained(self: *Termio, td: *ThreadData, focused: bool) !void {
 
     // We always notify our backend of focus changes.
     try self.backend.focusGained(td, focused);
+}
+
+pub fn restoreOutput(self: *Termio, buf: []const u8) void {
+    self.renderer_state.mutex.lockUncancelable(global.io());
+    defer self.renderer_state.mutex.unlock(global.io());
+    self.terminal_stream.resetParser();
+    self.terminal_stream.handler.restoring = true;
+    defer self.terminal_stream.handler.restoring = false;
+    self.processOutputLocked(buf);
 }
 
 /// Process output from the pty. This is the manual API that users can
@@ -1056,4 +1019,34 @@ test "manual process_output parses split UTF-8 and resizes inline" {
     try testing.expectEqual(@as(u16, 20), io.terminal.cols);
     try testing.expectEqual(@as(u16, 6), io.terminal.rows);
     try testing.expect(io.terminal_stream.handler.kitty_clipboard_write == null);
+    io.terminal_stream.handler.clipboard_write = .allow;
+    io.terminal_stream.handler.suppress_terminal_responses = false;
+    io.processOutput("\x1b]52;c;unfinished");
+    io.restoreOutput("\x1b[2J\x1b[Hrestored\x1b[6n\x1b]52;c;aGVsbG8=\x1b\\\x1b]2;title\x1b\\\x07\x1b]5522;type=read;\x1b\\");
+    try testing.expect(!io.terminal_stream.handler.restoring);
+    try testing.expect(io.mailbox.spsc.queue.pop(testing.io) == null);
+    const restored = try io.terminal.plainString(testing.allocator);
+    defer testing.allocator.free(restored);
+    try testing.expectEqualStrings("restored", restored);
+    io.processOutput("\x1b[6n");
+    const live_reply = io.mailbox.spsc.queue.pop(testing.io).?;
+    defer live_reply.deinit();
+    try testing.expectEqual(std.meta.Tag(termio.Message).write_small, std.meta.activeTag(live_reply));
+    const pages = &io.terminal.screens.active.pages;
+    pages.setMaxBytes(16 * 1024 * 1024);
+    pages.setMaxLines(10_000);
+    io.raiseScrollbackLimit();
+    try testing.expectEqual(@as(usize, 32 * 1024 * 1024), pages.limits.max(.bytes));
+    try testing.expectEqual(@as(usize, 20_000), pages.limits.max(.lines));
+    var updated = try DerivedConfig.init(testing.allocator, &config);
+    defer updated.deinit();
+    io.terminal_stream.handler.changeConfig(&updated);
+    try testing.expectEqual(@as(usize, 32 * 1024 * 1024), pages.limits.max(.bytes));
+    try testing.expectEqual(@as(usize, 20_000), pages.limits.max(.lines));
+    pages.setMaxBytes(null);
+    pages.setMaxLines(null);
+    io.raiseScrollbackLimit();
+    try testing.expectEqual(std.math.maxInt(usize), pages.limits.max(.bytes));
+    try testing.expectEqual(std.math.maxInt(usize), pages.limits.max(.lines));
+    while (io.mailbox.spsc.queue.pop(testing.io)) |message| message.deinit();
 }

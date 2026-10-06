@@ -110,6 +110,7 @@ pub const StreamHandler = struct {
     /// When another terminal core owns the PTY protocol, Ghostty is only a
     /// render/input mirror and must not emit a second copy of protocol replies.
     suppress_terminal_responses: bool = false,
+    restoring: bool = false,
 
     //---------------------------------------------------------------
     // Internal state
@@ -189,7 +190,7 @@ pub const StreamHandler = struct {
         self: *StreamHandler,
         msg: apprt.surface.Message,
     ) void {
-        if (self.stopping.load(.acquire)) {
+        if (self.restoring or self.stopping.load(.acquire)) {
             msg.deinit();
             return;
         }
@@ -203,6 +204,10 @@ pub const StreamHandler = struct {
     }
 
     inline fn messageWriter(self: *StreamHandler, msg: termio.Message) void {
+        if (self.restoring) {
+            msg.deinit();
+            return;
+        }
         if (suppressTerminalResponse(self.suppress_terminal_responses, msg))
             return;
         self.termio_mailbox.send(msg, self.renderer_state.mutex);
