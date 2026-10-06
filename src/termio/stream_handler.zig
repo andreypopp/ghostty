@@ -77,6 +77,7 @@ pub const StreamHandler = struct {
 
     /// Mailbox for the surface.
     surface_mailbox: apprt.surface.Mailbox,
+    stopping: std.atomic.Value(bool) = .init(false),
 
     /// The shared render state
     renderer_state: *renderer.State,
@@ -188,12 +189,16 @@ pub const StreamHandler = struct {
         self: *StreamHandler,
         msg: apprt.surface.Message,
     ) void {
+        if (self.stopping.load(.acquire)) {
+            msg.deinit();
+            return;
+        }
         // See messageWriter which has similar logic and explains why
         // we may have to do this.
         if (self.surface_mailbox.push(msg, .{ .instant = {} }) == 0) {
             self.renderer_state.mutex.unlock(global.io());
             defer self.renderer_state.mutex.lockUncancelable(global.io());
-            _ = self.surface_mailbox.push(msg, .{ .forever = {} });
+            if (!self.surface_mailbox.pushUntilStopped(msg, &self.stopping)) msg.deinit();
         }
     }
 
@@ -2056,7 +2061,6 @@ test "kitty clipboard write: oversized text replies EFBIG" {
     try testing.expect(mailbox.spsc.queue.pop(global.io()) == null);
 }
 
-
 test "manual mirror rejects Kitty clipboard packets without replies or host access" {
     var handler: StreamHandler = undefined;
     handler.suppress_terminal_responses = true;
@@ -2065,4 +2069,33 @@ test "manual mirror rejects Kitty clipboard packets without replies or host acce
         try handler.kittyClipboard(.{ .metadata = metadata, .payload = "SGVsbG8=", .terminator = .st });
         try std.testing.expect(handler.kitty_clipboard_write == null);
     }
+}
+
+test "stopping parser frees owning messages and preserves accepted delivery" {
+    const testing = std.testing;
+    var handler: StreamHandler = undefined;
+    handler.stopping = .init(true);
+    var app: apprt.App = undefined;
+    var surface: @import("../Surface.zig") = undefined;
+    var queue: @import("../App.zig").Mailbox.Queue = .{};
+    handler.surface_mailbox = .{ .surface = &surface, .app = .{ .rt_app = &app, .mailbox = &queue } };
+    var mutex: std.Io.Mutex = .init;
+    var state: renderer.State = .{ .mutex = &mutex, .terminal = undefined };
+    handler.renderer_state = &state;
+    mutex.lockUncancelable(global.io());
+    defer mutex.unlock(global.io());
+    const bytes = [_]u8{'a'} ** 300;
+    handler.surfaceMessageWriter(.{ .clipboard_write = .{ .clipboard_type = .standard, .req = try .init(testing.allocator, @as([]const u8, &bytes)) } });
+    handler.surfaceMessageWriter(.{ .pwd_change = try .init(testing.allocator, @as([]const u8, &bytes)) });
+    try testing.expect(queue.pop(global.io()) == null);
+    handler.stopping.store(false, .release);
+    handler.surfaceMessageWriter(.{ .clipboard_write = .{ .clipboard_type = .standard, .req = try .init(testing.allocator, @as([]const u8, &bytes)) } });
+    const accepted = queue.pop(global.io()).?.surface_message.message;
+    accepted.deinit();
+    for (0..64) |index| try testing.expectEqual(@as(@import("../App.zig").Mailbox.Queue.Size, @intCast(index + 1)), queue.push(global.io(), .{ .open_config = .os_open }, .instant));
+    handler.stopping.store(true, .release);
+    handler.surfaceMessageWriter(.{ .pwd_change = try .init(testing.allocator, @as([]const u8, &bytes)) });
+    var count: usize = 0;
+    while (queue.pop(global.io())) |_| count += 1;
+    try testing.expectEqual(@as(usize, 64), count);
 }
