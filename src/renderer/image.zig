@@ -20,6 +20,8 @@ pub const State = struct {
     /// The full image state for the renderer that specifies what images
     /// need to be uploaded, pruned, etc.
     images: ImageMap,
+    top_overscan_rows: u16 = 0,
+    bottom_overscan_rows: u16 = 0,
 
     /// The placements for the Kitty image protocol.
     kitty_placements: std.ArrayListUnmanaged(Placement),
@@ -141,7 +143,7 @@ pub const State = struct {
                 &.{.{
                     .grid_pos = .{
                         @as(f32, @floatFromInt(p.x)),
-                        @as(f32, @floatFromInt(p.y)),
+                        @as(f32, @floatFromInt(p.y + self.top_overscan_rows)),
                     },
 
                     .cell_offset = .{
@@ -406,17 +408,26 @@ pub const State = struct {
             // cells. Only tracked when such placements exist.
             var virtual_origins: std.AutoHashMapUnmanaged(
                 terminal.kitty.graphics.ImageStorage.PlacementKey,
-                struct { x: u32, y: u32 },
+                struct { x: u32, y: i64 },
             ) = .empty;
             defer virtual_origins.deinit(alloc);
 
-            var v_it = terminal.kitty.graphics.unicode.placementIterator(top, bot);
+            const capture_top = switch (top.upOverflow(self.top_overscan_rows)) {
+                .offset => |p| p,
+                .overflow => |v| v.end,
+            };
+            const capture_bot = switch (bot.downOverflow(self.bottom_overscan_rows)) {
+                .offset => |p| p,
+                .overflow => |v| v.end,
+            };
+            var v_it = terminal.kitty.graphics.unicode.placementIterator(capture_top, capture_bot);
             while (v_it.next()) |virtual_p| {
                 self.prepKittyVirtualPlacement(
                     alloc,
                     t,
                     &virtual_p,
                     cell_size,
+                    top_y,
                 ) catch |err| {
                     // For errors we log and continue. We try to place
                     // other placements even if one fails.
@@ -435,7 +446,7 @@ pub const State = struct {
 
                     // Get the actual viewport position for it.
                     const vp = t.screens.active.pages.pointFromPin(
-                        .viewport,
+                        .screen,
                         virtual_p.pin,
                     ) orelse break :fold;
 
@@ -448,10 +459,10 @@ pub const State = struct {
                         break :fold;
                     };
                     if (!gop.found_existing) {
-                        gop.value_ptr.* = .{ .x = vp.viewport.x, .y = vp.viewport.y };
+                        gop.value_ptr.* = .{ .x = vp.screen.x, .y = @as(i64, vp.screen.y) - top_y };
                     } else {
-                        gop.value_ptr.x = @min(gop.value_ptr.x, vp.viewport.x);
-                        gop.value_ptr.y = @min(gop.value_ptr.y, vp.viewport.y);
+                        gop.value_ptr.x = @min(gop.value_ptr.x, vp.screen.x);
+                        gop.value_ptr.y = @min(gop.value_ptr.y, @as(i64, vp.screen.y) - top_y);
                     }
                 }
             }
@@ -472,7 +483,7 @@ pub const State = struct {
                 // entirely outside the viewport.
                 const x: i64 = @as(i64, origin.x) + pr.horizontal_offset;
                 const y: i64 = @as(i64, origin.y) + pr.vertical_offset;
-                if (y >= t.rows or y + grid.rows - 1 < 0) continue;
+                if (y >= @as(i64, t.rows) + self.bottom_overscan_rows or y + grid.rows - 1 < -@as(i64, self.top_overscan_rows)) continue;
                 if (x >= t.cols or x + grid.cols - 1 < 0) continue;
 
                 self.appendKittyPlacement(
@@ -580,7 +591,7 @@ pub const State = struct {
         const img_right_x: i64 = img_left_x + grid.cols - 1;
 
         // If the placement isn't within our viewport then skip it.
-        if (img_top_y > bot_y or img_bot_y < top_y) return;
+        if (img_top_y > @as(i64, bot_y) + self.bottom_overscan_rows or img_bot_y < top_y -| self.top_overscan_rows) return;
         if (img_left_x >= t.cols or img_right_x < 0) return;
 
         // Viewport-relative position. Offsets so extreme that the
@@ -640,6 +651,7 @@ pub const State = struct {
         t: *const terminal.Terminal,
         p: *const terminal.kitty.graphics.unicode.Placement,
         cell_size: CellSize,
+        top_y: u32,
     ) PrepImageError!void {
         const storage = &t.screens.active.kitty_images;
         const image = storage.imageById(p.image_id) orelse {
@@ -664,23 +676,14 @@ pub const State = struct {
         // If our placement is zero sized then we don't do anything.
         if (rp.dest_width == 0 or rp.dest_height == 0) return;
 
-        const viewport: terminal.point.Point = t.screens.active.pages.pointFromPin(
-            .viewport,
-            rp.top_left,
-        ) orelse {
-            // This is unreachable with virtual placements because we should
-            // only ever be looking at virtual placements that are in our
-            // viewport in the renderer and virtual placements only ever take
-            // up one row.
-            unreachable;
-        };
+        const position = t.screens.active.pages.pointFromPin(.screen, rp.top_left).?.screen;
 
         // Prepare the image for the GPU and store the placement.
         try self.prepKittyImage(alloc, &image);
         try self.kitty_placements.append(alloc, .{
             .image_id = .{ .kitty = image.id },
             .x = @intCast(rp.top_left.x),
-            .y = @intCast(viewport.viewport.y),
+            .y = @intCast(@as(i64, position.y) - top_y),
             .z = -1,
             .width = rp.dest_width,
             .height = rp.dest_height,
@@ -1321,7 +1324,7 @@ test "kitty renderer positions relative placements from the parent pin" {
     try testing.expect(!state.kitty_virtual);
 }
 
-test "kitty renderer relative placement with negative offsets" {
+test "kitty renderer relative placement with negative offsets and overscan" {
     const testing = std.testing;
     const alloc = testing.allocator;
     const io = testing.io;
@@ -1389,6 +1392,32 @@ test "kitty renderer relative placement with negative offsets" {
     const child = state.kitty_placements.items[1];
     try testing.expectEqual(@as(i32, -1), child.x);
     try testing.expectEqual(@as(i32, -1), child.y);
+    var stream = t.vtStream();
+    defer stream.deinit();
+    for (0..14) |_| stream.nextSlice("line\r\n");
+    const anchor = try t.screens.active.pages.trackPin(
+        t.screens.active.pages.pin(.{ .active = .{ .x = 2, .y = 2 } }).?,
+    );
+    try storage.addPlacement(io, alloc, t.screens.active, 1, 4, .{
+        .location = .{ .pin = anchor },
+        .columns = 1,
+        .rows = 1,
+    });
+    try storage.addPlacement(io, alloc, t.screens.active, 1, 5, .{
+        .location = .{ .relative = .{
+            .parent = .{ .image_id = 1, .placement_id = .{ .tag = .external, .id = 4 } },
+            .vertical_offset = -4,
+        } },
+        .columns = 1,
+        .rows = 1,
+        .z = 3,
+    });
+    state.kittyUpdate(alloc, &t, .{ .width = 10, .height = 10 });
+    const without_band = state.kitty_placements.items.len;
+    state.top_overscan_rows = 2;
+    state.kittyUpdate(alloc, &t, .{ .width = 10, .height = 10 });
+    try testing.expectEqual(without_band + 1, state.kitty_placements.items.len);
+    try testing.expectEqual(@as(i32, -2), state.kitty_placements.items[state.kitty_placements.items.len - 1].y);
 }
 
 test "kitty renderer positions relative placements from virtual parent placeholders" {

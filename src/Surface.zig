@@ -1825,6 +1825,92 @@ pub const AbsoluteScrollSnapshot = extern struct {
     row_space_revision: u64,
 };
 
+pub const PixelScrollResult = struct {
+    position: AbsoluteScrollSnapshot,
+    viewport_delta: i64,
+};
+
+pub fn scrollToRowPixelIfRevision(self: *Surface, row: usize, pixel_offset: f32, expected_revision: u64) ?PixelScrollResult {
+    if (!std.math.isFinite(pixel_offset)) return null;
+    const result: PixelScrollResult = result: {
+        self.renderer_state.lockDemand(global.io());
+        defer self.renderer_state.unlockDemand(global.io());
+        const screens = &self.renderer_state.terminal.screens;
+        const key = screens.active_key;
+        var scrollbar = screens.active.pages.scrollbar();
+        const revision = self.rowSpaceIdentity(key, screens.generation(key), scrollbar.row_space_revision);
+        if (revision != expected_revision) return null;
+        const history = std.math.cast(i64, scrollbar.total - scrollbar.len) orelse return null;
+        const before = history - @as(i64, @intCast(scrollbar.offset));
+        screens.active.scroll(.{ .row = row });
+        if (key == .primary) screens.active.pages.viewport_pixel_offset = std.math.clamp(pixel_offset, -4096, 4096);
+        scrollbar = screens.active.pages.scrollbar();
+        break :result .{
+            .viewport_delta = @as(i64, @intCast(scrollbar.total - scrollbar.len)) - @as(i64, @intCast(scrollbar.offset)) - before,
+            .position = .{
+                .total = @intCast(scrollbar.total),
+                .offset = @intCast(scrollbar.offset),
+                .len = @intCast(scrollbar.len),
+                .row_space_revision = revision,
+            },
+        };
+    };
+    self.queueRender() catch |err| log.warn("failed to queue render after pixel scroll err={}", .{err});
+    return result;
+}
+
+test "pixel scroll returns atomic signed viewport movement" {
+    const testing = std.testing;
+    var mutex: std.Io.Mutex = .init;
+    var t: terminal.Terminal = try .init(testing.io, testing.allocator, .{ .cols = 20, .rows = 2 });
+    defer t.deinit(testing.allocator);
+    var stream = t.vtStream();
+    defer stream.deinit();
+    for (0..100) |i| {
+        var buf: [32]u8 = undefined;
+        const line = try std.fmt.bufPrint(&buf, "row-{d}\r\n", .{i});
+        stream.nextSlice(line);
+    }
+    var surface: Surface = undefined;
+    surface.id = 42;
+    surface.renderer_state = .{ .mutex = &mutex, .terminal = &t };
+    surface.renderer_thread.wakeup = try .init();
+    defer surface.renderer_thread.wakeup.deinit();
+    var sb = t.screens.active.pages.scrollbar();
+    t.screens.active.scroll(.{ .row = sb.total - sb.len - 21 });
+    for (0..10) |_| stream.nextSlice("growth\r\n");
+    sb = t.screens.active.pages.scrollbar();
+    try testing.expectEqual(31, sb.total - sb.len - sb.offset);
+    const revision = surface.rowSpaceIdentity(.primary, t.screens.generation(.primary), sb.row_space_revision);
+    const applied = surface.scrollToRowPixelIfRevision(sb.total - sb.len - 20, 3.5, revision).?;
+    try testing.expectEqual(-11, applied.viewport_delta);
+    try testing.expectEqual(20, applied.position.total - applied.position.len - applied.position.offset);
+    try testing.expectEqual(3.5, t.screens.active.pages.viewport_pixel_offset);
+    const zero = surface.scrollToRowPixelIfRevision(sb.total - sb.len - 20, 0, revision).?;
+    try testing.expectEqual(0, zero.viewport_delta);
+    const positive = surface.scrollToRowPixelIfRevision(sb.total - sb.len - 25, 0, revision).?;
+    try testing.expectEqual(5, positive.viewport_delta);
+    const unchanged = t.screens.active.pages.scrollbar();
+    try testing.expect(surface.scrollToRowPixelIfRevision(0, 1, revision + 1) == null);
+    try testing.expect(surface.scrollToRowPixelIfRevision(0, std.math.nan(f32), revision) == null);
+    try testing.expectEqualDeep(unchanged, t.screens.active.pages.scrollbar());
+    const top = surface.scrollToRowPixelIfRevision(0, 0, revision).?;
+    try testing.expectEqual(@as(i64, @intCast(sb.total - sb.len)) - 25, top.viewport_delta);
+    const bottom = surface.scrollToRowPixelIfRevision(std.math.maxInt(usize), 0, revision).?;
+    try testing.expectEqual(-@as(i64, @intCast(sb.total - sb.len)), bottom.viewport_delta);
+    _ = try t.switchScreen(.alternate);
+    sb = t.screens.active.pages.scrollbar();
+    const alternate_revision = surface.rowSpaceIdentity(.alternate, t.screens.generation(.alternate), sb.row_space_revision);
+    try testing.expect(surface.scrollToRowPixelIfRevision(0, 0, revision) == null);
+    const alternate = surface.scrollToRowPixelIfRevision(10, 3.5, alternate_revision).?;
+    try testing.expectEqual(0, alternate.viewport_delta);
+    try testing.expectEqual(0, t.screens.active.pages.viewport_pixel_offset);
+    _ = try t.switchScreen(.primary);
+    t.screens.remove(testing.allocator, .alternate);
+    _ = try t.switchScreen(.alternate);
+    try testing.expect(surface.scrollToRowPixelIfRevision(0, 0, alternate_revision) == null);
+}
+
 /// Called when the scrollbar state changes.
 fn updateScrollbar(self: *Surface, scrollbar: terminal.Scrollbar) void {
     _ = self.rt_app.performAction(
@@ -2660,7 +2746,7 @@ pub fn sizeCallback(self: *Surface, size: apprt.SurfaceSize) !void {
 
     const new_screen_size: rendererpkg.ScreenSize = .{
         .width = size.width,
-        .height = size.height,
+        .height = size.height +| self.size.top_inset +| self.size.bottom_inset,
     };
 
     // Update our screen size, but only if it actually changed. And if
@@ -2669,6 +2755,16 @@ pub fn sizeCallback(self: *Surface, size: apprt.SurfaceSize) !void {
     if (self.size.screen.equals(new_screen_size)) return;
 
     try self.resize(new_screen_size);
+}
+
+pub fn setRenderInsets(self: *Surface, top_px: u32, bottom_px: u32) !void {
+    const top = std.math.cast(u16, top_px) orelse std.math.maxInt(u16);
+    const bottom = std.math.cast(u16, bottom_px) orelse std.math.maxInt(u16);
+    if (self.size.top_inset == top and self.size.bottom_inset == bottom) return;
+    const height = self.size.screen.height -| (@as(u32, self.size.top_inset) + self.size.bottom_inset);
+    self.size.top_inset = top;
+    self.size.bottom_inset = bottom;
+    try self.resize(.{ .width = self.size.screen.width, .height = height +| top +| bottom });
 }
 
 fn resize(self: *Surface, size: rendererpkg.ScreenSize) !void {

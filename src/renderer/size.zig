@@ -29,23 +29,24 @@ pub const Size = struct {
     screen: ScreenSize,
     cell: CellSize,
     padding: Padding,
+    top_inset: u16 = 0,
+    bottom_inset: u16 = 0,
 
     /// Return the grid size for this size. The grid size is calculated by
     /// taking the screen size, removing padding, and dividing by the cell
     /// dimensions.
     pub fn grid(self: Size) GridSize {
-        return .init(self.screen.subPadding(self.padding), self.cell);
+        return .init(self.terminal(), self.cell);
     }
 
     /// The size of the terminal. This is the same as the screen without
     /// padding.
     pub fn terminal(self: Size) ScreenSize {
-        return self.screen.subPadding(self.padding);
+        var screen = self.screen.subPadding(self.padding);
+        screen.height -|= @as(u32, self.top_inset) + self.bottom_inset;
+        return screen;
     }
 
-    /// Set the padding to be balanced around the grid. The balanced
-    /// padding is calculated AFTER the explicit padding is taken
-    /// into account.
     pub fn screenForGrid(self: Size, requested: GridSize) ?ScreenSize {
         if (requested.columns == 0 or requested.rows == 0 or
             self.cell.width == 0 or self.cell.height == 0) return null;
@@ -54,8 +55,9 @@ pub const Size = struct {
             self.padding.left + self.padding.right;
         const height = @as(u64, requested.rows) * self.cell.height +
             self.padding.top + self.padding.bottom;
+        const insets = @as(u64, self.top_inset) + self.bottom_inset;
         if (width > std.math.maxInt(u32) or
-            height > std.math.maxInt(u32))
+            height + insets > std.math.maxInt(u32))
             return null;
 
         const screen: ScreenSize = .{
@@ -65,7 +67,7 @@ pub const Size = struct {
         var resolved = self;
         resolved.screen = .{
             .width = screen.width,
-            .height = @intCast(height),
+            .height = @intCast(height + insets),
         };
         if (!resolved.grid().equals(requested)) return null;
         return screen;
@@ -79,8 +81,10 @@ pub const Size = struct {
         self.padding = explicit;
 
         // Now we can calculate the balanced padding
+        var screen = self.screen;
+        screen.height -|= @as(u32, self.top_inset) + self.bottom_inset;
         self.padding = .balanced(
-            self.screen,
+            screen,
             self.grid(),
             self.cell,
         );
@@ -502,6 +506,29 @@ test "Size.screenForGrid resolves exact logical dimensions" {
         resolved.grid(),
     );
 }
+test "render insets preserve grid and app dimensions with balanced padding" {
+    const testing = std.testing;
+    var size: Size = .{
+        .screen = .{ .width = 109, .height = 127 },
+        .cell = .{ .width = 10, .height = 20 },
+        .padding = .{ .left = 2, .right = 3, .top = 4, .bottom = 5 },
+        .top_inset = 23,
+        .bottom_inset = 31,
+    };
+    const grid_size = size.grid();
+    try testing.expectEqual(@as(GridSize.Unit, 10), grid_size.columns);
+    try testing.expectEqual(@as(GridSize.Unit, 3), grid_size.rows);
+    const resolved = size.screenForGrid(grid_size).?;
+    try testing.expectEqual(@as(u32, 105), resolved.width);
+    try testing.expectEqual(@as(u32, 69), resolved.height);
+    size.balancePadding(size.padding, .equal);
+    try testing.expect(size.grid().equals(grid_size));
+    size.top_inset = 0;
+    size.bottom_inset = 0;
+    size.screen.height -= 54;
+    try testing.expect(size.grid().equals(grid_size));
+}
+
 test "Size.screenForGrid rejects zero and overflow" {
     const normal: Size = .{
         .screen = .{ .width = 0, .height = 0 },

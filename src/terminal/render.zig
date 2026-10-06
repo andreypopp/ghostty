@@ -171,6 +171,7 @@ pub const RenderState = struct {
     /// `viewportStart()` reads it and `row_data` is laid out for it by the
     /// update. Changing it causes the next update to be a full redraw.
     overscan_request: Overscan = .{},
+    pixel_offset: f32 = 0,
 
     /// The number of rows above and below the viewport that the last
     /// update actually captured. This is never more than
@@ -515,6 +516,8 @@ pub const RenderState = struct {
     ) Allocator.Error!void {
         const s: *Screen = t.screens.active;
         const viewport_pin = s.pages.getTopLeft(.viewport);
+        const pixel_offset = s.pages.viewport_pixel_offset;
+        const pixel_offset_changed = self.pixel_offset != pixel_offset;
 
         // The overscan rows to capture beyond the viewport. The request
         // decides the layout of row_data, and the actual counts are
@@ -931,11 +934,12 @@ pub const RenderState = struct {
 
             // Note: we don't clear any row_data here because our rebuild
             // above did this.
-        } else if (any_dirty and self.dirty == .false) {
+        } else if ((any_dirty or pixel_offset_changed) and self.dirty == .false) {
             self.dirty = .partial;
         }
 
         // Clear our dirty flags
+        self.pixel_offset = pixel_offset;
         t.flags.dirty = .{};
         s.dirty = .{};
     }
@@ -2811,6 +2815,35 @@ test "overscan row_data layout" {
         try testing.expectEqual(14, state.rowDataRange().end);
         try testing.expectEqual(15, state.row_data.len);
     }
+}
+
+test "pixel scroll snapshot respects populated overscan ranges and offset-only dirtiness" {
+    const testing = std.testing;
+    var t = try Terminal.init(testing.io, testing.allocator, .{ .cols = 5, .rows = 3 });
+    defer t.deinit(testing.allocator);
+    var stream = t.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("A\r\nB\r\nC\r\nD\r\nE\r\nF\r\nG");
+    const pages = &t.screens.active.pages;
+    pages.scroll(.{ .row = 1 });
+    pages.viewport_pixel_offset = 2;
+    var state: RenderState = .empty;
+    defer state.deinit(testing.allocator);
+    state.overscan_request = .{ .above = 5, .below = 2 };
+    try state.update(testing.allocator, &t);
+    try testing.expectEqual(@as(usize, 5), state.viewportStart());
+    try testing.expectEqual(@as(size.CellCountInt, 1), state.overscan.above);
+    try testing.expectEqual(@as(usize, 4), state.rowDataRange().start);
+    try testing.expectEqual(@as(f32, 2), state.pixel_offset);
+    state.dirty = .false;
+    pages.viewport_pixel_offset = 3;
+    try state.update(testing.allocator, &t);
+    try testing.expect(state.dirty == .partial);
+    try testing.expectEqual(@as(f32, 3), state.pixel_offset);
+    pages.scroll(.active);
+    try state.update(testing.allocator, &t);
+    try testing.expectEqual(@as(f32, 0), state.pixel_offset);
+    try testing.expectEqual(@as(size.CellCountInt, 0), state.overscan.below);
 }
 
 test "overscan request change forces redraw" {
