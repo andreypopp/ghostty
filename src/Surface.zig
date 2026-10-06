@@ -2453,12 +2453,14 @@ fn clipboardWrite(self: *const Surface, data: []const u8, loc: apprt.Clipboard) 
     // characters outside the base64 alphabet is discarded entirely
     // (never partially decoded), while a missing-padding tail is
     // tolerated since OSC 52 has no way to report errors.
+    if (data.len > std.base64.standard.Encoder.calcSize(terminal.osc.max_clipboard_bytes)) return;
     var buf = try self.alloc.allocSentinel(u8, simd.base64.maxLen(data), 0);
     defer self.alloc.free(buf);
     const decoded = simd.base64.decodeStrict(data, buf, .optional) catch {
         log.info("application sent invalid base64 data for OSC 52", .{});
         return;
     };
+    if (decoded.len > terminal.osc.max_clipboard_bytes) return;
     buf[decoded.len] = 0;
 
     // When clipboard-write is "ask" a prompt is displayed to the user asking
@@ -6628,6 +6630,7 @@ fn completeClipboardReadOSC52(
 ) !void {
     // We should never get here if clipboard-read is set to deny
     assert(self.config.clipboard_read != .deny);
+    if (data.len > terminal.osc.max_clipboard_bytes) return;
 
     // If clipboard-read is set to ask and we haven't confirmed with the user,
     // do that now
@@ -6663,6 +6666,20 @@ fn completeClipboardReadOSC52(
         .alloc = self.alloc,
         .data = buf,
     } }, .unlocked);
+}
+
+test "OSC52 host read completion caps encoded allocations" {
+    const testing = std.testing;
+    const data = try testing.allocator.alloc(u8, 1_048_577);
+    defer testing.allocator.free(data);
+    @memset(data, 'a');
+    var failing: testing.FailingAllocator = .init(testing.allocator, .{ .fail_index = 0 });
+    var surface: Surface = undefined;
+    surface.alloc = failing.allocator();
+    surface.config.clipboard_read = .allow;
+    try surface.completeClipboardReadOSC52(data, .standard, true);
+    try testing.expectEqual(@as(usize, 0), failing.allocations);
+    try testing.expectError(error.OutOfMemory, surface.completeClipboardReadOSC52(data[0..1_048_576], .standard, true));
 }
 
 /// Handle a Kitty clipboard protocol (OSC 5522) read request forwarded
