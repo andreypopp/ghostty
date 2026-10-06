@@ -32,6 +32,137 @@ pub const Padding = size.Padding;
 pub const cursorStyle = cursor.style;
 pub const lib = @import("lib/main.zig");
 
+pub const FramePresentation = struct {
+    pub const Status = enum(c_int) {
+        presented = 0,
+        discarded = 1,
+        backend_failed = 2,
+    };
+
+    callback: *const fn (?*anyopaque, u64) callconv(.c) void,
+    userdata: ?*anyopaque,
+    token: u64,
+    delivery_gate: ?*const fn (?*anyopaque) callconv(.c) void = null,
+    delivery_gate_userdata: ?*anyopaque = null,
+    failure_callback: ?*const fn (?*anyopaque, u64, Status) callconv(.c) void = null,
+    failure_userdata: ?*anyopaque = null,
+
+    pub fn deliver(self: FramePresentation) void {
+        if (self.delivery_gate) |gate| gate(self.delivery_gate_userdata);
+        self.callback(self.userdata, self.token);
+    }
+
+    pub fn fail(self: FramePresentation, status: Status) void {
+        if (self.delivery_gate) |gate| gate(self.delivery_gate_userdata);
+        if (self.failure_callback) |callback| {
+            callback(self.failure_userdata, self.token, status);
+        }
+    }
+};
+
+pub const RenderPresentationStatus = FramePresentation.Status;
+
+test "frame presentation waits for its delivery gate" {
+    const testing = @import("std").testing;
+    const TestState = struct {
+        events: [2]u8 = @splat(0),
+        len: usize = 0,
+
+        fn append(self: *@This(), event: u8) void {
+            self.events[self.len] = event;
+            self.len += 1;
+        }
+
+        fn gate(userdata: ?*anyopaque) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(userdata.?));
+            self.append(1);
+        }
+
+        fn callback(userdata: ?*anyopaque, _: u64) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(userdata.?));
+            self.append(2);
+        }
+    };
+
+    var state: TestState = .{};
+    const presentation: FramePresentation = .{
+        .callback = &TestState.callback,
+        .userdata = &state,
+        .token = 42,
+        .delivery_gate = &TestState.gate,
+        .delivery_gate_userdata = &state,
+    };
+    presentation.deliver();
+    try testing.expectEqualSlices(u8, &.{ 1, 2 }, state.events[0..state.len]);
+}
+
+test "failed frame presentation reports after its delivery gate" {
+    const testing = @import("std").testing;
+    const TestState = struct {
+        events: [2]u8 = @splat(0),
+        len: usize = 0,
+
+        fn append(self: *@This(), event: u8) void {
+            self.events[self.len] = event;
+            self.len += 1;
+        }
+
+        fn gate(userdata: ?*anyopaque) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(userdata.?));
+            self.append(1);
+        }
+
+        fn callback(
+            userdata: ?*anyopaque,
+            _: u64,
+            status: FramePresentation.Status,
+        ) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(userdata.?));
+            self.append(if (status == .discarded) 2 else 3);
+        }
+    };
+
+    var state: TestState = .{};
+    const presentation: FramePresentation = .{
+        .callback = undefined,
+        .userdata = &state,
+        .token = 42,
+        .delivery_gate = &TestState.gate,
+        .delivery_gate_userdata = &state,
+        .failure_callback = &TestState.callback,
+        .failure_userdata = &state,
+    };
+    presentation.fail(.discarded);
+    try testing.expectEqualSlices(u8, &.{ 1, 2 }, state.events[0..state.len]);
+}
+
+test "failed frame presentation preserves null callback userdata" {
+    const testing = @import("std").testing;
+    const TestState = struct {
+        var saw_null_userdata = false;
+
+        fn callback(
+            userdata: ?*anyopaque,
+            _: u64,
+            _: FramePresentation.Status,
+        ) callconv(.c) void {
+            saw_null_userdata = userdata == null;
+        }
+    };
+
+    TestState.saw_null_userdata = false;
+    var unrelated_userdata: u8 = 0;
+    const presentation: FramePresentation = .{
+        .callback = undefined,
+        .userdata = &unrelated_userdata,
+        .token = 42,
+        .failure_callback = &TestState.callback,
+        .failure_userdata = null,
+    };
+    presentation.fail(.backend_failed);
+    try testing.expect(TestState.saw_null_userdata);
+}
+
 /// The implementation to use for the renderer. This is comptime chosen
 /// so that every build has exactly one renderer implementation.
 pub const Renderer = GenericRenderer(GraphicsAPI);
