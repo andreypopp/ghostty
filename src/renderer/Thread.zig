@@ -19,6 +19,11 @@ const log = std.log.scoped(.renderer_thread);
 
 const CURSOR_BLINK_INTERVAL = 600;
 
+const Realization = enum { unrealize, realize, rebuild };
+const Pending = struct {
+    realization: ?Realization = null,
+    presentation: ?rendererpkg.FramePresentation = null,
+};
 /// Whether calls to `drawFrame` must be done from the app thread.
 ///
 /// The type used for sending messages to the IO thread. For now this is
@@ -28,6 +33,8 @@ pub const Mailbox = BlockingQueue(rendererpkg.Message, 64);
 
 /// Allocator used for some state
 alloc: std.mem.Allocator,
+pending_mutex: std.Io.Mutex = .init,
+pending: Pending = .{},
 
 /// The main event loop for the application. The user data of this loop
 /// is always the allocator used to create the loop. This is a convenience
@@ -113,6 +120,67 @@ pub const DerivedConfig = struct {
 /// Initialize the thread. This does not START the thread. This only sets
 /// up all the internal state necessary prior to starting the thread. It
 /// is up to the caller to start the thread with the threadMain entrypoint.
+pub fn publishRendererRealized(self: *Thread, realized: bool) bool {
+    self.pending_mutex.lockUncancelable(global.io());
+    defer self.pending_mutex.unlock(global.io());
+    const previous = self.pending.realization;
+    self.pending.realization = if (!realized) .unrealize else switch (previous orelse .realize) {
+        .unrealize, .rebuild => .rebuild,
+        .realize => .realize,
+    };
+    self.wakeup.notify() catch {
+        self.pending.realization = previous;
+        return false;
+    };
+    return true;
+}
+
+pub fn requestDrawWithPresentation(self: *Thread, presentation: rendererpkg.FramePresentation) bool {
+    self.pending_mutex.lockUncancelable(global.io());
+    defer self.pending_mutex.unlock(global.io());
+    if (self.pending.presentation != null) return false;
+    self.pending.presentation = presentation;
+    self.wakeup.notify() catch {
+        self.pending.presentation = null;
+        return false;
+    };
+    return true;
+}
+
+fn takePending(self: *Thread) Pending {
+    self.pending_mutex.lockUncancelable(global.io());
+    defer self.pending_mutex.unlock(global.io());
+    const pending = self.pending;
+    self.pending = .{};
+    return pending;
+}
+
+fn applyRealization(self: *Thread, request: Realization) !void {
+    if (request != .realize) {
+        self.renderer.displayUnrealized();
+        self.renderer.draw_mutex.lockUncancelable(global.io());
+        self.renderer.releaseGpuResources();
+        self.renderer.draw_mutex.unlock(global.io());
+    }
+    if (request != .unrealize) try self.renderer.displayRealized();
+}
+
+fn drawPendingPresentation(self: *Thread, presentation: rendererpkg.FramePresentation) void {
+    if (!self.renderer.display_realized) {
+        presentation.fail(.discarded);
+        return;
+    }
+    self.renderer.updateFrame(self.state, self.flags.cursor_blink_visible) catch |err| {
+        log.warn("tokened frame update failed err={}", .{err});
+        presentation.fail(.backend_failed);
+        return;
+    };
+    self.renderer.drawFrameWithPresentation(presentation) catch |err| {
+        log.warn("tokened frame draw failed err={}", .{err});
+        presentation.fail(.backend_failed);
+    };
+}
+
 pub fn init(
     alloc: Allocator,
     config: *const configpkg.Config,
@@ -484,13 +552,21 @@ fn wakeupCallback(
 
     const t = self_.?;
 
+    const pending = t.takePending();
+    if (pending.realization) |request| t.applyRealization(request) catch |err| {
+        log.warn("renderer realization failed err={}", .{err});
+    };
+
     // When we wake up, we check the mailbox. Mailbox producers should
     // wake up our thread after publishing.
     t.drainMailbox() catch |err|
         log.err("error draining mailbox err={}", .{err});
 
-    // Render immediately
-    _ = renderCallback(t, undefined, undefined, {});
+    if (pending.presentation) |presentation| {
+        t.drawPendingPresentation(presentation);
+    } else {
+        _ = renderCallback(t, undefined, undefined, {});
+    }
 
     // PageList mutations maintain their own compression dirty state. Checking
     // it here covers output, resize, and viewport scrolling uniformly.
@@ -855,3 +931,26 @@ const Compression = struct {
         };
     }
 };
+
+test "renderer request preserves forced rebuild and single token admission" {
+    const testing = std.testing;
+    var thread: Thread = undefined;
+    thread.pending_mutex = .init;
+    thread.pending = .{};
+    thread.wakeup = try .init();
+    defer thread.wakeup.deinit();
+    try testing.expect(thread.publishRendererRealized(false));
+    try testing.expect(thread.publishRendererRealized(true));
+    try testing.expect(thread.publishRendererRealized(true));
+    try testing.expectEqual(Realization.rebuild, thread.takePending().realization.?);
+    try testing.expect(thread.publishRendererRealized(true));
+    try testing.expect(thread.publishRendererRealized(false));
+    try testing.expectEqual(Realization.unrealize, thread.takePending().realization.?);
+    const presentation: rendererpkg.FramePresentation = .{ .callback = undefined, .userdata = null, .token = 42 };
+    try testing.expect(thread.requestDrawWithPresentation(presentation));
+    try testing.expect(!thread.requestDrawWithPresentation(presentation));
+    try testing.expectEqual(@as(u64, 42), thread.takePending().presentation.?.token);
+    try testing.expect(thread.takePending().presentation == null);
+    try testing.expect(thread.requestDrawWithPresentation(presentation));
+    _ = thread.takePending();
+}

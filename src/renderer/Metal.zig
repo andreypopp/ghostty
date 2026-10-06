@@ -137,6 +137,8 @@ pub fn init(
 }
 
 pub fn deinit(self: *Metal) void {
+    const renderer: *align(1) Renderer = @fieldParentPtr("api", self);
+    self.layer.detachFromHostIfDisplayCallbackOwned(@ptrCast(&displayCallback), @ptrCast(renderer));
     self.queue.release();
 
     // The MTLDevice is app-scoped and destroyed
@@ -240,6 +242,29 @@ pub inline fn present(self: *Metal, target: Target, sync: bool) !void {
     } else {
         try self.layer.setSurface(target.surface);
     }
+}
+
+pub fn clearPresentedSurface(self: *Metal) void {
+    self.layer.clearSurface();
+}
+
+pub fn invalidatePresentations(self: *Metal) void {
+    self.layer.invalidateSurfaceUpdates();
+}
+
+pub fn detachPresentationTarget(self: *Metal, target: *Target) !Target {
+    const replacement = try self.initTarget(target.width, target.height);
+    const frozen = target.*;
+    target.* = replacement;
+    return frozen;
+}
+
+pub fn preparePresentation(self: *Metal, target: Target, presentation: rendererpkg.FramePresentation) IOSurfaceLayer.PreparedSurfaceUpdate {
+    return self.layer.prepareSurfaceWithPresentation(target.surface, presentation);
+}
+
+pub fn preparePresentationFailure(self: *Metal, presentation: rendererpkg.FramePresentation, status: rendererpkg.FramePresentation.Status) IOSurfaceLayer.PreparedSurfaceUpdate {
+    return self.layer.prepareFailure(presentation, status);
 }
 
 /// Returns the options to use when constructing buffers.
@@ -383,5 +408,20 @@ pub inline fn beginFrame(
     /// The target is presented via the provided renderer's API when completed.
     target: *Target,
 ) !Frame {
-    return try Frame.begin(.{ .queue = self.queue }, renderer, target);
+    return try Frame.begin(.{ .queue = self.queue }, renderer, target, null);
+}
+
+fn waitForDraw(userdata: ?*anyopaque) callconv(.c) void {
+    const renderer: *Renderer = @ptrCast(@alignCast(userdata.?));
+    renderer.draw_mutex.lockUncancelable(@import("../global.zig").io());
+    renderer.draw_mutex.unlock(@import("../global.zig").io());
+}
+
+pub fn beginFrameWithPresentation(self: *const Metal, renderer: *Renderer, target: *Target, presentation: ?rendererpkg.FramePresentation) !Frame {
+    var gated = presentation;
+    if (gated) |*value| {
+        value.delivery_gate = &waitForDraw;
+        value.delivery_gate_userdata = renderer;
+    }
+    return Frame.begin(.{ .queue = self.queue }, renderer, target, gated);
 }

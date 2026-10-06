@@ -1223,6 +1223,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // Release the shaders as well if we're unrealized.
             if (!self.display_realized) {
                 self.shaders.deinit(self.alloc);
+                if (comptime @hasDecl(GraphicsAPI, "clearPresentedSurface")) self.api.clearPresentedSurface();
             }
         }
 
@@ -1689,34 +1690,44 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         ///
         /// If `sync` is true, this will synchronously block until
         /// the frame is finished drawing and has been presented.
-        pub fn drawFrame(
+        pub fn drawFrame(self: *Self, sync: bool) !void {
+            try self.drawFrameWithOptionalPresentation(sync, null);
+        }
+
+        pub fn drawFrameWithPresentation(self: *Self, presentation: renderer.FramePresentation) !void {
+            try self.drawFrameWithOptionalPresentation(false, presentation);
+        }
+
+        const DrawResult = enum { drawn, idle, discarded };
+
+        fn drawFrameWithOptionalPresentation(
             self: *Self,
             sync: bool,
+            presentation: ?renderer.FramePresentation,
         ) !void {
             // Everything that touches draw state happens under the draw
             // mutex. The display link is synced only after the mutex is
             // released; see `syncDisplayLink` for why it must never be
             // called with the draw mutex held.
-            const sync_display_link = locked: {
+            const result = locked: {
                 self.draw_mutex.lockUncancelable(global.io());
                 defer self.draw_mutex.unlock(global.io());
-                break :locked try self.drawFrameLocked(sync);
+                break :locked try self.drawFrameLocked(sync, presentation);
             };
-
-            if (sync_display_link) self.syncDisplayLink(null, null);
+            switch (result) {
+                .drawn => {},
+                .idle => self.syncDisplayLink(null, null),
+                .discarded => if (presentation) |value| value.fail(.discarded),
+            }
         }
 
         /// The body of `drawFrame`. Must be called with `draw_mutex` held.
         ///
-        /// Returns true if the display link should be resynced once the
-        /// draw mutex is released. This is only ever true on the no-redraw
-        /// path, which a sync draw never takes, so the main thread's sync
-        /// draws never touch the display link and `syncDisplayLink` stays
-        /// on the render thread.
         fn drawFrameLocked(
             self: *Self,
             sync: bool,
-        ) !bool {
+            presentation: ?renderer.FramePresentation,
+        ) !DrawResult {
             // After the graphics API is complete (so we defer) we want to
             // update our scrollbar state.
             defer if (self.scrollbar_dirty) {
@@ -1737,12 +1748,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
             // If either of our surface dimensions is zero
             // then drawing is absurd, so we just return.
-            if (surface_size.width == 0 or surface_size.height == 0) return false;
+            if (surface_size.width == 0 or surface_size.height == 0) return .discarded;
 
             // If we have no graphics context we can't draw. This is
             // only the case while unrealized (GTK) or after the render
             // thread exits; displayRealized rebuilds the swap chain.
-            if (!self.display_realized) return false;
+            if (!self.display_realized) return .discarded;
 
             // Get our swap chain, rebuilding it if it was released
             // while we were hidden. Rebuilding is deferred to draw
@@ -1772,13 +1783,13 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 swap_chain_rebuilt or
                 self.cells_rebuilt or
                 self.animationWake() != null or
-                sync;
+                sync or presentation != null;
 
             if (!needs_redraw) {
                 // Ask our caller to resync the display link once the draw
                 // mutex is released, because we can probably pause the
                 // display link at this point.
-                return true;
+                return .idle;
             }
             self.cells_rebuilt = false;
 
@@ -1879,8 +1890,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             }
 
             // Get a frame context from the graphics API.
-            var frame_ctx = try self.api.beginFrame(self, &frame.target);
-            defer frame_ctx.complete(sync);
+            var frame_ctx = if (comptime @hasDecl(GraphicsAPI, "beginFrameWithPresentation"))
+                try self.api.beginFrameWithPresentation(self, &frame.target, presentation)
+            else unsupported: {
+                if (presentation != null) return error.UnsupportedPresentation;
+                break :unsupported try self.api.beginFrame(self, &frame.target);
+            };
 
             {
                 var pass = frame_ctx.renderPass(&.{.{
@@ -2013,7 +2028,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 }
             }
 
-            return false;
+            frame_ctx.complete(sync);
+            return .drawn;
         }
 
         // Callback from the graphics API when a frame is completed.

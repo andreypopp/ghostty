@@ -447,6 +447,8 @@ pub const EnvVar = extern struct {
 pub const IoMode = @import("../termio/Manual.zig").IoMode;
 
 pub const IoWriteCallback = *const fn (?*anyopaque, [*]const u8, usize) callconv(.c) void;
+pub const RenderPresentedCallback = *const fn (?*anyopaque, u64) callconv(.c) void;
+pub const RenderFailedCallback = *const fn (?*anyopaque, u64, renderer.RenderPresentationStatus) callconv(.c) void;
 
 pub const FontSizeActionCallback = *const fn (
     ?*anyopaque,
@@ -472,6 +474,10 @@ pub const Surface = struct {
 
     font_size_action_cb: ?FontSizeActionCallback = null,
     font_size_action_userdata: ?*anyopaque = null,
+    render_presented_cb: ?RenderPresentedCallback = null,
+    render_presented_userdata: ?*anyopaque = null,
+    render_failed_cb: ?RenderFailedCallback = null,
+    render_failed_userdata: ?*anyopaque = null,
 
     /// The current title of the surface. The embedded apprt saves this so
     /// that getTitle works without the implementer needing to save it.
@@ -1970,6 +1976,34 @@ pub const CAPI = struct {
     /// Returns true if the surface process has exited.
     export fn ghostty_surface_process_exited(surface: *Surface) bool {
         return surface.core_surface.child_exited;
+    }
+
+    export fn ghostty_surface_set_renderer_realized(surface: *Surface, realized: bool) bool {
+        return surface.core_surface.renderer_thread.publishRendererRealized(realized);
+    }
+
+    export fn ghostty_surface_set_render_presented_callback(surface: *Surface, callback: ?RenderPresentedCallback, userdata: ?*anyopaque) bool {
+        if (surface.render_presented_cb != null) return false;
+        surface.render_presented_cb = callback orelse return false;
+        surface.render_presented_userdata = userdata;
+        return true;
+    }
+
+    export fn ghostty_surface_set_render_failed_callback(surface: *Surface, callback: ?RenderFailedCallback, userdata: ?*anyopaque) bool {
+        if (surface.render_failed_cb != null) return false;
+        surface.render_failed_cb = callback orelse return false;
+        surface.render_failed_userdata = userdata;
+        return true;
+    }
+
+    export fn ghostty_surface_request_render_with_token(surface: *Surface, token: u64) bool {
+        return surface.core_surface.renderer_thread.requestDrawWithPresentation(.{
+            .callback = surface.render_presented_cb orelse return false,
+            .userdata = surface.render_presented_userdata,
+            .token = token,
+            .failure_callback = surface.render_failed_cb,
+            .failure_userdata = surface.render_failed_userdata,
+        });
     }
 
     export fn ghostty_surface_set_font_size_action_callback(
