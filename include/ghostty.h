@@ -1253,7 +1253,16 @@ typedef struct {
   uint64_t row_space_revision;
 } ghostty_surface_scrollbar_s;
 
+// Insets are drawable pixels, excluded from the reported surface size and grid.
+GHOSTTY_API void ghostty_surface_set_render_insets(ghostty_surface_t, uint32_t top, uint32_t bottom);
 GHOSTTY_API bool ghostty_surface_scrollbar(ghostty_surface_t, ghostty_surface_scrollbar_s*);
+// Validation, row movement, pixel translation and returned geometry are atomic.
+// Non-finite offsets or stale revisions leave all outputs and scroll state unchanged.
+// Positive offsets translate up; ordinary scrolling resets them, and alternate
+// screens force zero. Finite offsets are clamped to +/-4096 drawable pixels.
+GHOSTTY_API bool ghostty_surface_scroll_to_row_pixel_if_revision(
+    ghostty_surface_t, uint64_t row, float pixel_offset, uint64_t revision,
+    ghostty_surface_scrollbar_s*, int64_t* viewport_delta);
 
 GHOSTTY_API bool ghostty_surface_set_renderer_realized(ghostty_surface_t, bool);
 GHOSTTY_API bool ghostty_surface_grid_metrics(ghostty_surface_t, ghostty_surface_grid_metrics_s*);
@@ -1303,6 +1312,15 @@ GHOSTTY_API void ghostty_surface_mouse_pos(ghostty_surface_t,
                                               double,
                                               double,
                                               ghostty_input_mods_e);
+typedef enum {
+  GHOSTTY_WHEEL_PROGRAM,
+  GHOSTTY_WHEEL_VIEWPORT,
+  GHOSTTY_WHEEL_IGNORE,
+} ghostty_wheel_disposition_e;
+
+GHOSTTY_API ghostty_wheel_disposition_e ghostty_surface_wheel_intent(ghostty_surface_t, bool);
+GHOSTTY_API bool ghostty_surface_wheel_input(ghostty_surface_t, double, double, int,
+                                           ghostty_input_mods_e, bool, ghostty_wheel_disposition_e);
 GHOSTTY_API void ghostty_surface_mouse_scroll(ghostty_surface_t,
                                                  double,
                                                  double,

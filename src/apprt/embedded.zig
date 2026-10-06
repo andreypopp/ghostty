@@ -1993,6 +1993,18 @@ pub const CAPI = struct {
         return true;
     }
 
+    export fn ghostty_surface_scroll_to_row_pixel_if_revision(surface: *Surface, row: u64, pixel_offset: f32, expected_revision: u64, result: *CoreSurface.AbsoluteScrollSnapshot, viewport_delta: *i64) bool {
+        const target_row = std.math.cast(usize, row) orelse return false;
+        const committed = surface.core_surface.scrollToRowPixelIfRevision(target_row, pixel_offset, expected_revision) orelse return false;
+        result.* = committed.position;
+        viewport_delta.* = committed.viewport_delta;
+        return true;
+    }
+
+    export fn ghostty_surface_set_render_insets(surface: *Surface, top: u32, bottom: u32) void {
+        surface.core_surface.setRenderInsets(top, bottom) catch |err| log.warn("failed to set render insets err={}", .{err});
+    }
+
     export fn ghostty_surface_set_renderer_realized(surface: *Surface, realized: bool) bool {
         return surface.core_surface.renderer_thread.publishRendererRealized(realized);
     }
@@ -2175,7 +2187,7 @@ pub const CAPI = struct {
             .columns = grid_size.columns,
             .rows = grid_size.rows,
             .width_px = surface.core_surface.size.screen.width,
-            .height_px = surface.core_surface.size.screen.height,
+            .height_px = surface.core_surface.size.screen.height -| (@as(u32, surface.core_surface.size.top_inset) + surface.core_surface.size.bottom_inset),
             .cell_width_px = surface.core_surface.size.cell.width,
             .cell_height_px = surface.core_surface.size.cell.height,
         };
@@ -2368,6 +2380,17 @@ pub const CAPI = struct {
             y,
             @bitCast(@as(u8, @truncate(@as(c_uint, @bitCast(scroll_mods))))),
         );
+    }
+
+    export fn ghostty_surface_wheel_intent(surface: *Surface, band: bool) CoreSurface.WheelDisposition {
+        return surface.core_surface.wheelIntent(band);
+    }
+
+    export fn ghostty_surface_wheel_input(surface: *Surface, x: f64, y: f64, scroll_mods: c_int, mods: c_int, band: bool, expected: CoreSurface.WheelDisposition) bool {
+        return surface.core_surface.scrollDispatch(x, y, @bitCast(@as(u8, @truncate(@as(c_uint, @bitCast(scroll_mods))))), @bitCast(@as(input.Mods.Backing, @truncate(@as(c_uint, @bitCast(mods))))), band, expected) catch |err| {
+            log.warn("failed to dispatch wheel input err={}", .{err});
+            return false;
+        };
     }
 
     export fn ghostty_surface_mouse_pressure(

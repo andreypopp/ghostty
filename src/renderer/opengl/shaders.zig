@@ -177,6 +177,7 @@ pub const Uniforms = extern struct {
     /// The padding around the terminal grid in pixels. In order:
     /// top, right, bottom, left.
     grid_padding: [4]f32 align(16),
+    scroll_offset: f32,
 
     /// Bit mask defining which directions to
     /// extend cell colors in to the padding.

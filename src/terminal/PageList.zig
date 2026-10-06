@@ -456,6 +456,7 @@ limits: Limits,
 /// specifically for scrollbar information so we can have the total size.
 total_rows: usize,
 row_space_revision: u64 = 0,
+viewport_pixel_offset: f32 = 0,
 
 /// The list of tracked pins. These are kept up to date automatically.
 tracked_pins: PinSet,
@@ -985,6 +986,7 @@ pub fn deinit(self: *PageList) void {
 pub fn reset(self: *PageList) void {
     defer self.assertIntegrity();
     self.row_space_revision +%= 1;
+    self.viewport_pixel_offset = 0;
 
     // Reset discards all scrollback, so there is nothing left to compress.
     self.page_compression.reset();
@@ -1263,6 +1265,7 @@ pub const Resize = struct {
 /// TODO: docs
 pub fn resize(self: *PageList, opts: Resize) Allocator.Error!void {
     defer self.assertIntegrity();
+    self.viewport_pixel_offset = 0;
     if (opts.cols) |cols| {
         if (cols != self.cols) self.row_space_revision +%= 1;
     }
@@ -3301,6 +3304,7 @@ pub const Scroll = union(enum) {
 /// previously allocated pages.
 pub fn scroll(self: *PageList, behavior: Scroll) void {
     defer self.assertIntegrity();
+    self.viewport_pixel_offset = 0;
 
     // Special case no-scrollback mode to never allow scrolling.
     if (self.limits.bytes.explicit == 0) {
@@ -3571,6 +3575,7 @@ fn scrollPrompt(self: *PageList, delta: isize) void {
 /// Clear the screen by scrolling written contents up into the scrollback.
 /// This will not update the viewport.
 pub fn scrollClear(self: *PageList) Allocator.Error!void {
+    self.viewport_pixel_offset = 0;
     defer self.assertIntegrity();
 
     // Go through the active area backwards to find the first non-empty
@@ -4073,6 +4078,7 @@ pub fn grow(self: *PageList) Allocator.Error!?*List.Node {
         }
 
         self.row_space_revision +%= 1;
+        self.viewport_pixel_offset = 0;
 
         // If we have a pin viewport cache then we need to update it.
         if (self.viewport == .pin) viewport: {
@@ -4527,6 +4533,7 @@ pub const PageAllocation = struct {
         destination.page_size = page_size;
         destination.total_rows = total_rows;
         destination.row_space_revision +%= 1;
+        destination.viewport_pixel_offset = 0;
         if (destination.viewport == .pin) {
             if (destination.viewport_pin_row_offset) |*offset| {
                 offset.* += node.rows();
@@ -5651,6 +5658,7 @@ fn eraseRows(
     // Update our total row count
     if (erased > 0) {
         self.row_space_revision +%= 1;
+        self.viewport_pixel_offset = 0;
     }
     self.total_rows -= erased;
 
@@ -7138,6 +7146,7 @@ const Limits = struct {
         // removal only after every page and pin points into the final list.
         if (removed > 0) {
             pagelist.row_space_revision +%= 1;
+            pagelist.viewport_pixel_offset = 0;
             pagelist.fixupViewport(removed);
         }
     }
@@ -11256,8 +11265,10 @@ test "row space revision changes for destructive mutations, not append or limits
     s.setMaxBytes(null);
     s.setMaxLines(null);
     try testing.expectEqual(initial, s.row_space_revision);
+    s.viewport_pixel_offset = 3;
     s.setMaxBytes(PagePool.item_size);
     try testing.expect(s.row_space_revision != initial);
+    try testing.expectEqual(@as(f32, 0), s.viewport_pixel_offset);
     var revision = s.row_space_revision;
     try s.resize(.{ .cols = cols + 1 });
     try testing.expect(s.row_space_revision != revision);
