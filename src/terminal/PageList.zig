@@ -455,6 +455,7 @@ limits: Limits,
 /// The total number of rows represented by this PageList. This is used
 /// specifically for scrollbar information so we can have the total size.
 total_rows: usize,
+row_space_revision: u64 = 0,
 
 /// The list of tracked pins. These are kept up to date automatically.
 tracked_pins: PinSet,
@@ -983,6 +984,7 @@ pub fn deinit(self: *PageList) void {
 /// memory to fit the active area.
 pub fn reset(self: *PageList) void {
     defer self.assertIntegrity();
+    self.row_space_revision +%= 1;
 
     // Reset discards all scrollback, so there is nothing left to compress.
     self.page_compression.reset();
@@ -1187,6 +1189,7 @@ pub fn clone(
         .cols = self.cols,
         .rows = self.rows,
         .total_rows = total_rows,
+        .row_space_revision = self.row_space_revision,
         .tracked_pins = tracked_pins,
         .viewport = .{ .active = {} },
         .viewport_pin = viewport_pin,
@@ -1260,6 +1263,9 @@ pub const Resize = struct {
 /// TODO: docs
 pub fn resize(self: *PageList, opts: Resize) Allocator.Error!void {
     defer self.assertIntegrity();
+    if (opts.cols) |cols| {
+        if (cols != self.cols) self.row_space_revision +%= 1;
+    }
 
     // Resizing forces all nodes to be decompressed today so we need to
     // reschedule compression.
@@ -3822,6 +3828,8 @@ pub const Scrollbar = struct {
     /// The length of the visible area. This is including the offset row.
     len: usize,
 
+    row_space_revision: u64 = 0,
+
     /// A zero-sized scrollable region.
     pub const zero: Scrollbar = .{
         .total = 0,
@@ -3848,7 +3856,8 @@ pub const Scrollbar = struct {
     pub fn eql(self: Scrollbar, other: Scrollbar) bool {
         return self.total == other.total and
             self.offset == other.offset and
-            self.len == other.len;
+            self.len == other.len and
+            self.row_space_revision == other.row_space_revision;
     }
 };
 
@@ -3869,12 +3878,14 @@ pub fn scrollbar(self: *PageList) Scrollbar {
         .total = self.rows,
         .offset = 0,
         .len = self.rows,
+        .row_space_revision = self.row_space_revision,
     };
 
     return .{
         .total = self.total_rows,
         .offset = self.viewportRowOffset(),
         .len = self.rows, // Length is always rows
+        .row_space_revision = self.row_space_revision,
     };
 }
 
@@ -4060,6 +4071,8 @@ pub fn grow(self: *PageList) Allocator.Error!?*List.Node {
             self.total_rows += first.rows();
             break :prune;
         }
+
+        self.row_space_revision +%= 1;
 
         // If we have a pin viewport cache then we need to update it.
         if (self.viewport == .pin) viewport: {
@@ -4513,6 +4526,7 @@ pub const PageAllocation = struct {
         destination.pages.prepend(node);
         destination.page_size = page_size;
         destination.total_rows = total_rows;
+        destination.row_space_revision +%= 1;
         if (destination.viewport == .pin) {
             if (destination.viewport_pin_row_offset) |*offset| {
                 offset.* += node.rows();
@@ -5635,6 +5649,9 @@ fn eraseRows(
     }
 
     // Update our total row count
+    if (erased > 0) {
+        self.row_space_revision +%= 1;
+    }
     self.total_rows -= erased;
 
     // If we deleted active, we need to regrow because one of our invariants
@@ -7119,7 +7136,10 @@ const Limits = struct {
 
         // Reconcile viewport mode and cached row offsets with the combined prefix
         // removal only after every page and pin points into the final list.
-        if (removed > 0) pagelist.fixupViewport(removed);
+        if (removed > 0) {
+            pagelist.row_space_revision +%= 1;
+            pagelist.fixupViewport(removed);
+        }
     }
 
     /// Returns the minimum valid "max size" for a given number of rows and cols
@@ -7912,6 +7932,7 @@ test "PageList PageAllocation finalizes pages and preserves live state" {
     };
     defer result.deinit();
 
+    const revision_before_prepend = result.row_space_revision;
     const old_first = result.pages.first.?;
     const old_last = result.pages.last.?;
     const active_top = result.getTopLeft(.active);
@@ -7938,6 +7959,8 @@ test "PageList PageAllocation finalizes pages and preserves live state" {
         page.getRowAndCell(0, 0).cell.* = .init('A');
         try allocation.finalize(.prepend, .{});
     }
+
+    try testing.expectEqual(revision_before_prepend +% 2, result.row_space_revision);
 
     // Repeated prepends reconstruct oldest-to-newest order without replacing
     // any existing nodes or tracked pins.
@@ -11219,6 +11242,34 @@ test "PageList Cell screenPoint supports long scrollback" {
         .x = 0,
         .y = expected_y,
     } }, cell.screenPoint());
+}
+
+test "row space revision changes for destructive mutations, not append or limits" {
+    const testing = std.testing;
+    const cols = 10;
+    const page_rows: usize = initialCapacity(cols).rows;
+    var s = try init(testing.allocator, .{ .cols = cols, .rows = 2, .max_size = null });
+    defer s.deinit();
+    const initial = s.row_space_revision;
+    try s.growRows(4 * page_rows);
+    try testing.expectEqual(initial, s.row_space_revision);
+    s.setMaxBytes(null);
+    s.setMaxLines(null);
+    try testing.expectEqual(initial, s.row_space_revision);
+    s.setMaxBytes(PagePool.item_size);
+    try testing.expect(s.row_space_revision != initial);
+    var revision = s.row_space_revision;
+    try s.resize(.{ .cols = cols + 1 });
+    try testing.expect(s.row_space_revision != revision);
+    revision = s.row_space_revision;
+    s.setMaxBytes(null);
+    try s.growRows(page_rows);
+    try testing.expectEqual(revision, s.row_space_revision);
+    s.eraseHistory(null);
+    try testing.expect(s.row_space_revision != revision);
+    revision = s.row_space_revision;
+    s.reset();
+    try testing.expect(s.row_space_revision != revision);
 }
 
 test "PageList set max bytes prunes immediately and can be raised" {
