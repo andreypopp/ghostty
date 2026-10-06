@@ -225,6 +225,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
         /// Health of the most recently completed frame.
         health: std.atomic.Value(Health) = .{ .raw = .healthy },
+        pending_health: std.atomic.Value(bool) = .init(false),
         stopping: std.atomic.Value(bool) = .init(false),
 
         /// Health of how well the apprt can present our frames.
@@ -1223,6 +1224,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // Release the shaders as well if we're unrealized.
             if (!self.display_realized) {
                 self.shaders.deinit(self.alloc);
+                if (comptime @hasDecl(GraphicsAPI, "clearPresentedSurface")) self.api.clearPresentedSurface();
             }
         }
 
@@ -1689,34 +1691,44 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         ///
         /// If `sync` is true, this will synchronously block until
         /// the frame is finished drawing and has been presented.
-        pub fn drawFrame(
+        pub fn drawFrame(self: *Self, sync: bool) !void {
+            try self.drawFrameWithOptionalPresentation(sync, null);
+        }
+
+        pub fn drawFrameWithPresentation(self: *Self, presentation: renderer.FramePresentation) !void {
+            try self.drawFrameWithOptionalPresentation(false, presentation);
+        }
+
+        const DrawResult = enum { drawn, idle, discarded };
+
+        fn drawFrameWithOptionalPresentation(
             self: *Self,
             sync: bool,
+            presentation: ?renderer.FramePresentation,
         ) !void {
             // Everything that touches draw state happens under the draw
             // mutex. The display link is synced only after the mutex is
             // released; see `syncDisplayLink` for why it must never be
             // called with the draw mutex held.
-            const sync_display_link = locked: {
+            const result = locked: {
                 self.draw_mutex.lockUncancelable(global.io());
                 defer self.draw_mutex.unlock(global.io());
-                break :locked try self.drawFrameLocked(sync);
+                break :locked try self.drawFrameLocked(sync, presentation);
             };
-
-            if (sync_display_link) self.syncDisplayLink(null, null);
+            switch (result) {
+                .drawn => {},
+                .idle => self.syncDisplayLink(null, null),
+                .discarded => if (presentation) |value| value.fail(.discarded),
+            }
         }
 
         /// The body of `drawFrame`. Must be called with `draw_mutex` held.
         ///
-        /// Returns true if the display link should be resynced once the
-        /// draw mutex is released. This is only ever true on the no-redraw
-        /// path, which a sync draw never takes, so the main thread's sync
-        /// draws never touch the display link and `syncDisplayLink` stays
-        /// on the render thread.
         fn drawFrameLocked(
             self: *Self,
             sync: bool,
-        ) !bool {
+            presentation: ?renderer.FramePresentation,
+        ) !DrawResult {
             // After the graphics API is complete (so we defer) we want to
             // update our scrollbar state.
             defer if (self.scrollbar_dirty) {
@@ -1737,12 +1749,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
             // If either of our surface dimensions is zero
             // then drawing is absurd, so we just return.
-            if (surface_size.width == 0 or surface_size.height == 0) return false;
+            if (surface_size.width == 0 or surface_size.height == 0) return .discarded;
 
             // If we have no graphics context we can't draw. This is
             // only the case while unrealized (GTK) or after the render
             // thread exits; displayRealized rebuilds the swap chain.
-            if (!self.display_realized) return false;
+            if (!self.display_realized) return .discarded;
 
             // Get our swap chain, rebuilding it if it was released
             // while we were hidden. Rebuilding is deferred to draw
@@ -1772,13 +1784,13 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 swap_chain_rebuilt or
                 self.cells_rebuilt or
                 self.animationWake() != null or
-                sync;
+                sync or presentation != null;
 
             if (!needs_redraw) {
                 // Ask our caller to resync the display link once the draw
                 // mutex is released, because we can probably pause the
                 // display link at this point.
-                return true;
+                return .idle;
             }
             self.cells_rebuilt = false;
 
@@ -1879,8 +1891,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             }
 
             // Get a frame context from the graphics API.
-            var frame_ctx = try self.api.beginFrame(self, &frame.target);
-            defer frame_ctx.complete(sync);
+            var frame_ctx = if (comptime @hasDecl(GraphicsAPI, "beginFrameWithPresentation"))
+                try self.api.beginFrameWithPresentation(self, &frame.target, presentation)
+            else unsupported: {
+                if (presentation != null) return error.UnsupportedPresentation;
+                break :unsupported try self.api.beginFrame(self, &frame.target);
+            };
 
             {
                 var pass = frame_ctx.renderPass(&.{.{
@@ -2013,7 +2029,84 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 }
             }
 
-            return false;
+            frame_ctx.complete(sync);
+            return .drawn;
+        }
+
+        test "renderer completion releases a permit while token delivery waits for rebuild and app capacity is full" {
+            const Context = struct {
+                renderer: *Self,
+                renderer_started: std.Io.Event = .unset,
+                main_started: std.Io.Event = .unset,
+                gpu_done: std.Io.Event = .unset,
+                renderer_done: std.Io.Event = .unset,
+                main_done: std.Io.Event = .unset,
+                fn rebuild(c: *@This()) void {
+                    c.renderer.draw_mutex.lockUncancelable(global.io());
+                    c.renderer_started.set(global.io());
+                    _ = c.renderer.swap_chain.?.nextFrame();
+                    c.renderer.draw_mutex.unlock(global.io());
+                    c.renderer_done.set(global.io());
+                }
+                fn complete(c: *@This()) void {
+                    c.renderer.frameCompleted(.unhealthy);
+                    c.gpu_done.set(global.io());
+                }
+                fn gate(ud: ?*anyopaque) callconv(.c) void {
+                    const c: *@This() = @ptrCast(@alignCast(ud.?));
+                    c.renderer.draw_mutex.lockUncancelable(global.io());
+                    c.renderer.draw_mutex.unlock(global.io());
+                }
+                fn presented(ud: ?*anyopaque, token: u64) callconv(.c) void {
+                    const c: *@This() = @ptrCast(@alignCast(ud.?));
+                    std.debug.assert(token == 42);
+                    c.main_done.set(global.io());
+                }
+                fn deliver(c: *@This()) void {
+                    c.main_started.set(global.io());
+                    const presentation: renderer.FramePresentation = .{
+                        .callback = &presented,
+                        .userdata = c,
+                        .token = 42,
+                        .delivery_gate = &gate,
+                        .delivery_gate_userdata = c,
+                    };
+                    presentation.deliver();
+                }
+            };
+            var app: apprt.App = undefined;
+            var mailbox: @import("../App.zig").Mailbox.Queue = .{};
+            for (0..64) |_| _ = mailbox.push(global.io(), .{ .open_config = .os_open }, .instant);
+            var value: Self = undefined;
+            @memset(std.mem.asBytes(&value), 0);
+            value.draw_mutex = .init;
+            value.health = .init(.healthy);
+            value.stopping = .init(false);
+            value.swap_chain = .{ .frames = undefined, .frame_sema = .{ .permits = 0 } };
+            value.surface_mailbox = .{ .surface = undefined, .app = .{ .rt_app = &app, .mailbox = &mailbox } };
+            var c: Context = .{ .renderer = &value };
+            const render_thread = try std.Thread.spawn(.{}, Context.rebuild, .{&c});
+            try c.renderer_started.waitTimeout(global.io(), .{ .duration = .{ .clock = .awake, .raw = .fromSeconds(5) } });
+            const main_thread = try std.Thread.spawn(.{}, Context.deliver, .{&c});
+            try c.main_started.waitTimeout(global.io(), .{ .duration = .{ .clock = .awake, .raw = .fromSeconds(5) } });
+            const gpu_thread = try std.Thread.spawn(.{}, Context.complete, .{&c});
+            defer {
+                value.stopping.store(true, .release);
+                c.gpu_done.waitTimeout(global.io(), .{ .duration = .{ .clock = .awake, .raw = .fromSeconds(5) } }) catch unreachable;
+                c.renderer_done.waitTimeout(global.io(), .{ .duration = .{ .clock = .awake, .raw = .fromSeconds(5) } }) catch unreachable;
+                c.main_done.waitTimeout(global.io(), .{ .duration = .{ .clock = .awake, .raw = .fromSeconds(5) } }) catch unreachable;
+                gpu_thread.join();
+                render_thread.join();
+                main_thread.join();
+            }
+            const completed = if (c.gpu_done.waitTimeout(global.io(), .{ .duration = .{ .clock = .awake, .raw = .fromMilliseconds(500) } })) true else |_| false;
+            try std.testing.expect(completed);
+            try std.testing.expectEqual(Health.unhealthy, value.health.load(.acquire));
+            var drained: usize = 0;
+            while (mailbox.pop(global.io())) |_| drained += 1;
+            try std.testing.expectEqual(@as(usize, 64), drained);
+            try std.testing.expectEqual(Health.unhealthy, value.takeHealth().?);
+            try std.testing.expect(value.takeHealth() == null);
         }
 
         // Callback from the graphics API when a frame is completed.
@@ -2021,16 +2114,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             self: *Self,
             health: Health,
         ) void {
-            // If our health value hasn't changed, then we do nothing. We don't
-            // do a cmpxchg here because strict atomicity isn't important.
-            if (self.health.load(.seq_cst) != health) {
-                self.health.store(health, .seq_cst);
-
-                // Our health value changed, so we notify the surface so that it
-                // can do something about it.
-                _ = self.surface_mailbox.pushUntilStopped(.{
-                    .renderer_health = health,
-                }, &self.stopping);
+            if (self.health.swap(health, .acq_rel) != health and
+                !self.stopping.load(.acquire) and
+                !self.pending_health.swap(true, .acq_rel))
+            {
+                self.surface_mailbox.app.rt_app.wakeup();
             }
 
             // Always release our semaphore. The swap chain is
@@ -2038,6 +2126,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // waiting for all in-flight frames to complete, and this
             // callback is what signals that completion.
             self.swap_chain.?.releaseFrame();
+        }
+
+        pub fn takeHealth(self: *Self) ?Health {
+            if (!self.pending_health.swap(false, .acq_rel)) return null;
+            return self.health.load(.acquire);
         }
 
         /// Call this any time the background image path changes.
