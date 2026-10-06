@@ -117,6 +117,14 @@ pub const ClipboardRequest = union(ClipboardRequestType) {
     /// reading any of their data.
     list: Clipboard,
 
+    pub fn destroy(self: *ClipboardRequest, alloc: std.mem.Allocator) void {
+        switch (self.*) {
+            inline .kitty_read, .kitty_write => |request| request.destroy(),
+            else => {},
+        }
+        alloc.destroy(self);
+    }
+
     /// State for one in-flight Kitty clipboard protocol read. This is
     /// created on the IO thread and completed on the app thread, so it
     /// owns all of its memory: everything, including the struct itself,
@@ -222,6 +230,16 @@ pub const ClipboardRequest = union(ClipboardRequestType) {
         .none => void,
     };
 };
+
+test "OSC52 request kind and cancellation consume pending state without IO" {
+    const testing = std.testing;
+    for ([_]ClipboardRequest{ .{ .paste = .standard }, .{ .osc_52_read = .primary } }, 0..) |value, kind| {
+        const request = try testing.allocator.create(ClipboardRequest);
+        request.* = value;
+        try testing.expectEqual(kind, @intFromEnum(std.meta.activeTag(request.*)));
+        request.destroy(testing.allocator);
+    }
+}
 
 /// The color scheme in use (light vs dark).
 pub const ColorScheme = enum(u2) {
