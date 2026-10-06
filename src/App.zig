@@ -173,6 +173,10 @@ pub fn destroy(self: *App) void {
 pub fn tick(self: *App, rt_app: *apprt.App) !void {
     // Drain our mailbox
     try self.drainMailbox(rt_app);
+    for (self.surfaces.items) |surface| {
+        const core = surface.core();
+        if (core.renderer.takeHealth()) |health| core.updateRendererHealth(health);
+    }
 }
 
 /// Update the configuration associated with the app. This can only be
