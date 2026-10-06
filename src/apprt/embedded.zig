@@ -2323,6 +2323,25 @@ pub const CAPI = struct {
         surface.preeditCallback(if (len == 0) null else ptr[0..len]);
     }
 
+    export fn ghostty_surface_prepend_history(surface: *Surface, ptr: [*]const u8, len: usize) usize {
+        return surface.core_surface.io.prependHistory(ptr[0..len]) catch 0;
+    }
+
+    export fn ghostty_surface_raise_scrollback_limit(surface: *Surface) void {
+        surface.core_surface.io.raiseScrollbackLimit();
+    }
+
+    export fn ghostty_surface_viewport_anchor(surface: *Surface, text: *Text) usize {
+        const state = &surface.core_surface.renderer_state;
+        state.mutex.lockUncancelable(global.io());
+        defer state.mutex.unlock(global.io());
+        text.* = std.mem.zeroes(Text);
+        const anchor = state.terminal.screens.active.viewportAnchor(global.alloc()) catch return state.terminal.screens.active.viewportLogicalLines();
+        text.text = anchor.text.ptr;
+        text.text_len = anchor.text.len;
+        return anchor.lines;
+    }
+
     /// Process output bytes as if they were read from the PTY.
     export fn ghostty_surface_process_output(
         surface: *Surface,

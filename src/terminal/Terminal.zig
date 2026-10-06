@@ -373,6 +373,129 @@ pub fn init(
     return result;
 }
 
+test "Terminal prepend history preserves rows styles pins and fractional viewport" {
+    var t = try init(testing.io, testing.allocator, .{ .cols = 4, .rows = 2, .max_scrollback_bytes = null });
+    defer t.deinit(testing.allocator);
+    var stream = t.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("new\r\nend");
+    try testing.expectEqual(@as(usize, 2), try t.prependHistory(testing.allocator, "old\r\nmid"));
+    t.screens.active.pages.scroll(.top);
+    const before = t.screens.active.pages.getTopLeft(.viewport);
+    const tracked = try t.screens.active.pages.trackPin(before);
+    defer t.screens.active.pages.untrackPin(tracked);
+    const offset = t.screens.active.pages.scrollbar().offset;
+    t.screens.active.pages.viewport_pixel_offset = 3;
+    try testing.expectEqual(@as(usize, 3), try t.prependHistory(testing.allocator, "\x1b[31mabcdefgh\r\nx"));
+    try testing.expect(t.screens.active.pages.getTopLeft(.viewport).eql(before));
+    try testing.expect(tracked.eql(before));
+    try testing.expectEqual(offset + 3, t.screens.active.pages.scrollbar().offset);
+    try testing.expectEqual(@as(f32, 3), t.screens.active.pages.viewport_pixel_offset);
+    const first = t.screens.active.pages.getCell(.{ .screen = .{ .x = 0, .y = 0 } }).?;
+    try testing.expectEqual(@as(u21, 'a'), first.cell.content.codepoint.data);
+    try testing.expect(first.cell.style_id != style.default_id);
+    const text = try t.screens.active.dumpStringAllocUnwrapped(testing.allocator, .{ .screen = .{} });
+    defer testing.allocator.free(text);
+    try testing.expectEqualStrings("abcdefgh\nx\nold\nmid\nnew\nend", text);
+    const anchor = try t.screens.active.viewportAnchor(testing.allocator);
+    defer testing.allocator.free(anchor.text);
+    try testing.expectEqual(@as(usize, 4), anchor.lines);
+    try testing.expectEqualStrings("old", anchor.text);
+    t.screens.active.pages.scroll(.top);
+    t.screens.active.pages.scroll(.{ .delta_row = 1 });
+    const wrapped = try t.screens.active.viewportAnchor(testing.allocator);
+    defer testing.allocator.free(wrapped.text);
+    try testing.expectEqualStrings("abcdefgh", wrapped.text);
+}
+
+test "Terminal prepend history whole chunk refusal leaves bytes lines rows and identities unchanged" {
+    var chunk: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer chunk.deinit();
+    for (0..1200) |i| {
+        if (i > 0) try chunk.writer.writeAll("\r\n");
+        try chunk.writer.print("{d}", .{i});
+    }
+    for ([_]bool{ false, true }) |byte_limit| {
+        var t = try init(testing.io, testing.allocator, .{ .cols = 80, .rows = 2, .max_scrollback_bytes = null });
+        defer t.deinit(testing.allocator);
+        var stream = t.vtStream();
+        defer stream.deinit();
+        stream.nextSlice("live");
+        const pages = &t.screens.active.pages;
+        if (byte_limit) pages.setMaxBytes(pages.page_size + 1) else pages.setMaxLines(500);
+        const before = pages.getTopLeft(.viewport);
+        const rows = pages.total_rows;
+        const size_before = pages.page_size;
+        const revision = pages.row_space_revision;
+        const serial = pages.page_serial;
+        try testing.expectEqual(@as(usize, 0), try t.prependHistory(testing.allocator, chunk.written()));
+        try testing.expectEqual(rows, pages.total_rows);
+        try testing.expectEqual(size_before, pages.page_size);
+        try testing.expectEqual(revision, pages.row_space_revision);
+        try testing.expectEqual(serial, pages.page_serial);
+        try testing.expect(pages.getTopLeft(.viewport).eql(before));
+        const text = try t.screens.active.dumpStringAllocUnwrapped(testing.allocator, .{ .screen = .{} });
+        defer testing.allocator.free(text);
+        try testing.expectEqualStrings("live", std.mem.trimEnd(u8, text, "\n"));
+        pages.setMaxBytes(null);
+        pages.setMaxLines(null);
+        try testing.expectEqual(@as(usize, 1200), try t.prependHistory(testing.allocator, chunk.written()));
+        const restored = try t.screens.active.dumpStringAllocUnwrapped(testing.allocator, .{ .screen = .{} });
+        defer testing.allocator.free(restored);
+        try testing.expect(std.mem.startsWith(u8, restored, "0\n1\n"));
+        try testing.expect(std.mem.indexOf(u8, restored, "1199\nlive") != null);
+    }
+}
+
+test "Terminal prepend history allocation refusal preserves compressed and resident source" {
+    var chunk: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer chunk.deinit();
+    for (0..1200) |i| {
+        if (i > 0) try chunk.writer.writeAll("\r\n");
+        try chunk.writer.print("{d}", .{i});
+    }
+    for ([_]bool{ false, true }) |do_compress| {
+        var source = try historyScratch(testing.io, testing.allocator, 80, chunk.written());
+        defer source.deinit(testing.allocator);
+        if (do_compress) _ = source.screens.active.pages.compress(.full);
+        const was_compressed = std.meta.activeTag(source.screens.active.pages.pages.first.?.data) == .compressed;
+        if (do_compress) try testing.expect(was_compressed);
+        var t = try init(testing.io, testing.allocator, .{ .cols = 80, .rows = 2, .max_scrollback_bytes = null });
+        defer t.deinit(testing.allocator);
+        const pages = &t.screens.active.pages;
+        const serial = pages.page_serial;
+        const size_before = pages.page_size;
+        const alloc = pages.pool.alloc;
+        var failing: testing.FailingAllocator = .init(alloc, .{ .fail_index = 0 });
+        pages.pool.alloc = failing.allocator();
+        defer pages.pool.alloc = alloc;
+        try testing.expectError(error.OutOfMemory, pages.prepend(&source.screens.active.pages));
+        pages.pool.alloc = alloc;
+        try testing.expectEqual(serial, pages.page_serial);
+        try testing.expectEqual(size_before, pages.page_size);
+        try testing.expectEqual(@as(usize, 2), pages.total_rows);
+        try testing.expectEqual(was_compressed, std.meta.activeTag(source.screens.active.pages.pages.first.?.data) == .compressed);
+        try testing.expectEqual(@as(usize, 1200), try pages.prepend(&source.screens.active.pages));
+        try testing.expectEqual(was_compressed, std.meta.activeTag(source.screens.active.pages.pages.first.?.data) == .compressed);
+    }
+}
+
+pub fn historyScratch(io_impl: std.Io, alloc: Allocator, cols: size.CellCountInt, bytes: []const u8) !Terminal {
+    var scratch = try init(io_impl, alloc, .{ .cols = cols, .rows = 1, .max_scrollback_bytes = null, .max_scrollback_lines = null });
+    errdefer scratch.deinit(alloc);
+    var stream = scratch.vtStream();
+    defer stream.deinit();
+    stream.nextSlice(bytes);
+    return scratch;
+}
+
+pub fn prependHistory(self: *Terminal, alloc: Allocator, bytes: []const u8) !usize {
+    if (self.screens.active_key != .primary or bytes.len == 0) return 0;
+    var scratch = try historyScratch(self.io(), alloc, self.cols, bytes);
+    defer scratch.deinit(alloc);
+    return self.screens.active.pages.prepend(&scratch.screens.active.pages);
+}
+
 pub fn deinit(self: *Terminal, alloc: Allocator) void {
     self.tabstops.deinit(alloc);
     self.screens.deinit(alloc);
