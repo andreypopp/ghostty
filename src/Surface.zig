@@ -320,6 +320,7 @@ const Mouse = struct {
     /// Pending scroll amounts for high-precision scrolls
     pending_scroll_x: f64 = 0,
     pending_scroll_y: f64 = 0,
+    wheel_owner: ?WheelOwner = null,
 
     /// True if the mouse is hidden
     hidden: bool = false,
@@ -1825,6 +1826,115 @@ pub const AbsoluteScrollSnapshot = extern struct {
     row_space_revision: u64,
 };
 
+pub const PixelScrollResult = struct {
+    position: AbsoluteScrollSnapshot,
+    viewport_delta: i64,
+};
+
+pub fn scrollToRowPixelIfRevision(self: *Surface, row: usize, pixel_offset: f32, expected_revision: u64) ?PixelScrollResult {
+    if (!std.math.isFinite(pixel_offset)) return null;
+    const result: PixelScrollResult = result: {
+        self.renderer_state.lockDemand(global.io());
+        defer self.renderer_state.unlockDemand(global.io());
+        const screens = &self.renderer_state.terminal.screens;
+        const key = screens.active_key;
+        var scrollbar = screens.active.pages.scrollbar();
+        const revision = self.rowSpaceIdentity(key, screens.generation(key), scrollbar.row_space_revision);
+        if (revision != expected_revision) return null;
+        const history = std.math.cast(i64, scrollbar.total - scrollbar.len) orelse return null;
+        const before = history - @as(i64, @intCast(scrollbar.offset));
+        screens.active.scroll(if (row >= scrollbar.total - scrollbar.len) .active else .{ .row = row });
+        if (key == .primary) screens.active.pages.viewport_pixel_offset = std.math.clamp(pixel_offset, -4096, 4096);
+        scrollbar = screens.active.pages.scrollbar();
+        break :result .{
+            .viewport_delta = @as(i64, @intCast(scrollbar.total - scrollbar.len)) - @as(i64, @intCast(scrollbar.offset)) - before,
+            .position = .{
+                .total = @intCast(scrollbar.total),
+                .offset = @intCast(scrollbar.offset),
+                .len = @intCast(scrollbar.len),
+                .row_space_revision = revision,
+            },
+        };
+    };
+    self.queueRender() catch |err| log.warn("failed to queue render after pixel scroll err={}", .{err});
+    return result;
+}
+
+test "pixel scroll zero history bottom follows live output" {
+    const testing = std.testing;
+    var mutex: std.Io.Mutex = .init;
+    var t: terminal.Terminal = try .init(testing.io, testing.allocator, .{ .cols = 20, .rows = 2 });
+    defer t.deinit(testing.allocator);
+    var surface: Surface = undefined;
+    surface.id = 42;
+    surface.renderer_state = .{ .mutex = &mutex, .terminal = &t };
+    surface.renderer_thread.wakeup = try .init();
+    defer surface.renderer_thread.wakeup.deinit();
+    const sb = t.screens.active.pages.scrollbar();
+    try testing.expectEqual(@as(usize, 0), sb.total - sb.len);
+    const revision = surface.rowSpaceIdentity(.primary, t.screens.generation(.primary), sb.row_space_revision);
+    _ = surface.scrollToRowPixelIfRevision(0, 0, revision).?;
+    try testing.expect(t.screens.active.pages.viewport == .active);
+    var stream = t.vtStream();
+    defer stream.deinit();
+    for (0..20) |_| stream.nextSlice("live\r\n");
+    const grown = t.screens.active.pages.scrollbar();
+    try testing.expect(grown.total > grown.len);
+    try testing.expectEqual(grown.total - grown.len, grown.offset);
+}
+
+test "pixel scroll returns atomic signed viewport movement" {
+    const testing = std.testing;
+    var mutex: std.Io.Mutex = .init;
+    var t: terminal.Terminal = try .init(testing.io, testing.allocator, .{ .cols = 20, .rows = 2 });
+    defer t.deinit(testing.allocator);
+    var stream = t.vtStream();
+    defer stream.deinit();
+    for (0..100) |i| {
+        var buf: [32]u8 = undefined;
+        const line = try std.fmt.bufPrint(&buf, "row-{d}\r\n", .{i});
+        stream.nextSlice(line);
+    }
+    var surface: Surface = undefined;
+    surface.id = 42;
+    surface.renderer_state = .{ .mutex = &mutex, .terminal = &t };
+    surface.renderer_thread.wakeup = try .init();
+    defer surface.renderer_thread.wakeup.deinit();
+    var sb = t.screens.active.pages.scrollbar();
+    t.screens.active.scroll(.{ .row = sb.total - sb.len - 21 });
+    for (0..10) |_| stream.nextSlice("growth\r\n");
+    sb = t.screens.active.pages.scrollbar();
+    try testing.expectEqual(31, sb.total - sb.len - sb.offset);
+    const revision = surface.rowSpaceIdentity(.primary, t.screens.generation(.primary), sb.row_space_revision);
+    const applied = surface.scrollToRowPixelIfRevision(sb.total - sb.len - 20, 3.5, revision).?;
+    try testing.expectEqual(-11, applied.viewport_delta);
+    try testing.expectEqual(20, applied.position.total - applied.position.len - applied.position.offset);
+    try testing.expectEqual(3.5, t.screens.active.pages.viewport_pixel_offset);
+    const zero = surface.scrollToRowPixelIfRevision(sb.total - sb.len - 20, 0, revision).?;
+    try testing.expectEqual(0, zero.viewport_delta);
+    const positive = surface.scrollToRowPixelIfRevision(sb.total - sb.len - 25, 0, revision).?;
+    try testing.expectEqual(5, positive.viewport_delta);
+    const unchanged = t.screens.active.pages.scrollbar();
+    try testing.expect(surface.scrollToRowPixelIfRevision(0, 1, revision + 1) == null);
+    try testing.expect(surface.scrollToRowPixelIfRevision(0, std.math.nan(f32), revision) == null);
+    try testing.expectEqualDeep(unchanged, t.screens.active.pages.scrollbar());
+    const top = surface.scrollToRowPixelIfRevision(0, 0, revision).?;
+    try testing.expectEqual(@as(i64, @intCast(sb.total - sb.len)) - 25, top.viewport_delta);
+    const bottom = surface.scrollToRowPixelIfRevision(std.math.maxInt(usize), 0, revision).?;
+    try testing.expectEqual(-@as(i64, @intCast(sb.total - sb.len)), bottom.viewport_delta);
+    _ = try t.switchScreen(.alternate);
+    sb = t.screens.active.pages.scrollbar();
+    const alternate_revision = surface.rowSpaceIdentity(.alternate, t.screens.generation(.alternate), sb.row_space_revision);
+    try testing.expect(surface.scrollToRowPixelIfRevision(0, 0, revision) == null);
+    const alternate = surface.scrollToRowPixelIfRevision(10, 3.5, alternate_revision).?;
+    try testing.expectEqual(0, alternate.viewport_delta);
+    try testing.expectEqual(0, t.screens.active.pages.viewport_pixel_offset);
+    _ = try t.switchScreen(.primary);
+    t.screens.remove(testing.allocator, .alternate);
+    _ = try t.switchScreen(.alternate);
+    try testing.expect(surface.scrollToRowPixelIfRevision(0, 0, alternate_revision) == null);
+}
+
 /// Called when the scrollbar state changes.
 fn updateScrollbar(self: *Surface, scrollbar: terminal.Scrollbar) void {
     _ = self.rt_app.performAction(
@@ -2660,7 +2770,7 @@ pub fn sizeCallback(self: *Surface, size: apprt.SurfaceSize) !void {
 
     const new_screen_size: rendererpkg.ScreenSize = .{
         .width = size.width,
-        .height = size.height,
+        .height = size.height +| self.size.top_inset +| self.size.bottom_inset,
     };
 
     // Update our screen size, but only if it actually changed. And if
@@ -2669,6 +2779,16 @@ pub fn sizeCallback(self: *Surface, size: apprt.SurfaceSize) !void {
     if (self.size.screen.equals(new_screen_size)) return;
 
     try self.resize(new_screen_size);
+}
+
+pub fn setRenderInsets(self: *Surface, top_px: u32, bottom_px: u32) !void {
+    const top = std.math.cast(u16, top_px) orelse std.math.maxInt(u16);
+    const bottom = std.math.cast(u16, bottom_px) orelse std.math.maxInt(u16);
+    if (self.size.top_inset == top and self.size.bottom_inset == bottom) return;
+    const height = self.size.screen.height -| (@as(u32, self.size.top_inset) + self.size.bottom_inset);
+    self.size.top_inset = top;
+    self.size.bottom_inset = bottom;
+    try self.resize(.{ .width = self.size.screen.width, .height = height +| top +| bottom });
 }
 
 fn resize(self: *Surface, size: rendererpkg.ScreenSize) !void {
@@ -3632,7 +3752,9 @@ pub fn refreshCallback(self: *Surface) !void {
 const ScrollAmount = struct {
     delta: isize = 0,
 
-    pub fn direction(self: ScrollAmount) enum { down_left, up_right } {
+    const Direction = enum { down_left, up_right };
+
+    pub fn direction(self: ScrollAmount) Direction {
         return if (self.delta < 0) .down_left else .up_right;
     }
 
@@ -3646,12 +3768,166 @@ const ScrollAmount = struct {
 /// "Natural scrolling" is a macOS term for inverting the scroll direction.
 /// This should be handled by the apprt implementation. At this layer,
 /// negative is always down, left.
-pub fn scrollCallback(
+pub const WheelDisposition = enum(c_int) { program, viewport, ignore };
+const WheelOwner = enum { mouse_primary, mouse_alternate, cursor_normal, cursor_application, viewport, ignore };
+
+fn wheelOwner(alternate: bool, reporting: bool, explicit_mouse: bool, alternate_scroll: bool, application_cursor: bool) WheelOwner {
+    if (reporting) return if (alternate) .mouse_alternate else .mouse_primary;
+    if (!alternate) return .viewport;
+    if (!explicit_mouse and alternate_scroll) return if (application_cursor) .cursor_application else .cursor_normal;
+    return .ignore;
+}
+
+test "wheel routing classifier" {
+    const testing = std.testing;
+    for ([_]bool{ false, true }) |alternate| {
+        for ([_]bool{ false, true }) |reporting_config| {
+            for ([_]bool{ false, true }) |explicit_mouse| {
+                for ([_]bool{ false, true }) |alternate_scroll| {
+                    for ([_]bool{ false, true }) |application_cursor| {
+                        const expected: WheelDisposition = if (reporting_config and explicit_mouse)
+                            .program
+                        else if (!alternate)
+                            .viewport
+                        else if (!explicit_mouse and alternate_scroll)
+                            .program
+                        else
+                            .ignore;
+                        try testing.expectEqual(expected, wheelDisposition(wheelOwner(alternate, reporting_config and explicit_mouse, explicit_mouse, alternate_scroll, application_cursor)));
+                    }
+                }
+            }
+        }
+    }
+}
+
+test "wheel routing validation and encoders" {
+    const testing = std.testing;
+    var mutex: std.Io.Mutex = .init;
+    var surface: Surface = undefined;
+    var config = try configpkg.Config.default(testing.allocator);
+    defer config.deinit();
+    surface.config = try DerivedConfig.init(testing.allocator, &config);
+    defer surface.config.deinit();
+    surface.io.terminal = try .init(testing.io, testing.allocator, .{ .cols = 20, .rows = 2 });
+    defer surface.io.terminal.deinit(testing.allocator);
+    surface.renderer_state = .{ .mutex = &mutex, .terminal = &surface.io.terminal };
+    surface.io.renderer_state = &surface.renderer_state;
+    surface.io.backend = .{ .exec = undefined };
+    surface.io.mailbox = try termio.Mailbox.initSPSC(testing.allocator);
+    defer surface.io.mailbox.deinit(testing.allocator);
+    surface.id = 42;
+    surface.mouse = .{};
+    surface.config.mouse_scroll_multiplier.precision = 1;
+    surface.readonly = false;
+    surface.size = .{ .screen = .{ .width = 160, .height = 32 }, .cell = .{ .width = 8, .height = 16 }, .padding = .{} };
+    var stream = surface.io.terminal.vtStream();
+    defer stream.deinit();
+    for (0..20) |_| stream.nextSlice("live\r\n");
+    const before = surface.io.terminal.screens.active.pages.scrollbar();
+    try testing.expect(surface.acceptWheel(false, .viewport));
+    try testing.expectEqualDeep(before, surface.io.terminal.screens.active.pages.scrollbar());
+    try testing.expect(surface.io.mailbox.spsc.queue.pop(testing.io) == null);
+    stream.nextSlice("\x1b[?1049h\x1b[?1007l");
+    try testing.expectEqual(WheelDisposition.ignore, surface.wheelIntent(false));
+    surface.mouse.pending_scroll_y = 7;
+    try testing.expect(!surface.acceptWheel(false, .viewport));
+    try testing.expectEqual(@as(f64, 7), surface.mouse.pending_scroll_y);
+    try testing.expect(surface.acceptWheel(false, .ignore));
+    try testing.expectEqual(@as(f64, 0), surface.mouse.pending_scroll_y);
+    stream.nextSlice("\x1b[?1007h");
+    for ([_]bool{ false, true }) |application| {
+        stream.nextSlice(if (application) "\x1b[?1h" else "\x1b[?1l");
+        for ([_]f64{ 16, -16 }) |delta| {
+            try testing.expectEqualStrings(if (application) (if (delta > 0) "\x1bOA" else "\x1bOB") else (if (delta > 0) "\x1b[A" else "\x1b[B"), wheelCursorSequence(application, if (delta > 0) .up_right else .down_left));
+        }
+    }
+    {
+        stream.nextSlice("\x1b[?1049l\x1b[?1000h\x1b[?1006h");
+        try testing.expectEqual(WheelDisposition.program, surface.wheelIntent(false));
+        surface.config.mouse_shift_capture = .never;
+        const opts: input.mouse_encode.Options = .fromTerminal(&surface.io.terminal, surface.size);
+        for ([_]input.MouseButton{ .four, .six }, [_][]const u8{ "\x1b[<92;1;1M", "\x1b[<94;1;1M" }) |button, bytes| {
+            var data: [64]u8 = undefined;
+            var writer: std.Io.Writer = .fixed(&data);
+            try input.mouse_encode.encode(&writer, .{ .button = button, .action = .press, .mods = .{ .shift = true, .ctrl = true, .alt = true }, .pos = .{ .x = 4, .y = 8 } }, opts);
+            try testing.expectEqualStrings(bytes, writer.buffered());
+        }
+        try testing.expectEqual(WheelDisposition.viewport, surface.wheelIntent(true));
+        try testing.expect(surface.acceptWheel(false, .program));
+        surface.mouse.pending_scroll_y = 1;
+        try testing.expect(surface.acceptWheel(true, .viewport));
+        try testing.expectEqual(@as(f64, 0), surface.mouse.pending_scroll_y);
+        surface.config.mouse_reporting = false;
+        try testing.expectEqual(WheelDisposition.viewport, surface.wheelIntent(false));
+        try testing.expect(!surface.acceptWheel(false, .program));
+        try testing.expectEqualDeep(before, surface.io.terminal.screens.active.pages.scrollbar());
+        stream.nextSlice("\x1b[?1049h");
+        try testing.expectEqual(WheelDisposition.ignore, surface.wheelIntent(false));
+        try testing.expectEqual(WheelDisposition.ignore, surface.wheelIntent(true));
+        try testing.expect(surface.io.mailbox.spsc.queue.pop(testing.io) == null);
+    }
+}
+
+fn currentWheelOwner(self: *Surface, band: bool) WheelOwner {
+    if (band) return if (self.io.terminal.screens.active_key == .alternate) .ignore else .viewport;
+    return wheelOwner(self.io.terminal.screens.active_key == .alternate, self.isMouseReporting(), self.io.terminal.flags.mouse_event != .none, self.io.terminal.modes.get(.mouse_alternate_scroll), self.io.terminal.modes.get(.cursor_keys));
+}
+
+pub fn wheelIntent(self: *Surface, band: bool) WheelDisposition {
+    self.renderer_state.mutex.lockUncancelable(global.io());
+    defer self.renderer_state.mutex.unlock(global.io());
+    return wheelDisposition(self.currentWheelOwner(band));
+}
+
+pub fn scrollCallback(self: *Surface, xoff: f64, yoff: f64, scroll_mods: input.ScrollMods) !void {
+    _ = try self.scrollDispatch(xoff, yoff, scroll_mods, self.mouse.mods, false, null);
+}
+
+fn wheelDisposition(owner: WheelOwner) WheelDisposition {
+    return switch (owner) {
+        .mouse_primary, .mouse_alternate, .cursor_normal, .cursor_application => .program,
+        .viewport => .viewport,
+        .ignore => .ignore,
+    };
+}
+
+fn acceptWheel(self: *Surface, band: bool, expected: WheelDisposition) bool {
+    const owner = self.currentWheelOwner(band);
+    if (expected != wheelDisposition(owner)) return false;
+    if (self.mouse.wheel_owner != owner) {
+        self.mouse.pending_scroll_x = 0;
+        self.mouse.pending_scroll_y = 0;
+        self.mouse.wheel_owner = owner;
+    }
+    return true;
+}
+
+fn wheelCursorSequence(application: bool, direction: ScrollAmount.Direction) []const u8 {
+    return if (application) switch (direction) {
+        .up_right => "\x1bOA",
+        .down_left => "\x1bOB",
+    } else switch (direction) {
+        .up_right => "\x1b[A",
+        .down_left => "\x1b[B",
+    };
+}
+
+pub fn scrollDispatch(
     self: *Surface,
     xoff: f64,
     yoff: f64,
     scroll_mods: input.ScrollMods,
-) !void {
+    mods: input.Mods,
+    band: bool,
+    expected: ?WheelDisposition,
+) !bool {
+    if (expected != null) self.renderer_state.mutex.lockUncancelable(global.io());
+    defer if (expected != null) self.renderer_state.mutex.unlock(global.io());
+    if (expected) |intent| {
+        if (!self.acceptWheel(band, intent)) return false;
+        if (intent != .program) return true;
+    }
     // log.info("SCROLL: xoff={} yoff={} mods={}", .{ xoff, yoff, scroll_mods });
 
     // Crash metadata in case we crash in here
@@ -3743,8 +4019,8 @@ pub fn scrollCallback(
     // log.info("SCROLL: delta_y={} delta_x={}", .{ y.delta, x.delta });
 
     {
-        self.renderer_state.mutex.lockUncancelable(global.io());
-        defer self.renderer_state.mutex.unlock(global.io());
+        if (expected == null) self.renderer_state.mutex.lockUncancelable(global.io());
+        defer if (expected == null) self.renderer_state.mutex.unlock(global.io());
 
         // If we have an active mouse reporting mode, clear the selection.
         // The selection can occur if the user uses the shift mod key to
@@ -3766,25 +4042,13 @@ pub fn scrollCallback(
                 // clear the selection.
                 try self.setSelection(null);
 
-                const seq = if (self.io.terminal.modes.get(.cursor_keys)) seq: {
-                    // cursor key: application mode
-                    break :seq switch (y.direction()) {
-                        .up_right => "\x1bOA",
-                        .down_left => "\x1bOB",
-                    };
-                } else seq: {
-                    // cursor key: normal mode
-                    break :seq switch (y.direction()) {
-                        .up_right => "\x1b[A",
-                        .down_left => "\x1b[B",
-                    };
-                };
+                const seq = wheelCursorSequence(self.io.terminal.modes.get(.cursor_keys), y.direction());
                 for (0..y.magnitude()) |_| {
                     self.queueIo(.{ .write_stable = seq }, .locked);
                 }
             }
 
-            return;
+            return true;
         }
 
         // We have mouse events, are not in an alternate scroll buffer,
@@ -3798,7 +4062,7 @@ pub fn scrollCallback(
                 self.mouseReport(switch (y.direction()) {
                     .up_right => .four,
                     .down_left => .five,
-                }, .press, self.mouse.mods, pos);
+                }, .press, mods, pos);
             }
 
             for (0..@abs(x.delta)) |_| {
@@ -3806,15 +4070,15 @@ pub fn scrollCallback(
                 self.mouseReport(switch (x.direction()) {
                     .up_right => .six,
                     .down_left => .seven,
-                }, .press, self.mouse.mods, pos);
+                }, .press, mods, pos);
             }
 
             // If mouse reporting is on, we do not want to scroll the
             // viewport.
-            return;
+            return true;
         }
 
-        if (y.delta != 0) {
+        if (expected == null and y.delta != 0) {
             // Modify our viewport, this requires a lock since it affects
             // rendering. We have to switch signs here because our delta
             // is negative down but our viewport is positive down.
@@ -3823,6 +4087,7 @@ pub fn scrollCallback(
     }
 
     try self.queueRender();
+    return true;
 }
 
 /// This is called when the content scale of the surface changes. The surface

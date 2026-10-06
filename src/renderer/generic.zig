@@ -750,6 +750,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .cell_size = undefined,
                     .grid_size = undefined,
                     .grid_padding = undefined,
+                    .scroll_offset = 0,
                     .screen_size = undefined,
                     .padding_extend = .{},
                     .min_contrast = options.config.min_contrast,
@@ -1425,6 +1426,17 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     state.terminal.scrollViewport(.bottom);
                 }
 
+                const extra_rows = std.math.maxInt(terminal.size.CellCountInt) - state.terminal.rows;
+                const above = @min(overscanRowsForInset(self.size.top_inset, self.grid_metrics.cell_height), extra_rows);
+                const below = if (self.size.bottom_inset != 0)
+                    overscanRowsForInset(self.size.bottom_inset, self.grid_metrics.cell_height)
+                else
+                    @as(terminal.size.CellCountInt, @intFromBool(state.terminal.screens.active.pages.viewport_pixel_offset > 0));
+                self.terminal_state.overscan_request = .{
+                    .above = above,
+                    .below = @min(below, extra_rows - above),
+                };
+
                 // Begin the update of our terminal state. Work that
                 // doesn't require terminal access (e.g. style
                 // denormalization) is deferred to the endUpdate call
@@ -1488,11 +1500,15 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // If we have any virtual references, we must also rebuild our
                 // kitty state on every frame because any cell change can move
                 // an image.
-                if (self.images.kittyRequiresUpdate(state.terminal)) {
+                const image_overscan_changed = self.images.top_overscan_rows != self.terminal_state.overscan.above or
+                    self.images.bottom_overscan_rows != self.terminal_state.overscan.below;
+                if (image_overscan_changed or self.images.kittyRequiresUpdate(state.terminal)) {
                     // We need to grab the draw mutex since this updates
                     // our image state that drawFrame uses.
                     self.draw_mutex.lockUncancelable(global.io());
                     defer self.draw_mutex.unlock(global.io());
+                    self.images.top_overscan_rows = self.terminal_state.overscan.above;
+                    self.images.bottom_overscan_rows = self.terminal_state.overscan.below;
                     self.images.kittyUpdate(
                         self.alloc,
                         state.terminal,
@@ -1562,10 +1578,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
                 // Clear the prior highlights
                 const row_data = self.terminal_state.row_data.slice();
+                const captured = self.terminal_state.rowDataRange();
                 var any_dirty: bool = false;
                 for (
-                    row_data.items(.highlights),
-                    row_data.items(.dirty),
+                    row_data.items(.highlights)[captured.start..captured.end],
+                    row_data.items(.dirty)[captured.start..captured.end],
                 ) |*highlights, *dirty| {
                     if (highlights.items.len > 0) {
                         highlights.clearRetainingCapacity();
@@ -2313,6 +2330,19 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             }
         }
 
+        test "render inset overscan reserves a fractional sliver" {
+            try std.testing.expectEqual(@as(terminal.size.CellCountInt, 0), overscanRowsForInset(0, 16));
+            try std.testing.expectEqual(@as(terminal.size.CellCountInt, 2), overscanRowsForInset(1, 16));
+            try std.testing.expectEqual(@as(terminal.size.CellCountInt, 3), overscanRowsForInset(32, 16));
+            try std.testing.expectEqual(@as(terminal.size.CellCountInt, 4), overscanRowsForInset(33, 16));
+        }
+
+        fn overscanRowsForInset(inset: u32, cell_height: u32) terminal.size.CellCountInt {
+            if (inset == 0 or cell_height == 0) return 0;
+            const rows = std.math.divCeil(u32, inset, cell_height) catch unreachable;
+            return std.math.cast(terminal.size.CellCountInt, rows + 1) orelse std.math.maxInt(terminal.size.CellCountInt);
+        }
+
         /// Resize the screen.
         pub fn setScreenSize(
             self: *Self,
@@ -2340,12 +2370,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             const terminal_size = self.size.terminal();
 
             // Blank space around the grid.
-            const blank: renderer.Padding = self.size.screen.blankPadding(
+            var screen = self.size.screen;
+            screen.height -|= @as(u32, self.size.top_inset) + self.size.bottom_inset;
+            const blank: renderer.Padding = screen.blankPadding(
                 self.size.padding,
-                .{
-                    .columns = self.cells.size.columns,
-                    .rows = self.cells.size.rows,
-                },
+                self.size.grid(),
                 .{
                     .width = self.grid_metrics.cell_width,
                     .height = self.grid_metrics.cell_height,
@@ -2356,13 +2385,13 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             self.uniforms.projection_matrix = math.ortho2d(
                 -1 * @as(f32, @floatFromInt(self.size.padding.left)),
                 @floatFromInt(terminal_size.width + self.size.padding.right),
-                @floatFromInt(terminal_size.height + self.size.padding.bottom),
-                -1 * @as(f32, @floatFromInt(self.size.padding.top)),
+                @floatFromInt(terminal_size.height + self.size.padding.bottom + self.size.bottom_inset),
+                -1 * @as(f32, @floatFromInt(self.size.padding.top + self.size.top_inset)),
             );
             self.uniforms.grid_padding = .{
-                @floatFromInt(blank.top),
+                @floatFromInt(blank.top + self.size.top_inset),
                 @floatFromInt(blank.right),
-                @floatFromInt(blank.bottom),
+                @floatFromInt(blank.bottom + self.size.bottom_inset),
                 @floatFromInt(blank.left),
             };
             self.uniforms.screen_size = .{
@@ -2703,13 +2732,16 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         ) Allocator.Error!void {
             const state: *terminal.RenderState = &self.terminal_state;
 
+            const captured = state.rowDataRange();
+            const state_rows: terminal.size.CellCountInt = @intCast(captured.end - captured.start);
+            self.uniforms.scroll_offset = state.pixel_offset + @as(f32, @floatFromInt(@as(u32, state.overscan.above) * self.grid_metrics.cell_height));
             const grid_size_diff =
-                self.cells.size.rows != state.rows or
+                self.cells.size.rows != state_rows or
                 self.cells.size.columns != state.cols;
 
             if (grid_size_diff) {
                 var new_size = self.cells.size;
-                new_size.rows = state.rows;
+                new_size.rows = state_rows;
                 new_size.columns = state.cols;
                 try self.cells.resize(self.alloc, new_size);
 
@@ -2746,18 +2778,18 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
             // Get our row data from our state
             const row_data = state.row_data.slice();
-            const row_raws = row_data.items(.raw);
-            const row_cells = row_data.items(.cells);
-            const row_dirty = row_data.items(.dirty);
-            const row_selection = row_data.items(.selection);
-            const row_highlights = row_data.items(.highlights);
+            const row_raws = row_data.items(.raw)[captured.start..captured.end];
+            const row_cells = row_data.items(.cells)[captured.start..captured.end];
+            const row_dirty = row_data.items(.dirty)[captured.start..captured.end];
+            const row_selection = row_data.items(.selection)[captured.start..captured.end];
+            const row_highlights = row_data.items(.highlights)[captured.start..captured.end];
 
             // If our cell contents buffer is shorter than the screen viewport,
             // we render the rows that fit, starting from the bottom. If instead
             // the viewport is shorter than the cell contents buffer, we align
             // the top of the viewport with the top of the contents buffer.
             const row_len: usize = @min(
-                state.rows,
+                state_rows,
                 self.cells.size.rows,
             );
 
@@ -2773,14 +2805,14 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // If our preedit row isn't dirty then we don't need the
                 // preedit range. This also avoids an issue later where we
                 // unconditionally add preedit cells when this is set.
-                if (!rebuild and !row_dirty[cursor_vp.y]) break :preedit null;
+                if (!rebuild and !row_dirty[cursor_vp.y + state.overscan.above]) break :preedit null;
 
                 const range = preedit_v.range(
                     cursor_vp.x,
                     state.cols - 1,
                 );
                 break :preedit .{
-                    .y = @intCast(cursor_vp.y),
+                    .y = @intCast(cursor_vp.y + state.overscan.above),
                     .x = .{ range.start, range.end },
                     .cp_offset = range.cp_offset,
                 };
@@ -2840,7 +2872,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 const cursor_vp = state.cursor.viewport orelse break :cursor;
                 const cursor_style: terminal.Style = cursor_style: {
                     const cells = state.row_data.items(.cells);
-                    const cell = cells[cursor_vp.y].get(cursor_vp.x);
+                    const cell = cells[state.viewportStart() + cursor_vp.y].get(cursor_vp.x);
                     break :cursor_style if (cell.raw.hasStyling())
                         cell.style
                     else
@@ -2911,7 +2943,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                             .narrow, .spacer_head, .wide => cursor_vp.x,
                             .spacer_tail => cursor_vp.x -| 1,
                         },
-                        @intCast(cursor_vp.y),
+                        @intCast(cursor_vp.y + state.overscan.above),
                     };
 
                     self.uniforms.bools.cursor_wide = switch (wide) {
@@ -3048,7 +3080,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // visible on this viewport.
                 .cursor_x = cursor_x: {
                     const vp = state.cursor.viewport orelse break :cursor_x null;
-                    if (vp.y != y) break :cursor_x null;
+                    if (vp.y + self.terminal_state.overscan.above != y) break :cursor_x null;
                     break :cursor_x vp.x;
                 },
             };
@@ -3314,9 +3346,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // an underline, in which case use a double underline to
                 // distinguish them.
                 const underline: terminal.Attribute.Underline = underline: {
-                    if (links.contains(.{
+                    const above = self.terminal_state.overscan.above;
+                    if (y >= above and links.contains(.{
                         .x = @intCast(x),
-                        .y = @intCast(y),
+                        .y = @intCast(y - above),
                     })) {
                         break :underline if (style.flags.underline == .single)
                             .double
@@ -3682,7 +3715,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             self.cells.setCursor(.{
                 .atlas = .grayscale,
                 .bools = .{ .is_cursor_glyph = true },
-                .grid_pos = .{ x, cursor_vp.y },
+                .grid_pos = .{ x, cursor_vp.y + self.terminal_state.overscan.above },
                 .color = .{ cursor_color.r, cursor_color.g, cursor_color.b, alpha },
                 .glyph_pos = .{ render.glyph.atlas_x, render.glyph.atlas_y },
                 .glyph_size = .{ render.glyph.width, render.glyph.height },
