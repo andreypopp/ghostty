@@ -4399,6 +4399,58 @@ pub fn increaseCapacity(
     return new_node;
 }
 
+pub fn prepend(self: *PageList, source: *const PageList) !usize {
+    if (self.cols != source.cols or source.total_rows == 0) return 0;
+    const total_rows = std.math.add(usize, self.total_rows, source.total_rows) catch return 0;
+    if (total_rows - self.rows > self.limits.max(.lines)) return 0;
+    var pending: std.ArrayList(PageAllocation) = .empty;
+    defer {
+        for (pending.items) |*allocation| allocation.deinit();
+        pending.deinit(self.pool.alloc);
+    }
+    const serial = self.page_serial;
+    var committed = false;
+    defer if (!committed) {
+        self.page_serial = serial;
+    };
+    var page_size = self.page_size;
+    var it = source.pages.last;
+    while (it) |src| : (it = src.prev) {
+        var allocation = try self.allocatePage(src.capacity());
+        errdefer allocation.deinit();
+        const page = allocation.page();
+        page.size.rows = src.rows();
+        page.size.cols = src.cols();
+        var preserved = try src.pagePreservingState(self.pool.alloc);
+        defer preserved.deinit();
+        try page.cloneFrom(preserved.page(), 0, src.rows());
+        const node_size: usize = switch (allocation.node.?.owned) {
+            .pool => PagePool.item_size,
+            .heap => page.memory.len,
+        };
+        page_size = std.math.add(usize, page_size, node_size) catch {
+            allocation.deinit();
+            return 0;
+        };
+        if (page_size > self.limits.max(.bytes)) {
+            allocation.deinit();
+            return 0;
+        }
+        try pending.append(self.pool.alloc, allocation);
+    }
+    const pixel_offset = self.viewport_pixel_offset;
+    if (self.viewport == .top) {
+        self.viewport_pin.* = .{ .node = self.pages.first.? };
+        self.viewport = if (self.pinIsActive(self.viewport_pin.*)) .active else .{ .pin = {} };
+        self.viewport_pin_row_offset = 0;
+    }
+    for (pending.items) |*allocation| allocation.finalize(.prepend, .{ .compress = true }) catch unreachable;
+    self.viewport_pixel_offset = pixel_offset;
+    committed = true;
+    self.assertIntegrity();
+    return source.total_rows;
+}
+
 /// Allocate a new page using the PageList's memory pools.
 ///
 /// The page is detached: it doesn't contribute to the memory limits or

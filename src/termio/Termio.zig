@@ -756,6 +756,41 @@ pub fn clearScreen(self: *Termio, td: *ThreadData, history: bool) !void {
     try self.queueWrite(td, &[_]u8{0x0C}, false);
 }
 
+pub fn raiseScrollbackLimit(self: *Termio) void {
+    self.renderer_state.mutex.lockUncancelable(global.io());
+    defer self.renderer_state.mutex.unlock(global.io());
+    const pages = &self.terminal.screens.get(.primary).?.pages;
+    pages.setMaxBytes(pages.limits.max(.bytes) *| 2);
+    pages.setMaxLines(pages.limits.max(.lines) *| 2);
+}
+
+pub fn prependHistory(self: *Termio, bytes: []const u8) !usize {
+    self.renderer_state.mutex.lockUncancelable(global.io());
+    const cols = self.terminal.cols;
+    const rows = self.terminal.rows;
+    const generation = self.terminal.screens.generation(.primary);
+    const revision = self.terminal.screens.active.pages.row_space_revision;
+    const epoch = self.terminal.screens.active.pages.page_serial_epoch;
+    const available = bytes.len > 0 and self.terminal.screens.active_key == .primary;
+    self.renderer_state.mutex.unlock(global.io());
+    if (!available) return 0;
+    var scratch = try terminalpkg.Terminal.historyScratch(global.io(), self.alloc, cols, bytes);
+    defer scratch.deinit(self.alloc);
+    self.renderer_state.mutex.lockUncancelable(global.io());
+    defer self.renderer_state.mutex.unlock(global.io());
+    if (self.terminal.cols != cols or self.terminal.rows != rows or
+        self.terminal.screens.active_key != .primary or
+        self.terminal.screens.generation(.primary) != generation or
+        self.terminal.screens.active.pages.row_space_revision != revision or
+        self.terminal.screens.active.pages.page_serial_epoch != epoch) return 0;
+    const count = try self.terminal.screens.active.pages.prepend(&scratch.screens.active.pages);
+    if (count > 0) {
+        self.terminal.flags.dirty = .{ .clear = true };
+        self.renderer_wakeup.notify() catch {};
+    }
+    return count;
+}
+
 /// Scroll the viewport
 pub fn scrollViewport(
     self: *Termio,
