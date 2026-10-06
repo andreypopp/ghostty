@@ -1231,6 +1231,22 @@ GHOSTTY_API bool ghostty_surface_set_font_size_action_callback(
     ghostty_surface_t,
     ghostty_font_size_action_cb,
     void* userdata);
+typedef void (*ghostty_render_presented_cb)(void*, uint64_t);
+typedef enum {
+  GHOSTTY_RENDER_PRESENTATION_PRESENTED = 0,
+  GHOSTTY_RENDER_PRESENTATION_DISCARDED = 1,
+  GHOSTTY_RENDER_PRESENTATION_BACKEND_FAILED = 2,
+} ghostty_render_presentation_status_e;
+typedef void (*ghostty_render_failed_cb)(void*, uint64_t, ghostty_render_presentation_status_e);
+
+// Registration is one-shot. Userdata must remain valid until destruction;
+// destruction invalidates queued platform callbacks before it frees resources.
+GHOSTTY_API bool ghostty_surface_set_render_presented_callback(ghostty_surface_t, ghostty_render_presented_cb, void*);
+GHOSTTY_API bool ghostty_surface_set_render_failed_callback(ghostty_surface_t, ghostty_render_failed_cb, void*);
+// Callers quiesce requests before destruction. True admits one forced frame,
+// including while occluded; its token follows the retained IOSurface to main.
+GHOSTTY_API bool ghostty_surface_request_render_with_token(ghostty_surface_t, uint64_t);
+GHOSTTY_API bool ghostty_surface_set_renderer_realized(ghostty_surface_t, bool);
 GHOSTTY_API bool ghostty_surface_grid_metrics(ghostty_surface_t, ghostty_surface_grid_metrics_s*);
 GHOSTTY_API bool ghostty_surface_set_grid_size(ghostty_surface_t,
                                                uint16_t columns,
