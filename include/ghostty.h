@@ -505,6 +505,15 @@ typedef enum {
   GHOSTTY_SURFACE_CONTEXT_SPLIT = 2,
 } ghostty_surface_context_e;
 
+typedef enum {
+  GHOSTTY_SURFACE_IO_EXEC = 0,
+  GHOSTTY_SURFACE_IO_MANUAL = 1,
+} ghostty_surface_io_mode_e;
+
+// The callback borrows bytes for the duration of the call. Its userdata must
+// remain valid until surface destruction; output callers must first quiesce.
+typedef void (*ghostty_io_write_cb)(void*, const char*, uintptr_t);
+
 typedef struct {
   ghostty_platform_e platform_tag;
   ghostty_platform_u platform;
@@ -518,6 +527,9 @@ typedef struct {
   const char* initial_input;
   bool wait_after_command;
   ghostty_surface_context_e context;
+  ghostty_surface_io_mode_e io_mode;
+  ghostty_io_write_cb io_write_cb;
+  void* io_write_userdata;
 } ghostty_surface_config_s;
 
 typedef struct {
@@ -1091,6 +1103,18 @@ typedef bool (*ghostty_runtime_action_cb)(ghostty_app_t,
                                           ghostty_action_s);
 
 typedef struct {
+  uint16_t columns;
+  uint16_t rows;
+  uint16_t cursor_column;
+  uint16_t cursor_row;
+  uint16_t cursor_width_cells;
+  bool cursor_in_viewport;
+  double cell_width;
+  double cell_height;
+  double padding_left;
+  double padding_top;
+} ghostty_surface_grid_metrics_s;
+typedef struct {
   void* userdata;
   bool supports_selection_clipboard;
   ghostty_runtime_wakeup_cb wakeup_cb;
@@ -1177,6 +1201,11 @@ GHOSTTY_API ghostty_surface_config_s ghostty_surface_config_new();
 
 GHOSTTY_API ghostty_surface_t ghostty_surface_new(ghostty_app_t,
                                                      const ghostty_surface_config_s*);
+GHOSTTY_API bool ghostty_surface_grid_metrics(ghostty_surface_t, ghostty_surface_grid_metrics_s*);
+GHOSTTY_API bool ghostty_surface_set_grid_size(ghostty_surface_t,
+                                               uint16_t columns,
+                                               uint16_t rows,
+                                               ghostty_surface_size_s* resolved);
 GHOSTTY_API void ghostty_surface_free(ghostty_surface_t);
 GHOSTTY_API void* ghostty_surface_userdata(ghostty_surface_t);
 GHOSTTY_API ghostty_app_t ghostty_surface_app(ghostty_surface_t);
@@ -1202,7 +1231,10 @@ GHOSTTY_API bool ghostty_surface_key_is_binding(ghostty_surface_t,
                                                    ghostty_input_key_s,
                                                    ghostty_binding_flags_e*);
 GHOSTTY_API void ghostty_surface_text(ghostty_surface_t, const char*, uintptr_t);
+GHOSTTY_API void ghostty_surface_text_input(ghostty_surface_t, const char*, uintptr_t);
 GHOSTTY_API void ghostty_surface_preedit(ghostty_surface_t, const char*, uintptr_t);
+// Callers serialize output feeds and quiesce them before surface destruction.
+GHOSTTY_API void ghostty_surface_process_output(ghostty_surface_t, const char*, uintptr_t);
 GHOSTTY_API bool ghostty_surface_mouse_captured(ghostty_surface_t);
 GHOSTTY_API bool ghostty_surface_mouse_button(ghostty_surface_t,
                                                  ghostty_input_mouse_state_e,
