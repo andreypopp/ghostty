@@ -11,6 +11,8 @@ const MessageData = @import("../datastruct/main.zig").MessageData;
 
 /// The message types that can be sent to a single surface.
 pub const Message = union(enum) {
+    pub const SearchValue = struct { generation: u64, value: ?usize };
+
     /// Represents a write request. Magic number comes from the max size
     /// we want this union to be.
     pub const WriteReq = MessageData(u8, 255);
@@ -148,10 +150,10 @@ pub const Message = union(enum) {
     scrollbar: terminal.Scrollbar,
 
     /// Search progress update
-    search_total: ?usize,
+    search_total: SearchValue,
 
     /// Selected search index change
-    search_selected: ?usize,
+    search_selected: SearchValue,
 
     /// Renderer pushed a new frame, redraw this surface.
     redraw,
