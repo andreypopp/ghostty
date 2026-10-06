@@ -1246,6 +1246,15 @@ GHOSTTY_API bool ghostty_surface_set_render_failed_callback(ghostty_surface_t, g
 // Callers quiesce requests before destruction. True admits one forced frame,
 // including while occluded; its token follows the retained IOSurface to main.
 GHOSTTY_API bool ghostty_surface_request_render_with_token(ghostty_surface_t, uint64_t);
+typedef struct {
+  uint64_t total;
+  uint64_t offset;
+  uint64_t len;
+  uint64_t row_space_revision;
+} ghostty_surface_scrollbar_s;
+
+GHOSTTY_API bool ghostty_surface_scrollbar(ghostty_surface_t, ghostty_surface_scrollbar_s*);
+
 GHOSTTY_API bool ghostty_surface_set_renderer_realized(ghostty_surface_t, bool);
 GHOSTTY_API bool ghostty_surface_grid_metrics(ghostty_surface_t, ghostty_surface_grid_metrics_s*);
 GHOSTTY_API bool ghostty_surface_set_grid_size(ghostty_surface_t,
