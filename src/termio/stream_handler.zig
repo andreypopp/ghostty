@@ -1086,9 +1086,7 @@ pub const StreamHandler = struct {
     }
 
     fn clipboardContents(self: *StreamHandler, kind: u8, data: []const u8) !void {
-        // Note: we ignore the "kind" field and always use the standard clipboard.
-        // iTerm also appears to do this but other terminals seem to only allow
-        // certain. Let's investigate more.
+        if (data.len > std.base64.standard.Encoder.calcSize(terminal.osc.max_clipboard_bytes)) return;
 
         const clipboard_type: apprt.Clipboard = switch (kind) {
             'c' => .standard,
@@ -2064,6 +2062,39 @@ test "kitty clipboard write: oversized text replies EFBIG" {
     // Teardown leaves no transaction that could be committed and
     // forwarded to the macOS clipboard path.
     try testing.expect(mailbox.spsc.queue.pop(global.io()) == null);
+}
+
+test "OSC52 live reads route once and replay suppresses them in both manual modes" {
+    const testing = std.testing;
+    var app: apprt.App = undefined;
+    var surface: @import("../Surface.zig") = undefined;
+    var queue: @import("../App.zig").Mailbox.Queue = .{};
+    var handler: StreamHandler = undefined;
+    handler.alloc = testing.allocator;
+    handler.surface_mailbox = .{ .surface = &surface, .app = .{ .rt_app = &app, .mailbox = &queue } };
+    handler.stopping = .init(false);
+    handler.restoring = false;
+    defer while (queue.pop(global.io())) |message| message.surface_message.message.deinit();
+    var stream: terminal.Stream(*StreamHandler) = .init(.{ .allocator = testing.allocator, .handler = &handler });
+    defer stream.parser.deinit();
+    for ([_]bool{ false, true }) |mirror| {
+        handler.suppress_terminal_responses = mirror;
+        for ([_]u8{ 'c', 's', 'p' }, [_]apprt.Clipboard{ .standard, .selection, .primary }) |kind, clipboard| {
+            var bytes = [_]u8{ 0x1b, ']', '5', '2', ';', kind, ';', '?', 0x07 };
+            stream.nextSlice(&bytes);
+            try testing.expectEqual(clipboard, queue.pop(global.io()).?.surface_message.message.clipboard_read);
+            try testing.expectEqual(@as(u32, 0), queue.len);
+        }
+        handler.restoring = true;
+        stream.nextSlice("\x1b]52;c;?\x07\x1b]52;c;Y29weQ==\x1b\\");
+        try testing.expectEqual(@as(u32, 0), queue.len);
+        handler.restoring = false;
+    }
+    const oversized = try testing.allocator.alloc(u8, std.base64.standard.Encoder.calcSize(1_048_576) + 1);
+    defer testing.allocator.free(oversized);
+    @memset(oversized, 'A');
+    try handler.clipboardContents('c', oversized);
+    try testing.expectEqual(@as(u32, 0), queue.len);
 }
 
 test "manual mirror rejects Kitty clipboard packets without replies or host access" {

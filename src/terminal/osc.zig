@@ -6,6 +6,7 @@
 const osc = @This();
 
 const std = @import("std");
+pub const max_clipboard_bytes = 1_048_576;
 const builtin = @import("builtin");
 const build_options = @import("terminal_options");
 const mem = std.mem;
@@ -703,7 +704,7 @@ pub const Parser = struct {
                 Capture.allocating(
                     &self.capture,
                     alloc,
-                    self.max_allocating_bytes,
+                    if (self.state == .@"52") @min(self.max_allocating_bytes, std.base64.standard.Encoder.calcSize(max_clipboard_bytes) + 3) else self.max_allocating_bytes,
                 ) catch {
                     // The allocator failed for some reason, fall back to a fixed buffer
                     // and hope that it's big enough.
@@ -1248,6 +1249,27 @@ test "Parser nextSlice overflowing slice is truncated at the limit" {
     const cap = &p.capture.?;
     try testing.expectEqualStrings("abcd", cap.trailing());
     try testing.expectEqual(@as(usize, 4), cap.writer.buffer.len);
+}
+
+test "OSC52 global cap bounds parser captures at one MiB" {
+    const testing = std.testing;
+    const limit = std.base64.standard.Encoder.calcSize(1_048_576);
+    const payload = try testing.allocator.alloc(u8, limit + 4);
+    defer testing.allocator.free(payload);
+    @memset(payload, 'A');
+    for ([_]bool{ false, true }) |vector| {
+        var p: Parser = .init(testing.allocator);
+        defer p.deinit();
+        p.nextSlice("52;c;");
+        if (vector) p.nextSlice(payload) else for (payload) |byte| p.next(byte);
+        try testing.expect(p.end(null) == null);
+        try testing.expect(p.capture.?.writer.buffered().len <= limit + 3);
+    }
+    var p: Parser = .init(testing.allocator);
+    defer p.deinit();
+    p.nextSlice("52;c;");
+    p.nextSlice(payload[0..limit]);
+    try testing.expectEqual(@as(usize, limit), p.end(null).?.clipboard_contents.data.len);
 }
 
 test "Parser nextSlice matches per-byte parsing" {
