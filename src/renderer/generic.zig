@@ -225,6 +225,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
         /// Health of the most recently completed frame.
         health: std.atomic.Value(Health) = .{ .raw = .healthy },
+        stopping: std.atomic.Value(bool) = .init(false),
 
         /// Health of how well the apprt can present our frames.
         ///
@@ -821,6 +822,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             try result.prepBackgroundImage();
 
             return result;
+        }
+
+        pub fn prepareShutdown(self: *Self) void {
+            self.stopping.store(true, .release);
+            if (comptime @hasDecl(GraphicsAPI, "invalidatePresentations")) self.api.invalidatePresentations();
         }
 
         pub fn deinit(self: *Self) void {
@@ -2022,9 +2028,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
                 // Our health value changed, so we notify the surface so that it
                 // can do something about it.
-                _ = self.surface_mailbox.push(.{
+                _ = self.surface_mailbox.pushUntilStopped(.{
                     .renderer_health = health,
-                }, .{ .forever = {} });
+                }, &self.stopping);
             }
 
             // Always release our semaphore. The swap chain is
