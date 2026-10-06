@@ -15,7 +15,6 @@ const apprt = @import("../apprt.zig");
 const build_config = @import("../build_config.zig");
 const configpkg = @import("../config.zig");
 const crash = @import("../crash/main.zig");
-const fastmem = @import("../fastmem.zig");
 const internal_os = @import("../os/main.zig");
 const renderer = @import("../renderer.zig");
 const shell_integration = @import("shell_integration.zig");
@@ -420,39 +419,7 @@ pub fn queueWrite(
         const w = try exec.write_pool.create(alloc);
         w.td = exec;
         const buf = &w.buf;
-        const slice = slice: {
-            // The maximum end index is either the end of our data or
-            // the end of our buffer, whichever is smaller.
-            const max = @min(data.len, i + buf.len);
-
-            // Fast
-            if (!linefeed) {
-                fastmem.copy(u8, buf, data[i..max]);
-                const len = max - i;
-                i = max;
-                break :slice buf[0..len];
-            }
-
-            // Slow, have to replace \r with \r\n
-            var buf_i: usize = 0;
-            while (i < data.len and buf_i < buf.len - 1) {
-                const ch = data[i];
-                i += 1;
-
-                if (ch != '\r') {
-                    buf[buf_i] = ch;
-                    buf_i += 1;
-                    continue;
-                }
-
-                // CRLF
-                buf[buf_i] = '\r';
-                buf[buf_i + 1] = '\n';
-                buf_i += 2;
-            }
-
-            break :slice buf[0..buf_i];
-        };
+        const slice = termio.backend.writeChunk(data, &i, buf, linefeed);
 
         //for (slice) |b| log.warn("write: {x}", .{b});
 
