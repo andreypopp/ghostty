@@ -218,10 +218,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// Graphics API state.
         api: GraphicsAPI,
 
-        /// The CVDisplayLink used to drive the rendering loop in
-        /// sync with the display. This is void on platforms that
-        /// don't support a display link.
-        display_link: ?DisplayLink = null,
+        pacing: union(enum) {
+            native: ?DisplayLink,
+            external: @import("ExternalVsync.zig"),
+        } = .{ .native = null },
 
         /// Health of the most recently completed frame.
         health: std.atomic.Value(Health) = .{ .raw = .healthy },
@@ -728,6 +728,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             };
 
             var result: Self = .{
+                .pacing = if (comptime @hasField(apprt.Surface, "vsync_request_cb")) pacing: {
+                    const callback = options.rt_surface.vsync_request_cb orelse break :pacing .{ .native = null };
+                    break :pacing .{ .external = .{ .callback = callback, .userdata = options.rt_surface.vsync_userdata } };
+                } else .{ .native = null },
                 .alloc = alloc,
                 .config = options.config,
                 .surface_mailbox = options.surface_mailbox,
@@ -828,6 +832,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
         pub fn prepareShutdown(self: *Self) void {
             self.stopping.store(true, .release);
+            switch (self.pacing) {
+                .native => {},
+                .external => |*state| {
+                    _ = state.setState(.closed);
+                },
+            }
             if (comptime @hasDecl(GraphicsAPI, "invalidatePresentations")) self.api.invalidatePresentations();
         }
 
@@ -844,9 +854,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             self.latest_frame.deinit(global.io());
 
             if (DisplayLink != void) {
-                if (self.display_link) |display_link| {
-                    display_link.stop() catch {};
-                    display_link.release();
+                if (self.pacing == .native) {
+                    if (self.pacing.native) |display_link| {
+                        display_link.stop() catch {};
+                        display_link.release();
+                    }
                 }
             }
 
@@ -956,7 +968,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // Stop our display link. If this fails its okay it just means
             // that we either never started it or the view its attached to
             // is gone which is fine.
-            const display_link = self.display_link orelse return;
+            if (self.pacing == .external) return;
+            const display_link = self.pacing.native orelse return;
             display_link.stop() catch {};
         }
 
@@ -1079,6 +1092,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             id: u32,
             draw_now: *xev.Async,
         ) !void {
+            if (self.pacing == .external) return;
             if (comptime DisplayLink == void) return;
             self.syncDisplayLink(id, draw_now);
         }
@@ -1112,11 +1126,19 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// timer off this, re-querying after every wake.
         ///
         /// Must be called on the render thread.
-        pub fn animationWake(self: *const Self) ?AnimationWake {
+        pub fn animationWake(self: *Self) ?AnimationWake {
+            const include_draw = if (self.pacing == .external) draw: {
+                if (!self.visible or !self.display_realized) return null;
+                break :draw !self.hasVsync();
+            } else true;
+            return self.nextAnimationWake(include_draw);
+        }
+
+        fn nextAnimationWake(self: *const Self, include_draw: bool) ?AnimationWake {
             // Custom shaders animate by redrawing on a fixed cadence,
             // gated by configuration and focus.
             const shader_delay: ?u64 = shader: {
-                if (!self.has_custom_shaders) break :shader null;
+                if (!include_draw or !self.has_custom_shaders) break :shader null;
                 break :shader switch (self.config.custom_shader_animation) {
                     .false => null,
                     .always => draw_interval_ms,
@@ -1156,9 +1178,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// True if our renderer is using vsync. If true, the renderer or apprt
         /// is responsible for triggering draw_now calls to the render thread.
         /// That is the only way to trigger a drawFrame.
-        pub fn hasVsync(self: *const Self) bool {
+        pub fn hasVsync(self: *Self) bool {
+            if (self.pacing == .external) return self.pacing.external.active();
             if (comptime DisplayLink == void) return false;
-            const display_link = self.display_link orelse return false;
+            const display_link = self.pacing.native orelse return false;
             return display_link.isRunning();
         }
 
@@ -1237,14 +1260,19 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// blocking join on CoreVideo's IO thread, and the apprt calls
         /// `drawFrame` (which takes `draw_mutex`) from the CoreAnimation
         /// layer display path on the main thread.
-        fn syncDisplayLink(
+        pub fn syncDisplayLink(
             self: *Self,
             display_id: ?u32,
             draw_now: ?*xev.Async,
         ) void {
+            if (self.pacing == .external) {
+                self.pacing.external.publish(self.config.vsync and self.visible and self.display_realized and
+                    (self.cells_rebuilt or self.nextAnimationWake(true) != null));
+                return;
+            }
             if (comptime DisplayLink == void) return;
 
-            const display_link = self.display_link orelse display_link: {
+            const display_link = self.pacing.native orelse display_link: {
                 if (!self.config.vsync) return;
                 const callback = draw_now orelse return;
                 const result = macos.video.DisplayLink.createWithActiveCGDisplays() catch |err| {
@@ -1264,7 +1292,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     return;
                 };
 
-                self.display_link = result;
+                self.pacing.native = result;
                 log.info("created display link", .{});
                 break :display_link result;
             };
@@ -1280,7 +1308,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // Non-visible windows never vsync
                 self.visible and
                 // Only vsync if we have cell changes or animation
-                (self.cells_rebuilt or self.animationWake() != null);
+                (self.cells_rebuilt or self.nextAnimationWake(true) != null);
 
             if (should_run) {
                 if (!display_link.isRunning()) {
@@ -1800,7 +1828,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 size_changed or
                 swap_chain_rebuilt or
                 self.cells_rebuilt or
-                self.animationWake() != null or
+                self.nextAnimationWake(true) != null or
                 sync or presentation != null;
 
             if (!needs_redraw) {

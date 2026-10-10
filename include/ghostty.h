@@ -534,7 +534,36 @@ typedef struct {
   ghostty_surface_io_mode_e io_mode;
   ghostty_io_write_cb io_write_cb;
   void* io_write_userdata;
+  // Nonnull opts permanently into external pacing at creation; it never falls
+  // back to a native link. Initially UNAVAILABLE, visible surfaces still draw
+  // on events and animate on timers. Each surface needs its own callback/context;
+  // inherited configs do not copy these fields. Invoked on the renderer thread:
+  // enqueue host work without reentry. Context must remain valid through free
+  // and through a failed surface_new.
+  void (*vsync_request_cb)(void*);
+  void* vsync_userdata;
 } ghostty_surface_config_s;
+
+typedef enum {
+  GHOSTTY_VSYNC_UNAVAILABLE = 0,
+  GHOSTTY_VSYNC_AVAILABLE = 1,
+  GHOSTTY_VSYNC_CLOSED = 2,
+} ghostty_vsync_state_e;
+
+// Main-thread, live-surface APIs. Native-paced surfaces are inert.
+// Take and reconcile demand after attach and on EVERY availability gain, even
+// if previously taken while unavailable. Taking clears the notification, not
+// the demand; unchanged demand does not notify again. Publish AVAILABLE only
+// while the host can tick; loss must stop ticks at once. Changing availability
+// wakes the renderer. Tick while demanded and available; stop the host's tick
+// source when demand clears. Stop/clear host surface access before free.
+// CLOSED is optional before free: it suppresses callbacks early; shutdown also
+// closes. CLOSED is terminal, but an already committed callback may still arrive.
+bool ghostty_surface_take_vsync_demand(ghostty_surface_t);
+void ghostty_surface_set_vsync_state(ghostty_surface_t, ghostty_vsync_state_e);
+// Schedules an asynchronous renderer-thread draw, without a frame update,
+// mailbox push, or synchronous host dispatch.
+void ghostty_surface_vsync_tick(ghostty_surface_t);
 
 typedef struct {
   uint16_t columns;

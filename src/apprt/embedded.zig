@@ -15,6 +15,7 @@ const global = @import("../global.zig");
 const input = @import("../input.zig");
 const internal_os = @import("../os/main.zig");
 const renderer = @import("../renderer.zig");
+const ExternalVsync = @import("../renderer/ExternalVsync.zig");
 const terminal = @import("../terminal/main.zig");
 const CoreApp = @import("../App.zig");
 const CoreInspector = @import("../inspector/main.zig").Inspector;
@@ -471,6 +472,8 @@ pub const Surface = struct {
     io_mode: IoMode = .exec,
     io_write_cb: ?IoWriteCallback = null,
     io_write_userdata: ?*anyopaque = null,
+    vsync_request_cb: ?ExternalVsync.Callback = null,
+    vsync_userdata: ?*anyopaque = null,
 
     font_size_action_cb: ?FontSizeActionCallback = null,
     font_size_action_userdata: ?*anyopaque = null,
@@ -533,6 +536,8 @@ pub const Surface = struct {
 
         /// Userdata passed to io_write_cb.
         io_write_userdata: ?*anyopaque = null,
+        vsync_request_cb: ?ExternalVsync.Callback = null,
+        vsync_userdata: ?*anyopaque = null,
     };
 
     pub fn init(self: *Surface, app: *App, opts: Options) !void {
@@ -550,6 +555,8 @@ pub const Surface = struct {
             .io_mode = opts.io_mode,
             .io_write_cb = opts.io_write_cb,
             .io_write_userdata = opts.io_write_userdata,
+            .vsync_request_cb = opts.vsync_request_cb,
+            .vsync_userdata = opts.vsync_userdata,
         };
 
         // Add ourselves to the list of surfaces on the app.
@@ -1935,6 +1942,29 @@ pub const CAPI = struct {
         return try app.newSurface(opts.*);
     }
 
+    export fn ghostty_surface_take_vsync_demand(surface: *Surface) bool {
+        return switch (surface.core_surface.renderer.pacing) {
+            .native => false,
+            .external => |*state| state.take(),
+        };
+    }
+
+    export fn ghostty_surface_set_vsync_state(surface: *Surface, state: ExternalVsync.State) void {
+        switch (surface.core_surface.renderer.pacing) {
+            .native => {},
+            .external => |*external| if (external.setState(state)) {
+                surface.core_surface.renderer_thread.wakeup.notify() catch {};
+            },
+        }
+    }
+
+    export fn ghostty_surface_vsync_tick(surface: *Surface) void {
+        switch (surface.core_surface.renderer.pacing) {
+            .native => {},
+            .external => surface.core_surface.renderer_thread.draw_now.notify() catch {},
+        }
+    }
+
     export fn ghostty_surface_free(ptr: *Surface) void {
         ptr.app.closeSurface(ptr);
     }
@@ -2696,6 +2726,7 @@ pub const CAPI = struct {
     // Darwin-only C APIs.
     const Darwin = struct {
         export fn ghostty_surface_set_display_id(ptr: *Surface, display_id: u32) void {
+            if (ptr.core_surface.renderer.pacing == .external) return;
             const surface = &ptr.core_surface;
             _ = surface.renderer_thread.mailbox.push(
                 global.io(),

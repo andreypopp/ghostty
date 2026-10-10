@@ -187,7 +187,14 @@ pub const Health = enum(c_int) {
     }
 };
 
+test "ghostty.h vsync state" {
+    const ExternalVsync = @import("renderer/ExternalVsync.zig");
+    try lib.checkGhosttyHEnum(ExternalVsync.State, "GHOSTTY_VSYNC_");
+}
+
 test {
+    _ = @import("renderer/ExternalVsync.zig");
+
     // Our comptime-chosen renderer
     _ = Renderer;
 

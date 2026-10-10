@@ -163,6 +163,7 @@ fn applyRealization(self: *Thread, request: Realization) !void {
         self.renderer.draw_mutex.unlock(global.io());
     }
     if (request != .unrealize) try self.renderer.displayRealized();
+    if (self.renderer.pacing == .external) self.renderer.syncDisplayLink(null, null);
 }
 
 fn drawPendingPresentation(self: *Thread, presentation: rendererpkg.FramePresentation) void {
@@ -390,13 +391,7 @@ fn drainMailbox(self: *Thread) !void {
 
                 // Notify the renderer so it can update any state.
                 self.renderer.setVisible(v);
-
-                // Note that we're explicitly today not stopping any
-                // cursor timers, draw timers, etc. These things have very
-                // little resource cost and properly maintaining their active
-                // state across different transitions is going to be bug-prone,
-                // so its easier to just let them keep firing and have them
-                // check the visible state themselves to control their behavior.
+                if (self.renderer.pacing == .external) self.armAnimationTimer();
             },
 
             .focus => |v| focus: {
@@ -427,7 +422,7 @@ fn drainMailbox(self: *Thread) !void {
                             &self.cursor_c_cancel,
                             void,
                             null,
-                            cursorCancelCallback,
+                            timerCancelCallback,
                         );
                     }
                 } else {
@@ -564,6 +559,7 @@ fn wakeupCallback(
 
     if (pending.presentation) |presentation| {
         t.drawPendingPresentation(presentation);
+        if (t.renderer.pacing == .external) t.armAnimationTimer();
     } else {
         _ = renderCallback(t, undefined, undefined, {});
     }
@@ -633,6 +629,7 @@ fn renderCallback(
     // we're on the render thread, and do not try to update and draw
     // this frame.
     if (!t.renderer.display_realized) {
+        if (t.renderer.pacing == .external) t.armAnimationTimer();
         t.renderer.draw_mutex.lockUncancelable(global.io());
         defer t.renderer.draw_mutex.unlock(global.io());
 
@@ -643,7 +640,10 @@ fn renderCallback(
     // If we're not visible there's no point spending CPU rebuilding cells —
     // we'll catch up when the .visible mailbox message flips us back on.
     // Kitty graphics animations pause with us and resume on visibility.
-    if (!t.flags.visible) return .disarm;
+    if (!t.flags.visible) {
+        if (t.renderer.pacing == .external) t.armAnimationTimer();
+        return .disarm;
+    }
 
     // Update our frame data
     t.renderer.updateFrame(
@@ -670,7 +670,19 @@ fn renderCallback(
 /// recomputes the wake, so the deadline only ever moves toward the
 /// actual next wake.
 fn armAnimationTimer(self: *Thread) void {
-    const wake = self.renderer.animationWake() orelse return;
+    const wake = self.renderer.animationWake() orelse {
+        if (self.renderer.pacing == .external and self.render_c.state() == .active and self.render_c_cancel.state() == .dead) {
+            self.render_h.cancel(
+                &self.loop,
+                &self.render_c,
+                &self.render_c_cancel,
+                void,
+                null,
+                timerCancelCallback,
+            );
+        }
+        return;
+    };
     self.animation_wake = wake.kind;
     self.render_h.reset(
         &self.loop,
@@ -763,7 +775,7 @@ fn cursorTimerCallback(
     return .disarm;
 }
 
-fn cursorCancelCallback(
+fn timerCancelCallback(
     _: ?*void,
     _: *xev.Loop,
     _: *xev.Completion,
@@ -781,7 +793,7 @@ fn cursorCancelCallback(
         error.Canceled => {}, // success
         error.NotFound => {}, // completed before it could cancel
         else => {
-            log.warn("error in cursor cancel callback err={}", .{err});
+            log.warn("error in timer cancel callback err={}", .{err});
             unreachable;
         },
     };
