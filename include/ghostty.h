@@ -482,6 +482,15 @@ typedef struct {
   uint32_t y;
 } ghostty_point_s;
 
+typedef enum {
+  GHOSTTY_POINT_MOTION_LEFT,
+  GHOSTTY_POINT_MOTION_RIGHT,
+  GHOSTTY_POINT_MOTION_WORD_NEXT,
+  GHOSTTY_POINT_MOTION_WORD_PREVIOUS,
+  GHOSTTY_POINT_MOTION_WORD_END,
+  GHOSTTY_POINT_MOTION_FIRST_NONBLANK,
+} ghostty_point_motion_e;
+
 typedef struct {
   ghostty_point_s top_left;
   ghostty_point_s bottom_right;
@@ -1395,6 +1404,26 @@ GHOSTTY_API bool ghostty_clipboard_request_granted(const void*);
 // Consumes a started request without a PTY reply; the pointer is invalid afterward.
 GHOSTTY_API void ghostty_surface_cancel_clipboard_request(ghostty_surface_t, void*);
 GHOSTTY_API bool ghostty_surface_has_selection(ghostty_surface_t);
+// Selection points are exact screen coordinates: row zero is the first loaded
+// history row (or the first active row when there is no history). NULL clears.
+// Call on the main/UI thread. Invalid input returns false without a change.
+// The selection_changed action is sent synchronously with the renderer mutex
+// held; its callback must not re-enter selection or read APIs.
+GHOSTTY_API bool ghostty_surface_set_selection(ghostty_surface_t,
+                                            const ghostty_selection_s*);
+// Call on the main/UI thread. Returns false if there is no selection.
+// Returns raw endpoints, which may be reversed (start after end).
+GHOSTTY_API bool ghostty_surface_selection(ghostty_surface_t,
+                                        ghostty_selection_s*);
+// Call on the main/UI thread. Row y uses the selection's screen coordinates.
+// True if the row soft-wraps onto the next row; false if not or out of range.
+GHOSTTY_API bool ghostty_surface_row_wrapped(ghostty_surface_t, uint32_t y);
+// Call on the main/UI thread. Moves an exact screen point within the loaded
+// rows without changing any state; false for an invalid point or motion.
+GHOSTTY_API bool ghostty_surface_move_point(ghostty_surface_t,
+                                         ghostty_point_s,
+                                         ghostty_point_motion_e,
+                                         ghostty_point_s*);
 GHOSTTY_API bool ghostty_surface_read_selection(ghostty_surface_t, ghostty_text_s*);
 GHOSTTY_API bool ghostty_surface_read_text(ghostty_surface_t,
                                               ghostty_selection_s,
