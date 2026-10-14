@@ -1706,87 +1706,11 @@ pub const CAPI = struct {
         }
     };
 
-    // ghostty_point_s
-    const Point = extern struct {
-        tag: Tag,
-        coord_tag: CoordTag,
-        x: u32,
-        y: u32,
-
-        const Tag = enum(c_int) {
-            active = 0,
-            viewport = 1,
-            screen = 2,
-            history = 3,
-        };
-
-        const CoordTag = enum(c_int) {
-            exact = 0,
-            top_left = 1,
-            bottom_right = 2,
-        };
-
-        fn pin(
-            self: Point,
-            screen: *const terminal.Screen,
-        ) ?terminal.Pin {
-            // The core point tag.
-            const tag: terminal.point.Tag = switch (self.tag) {
-                inline else => |tag| @field(
-                    terminal.point.Tag,
-                    @tagName(tag),
-                ),
-            };
-
-            // Clamp our point to the screen bounds.
-            const clamped_x = @min(self.x, screen.pages.cols -| 1);
-            const clamped_y = @min(self.y, screen.pages.rows -| 1);
-
-            return switch (self.coord_tag) {
-                // Exact coordinates require a specific pin.
-                .exact => exact: {
-                    const pt_x = std.math.cast(
-                        terminal.size.CellCountInt,
-                        clamped_x,
-                    ) orelse std.math.maxInt(terminal.size.CellCountInt);
-
-                    const pt: terminal.Point = switch (tag) {
-                        inline else => |v| @unionInit(
-                            terminal.Point,
-                            @tagName(v),
-                            .{ .x = pt_x, .y = clamped_y },
-                        ),
-                    };
-
-                    break :exact screen.pages.pin(pt) orelse null;
-                },
-
-                .top_left => screen.pages.getTopLeft(tag),
-
-                .bottom_right => screen.pages.getBottomRight(tag),
-            };
-        }
-    };
-
-    // ghostty_selection_s
-    const Selection = extern struct {
-        tl: Point,
-        br: Point,
-        rectangle: bool,
-
-        fn core(
-            self: Selection,
-            screen: *const terminal.Screen,
-        ) ?terminal.Selection {
-            return .{
-                .bounds = .{ .untracked = .{
-                    .start = self.tl.pin(screen) orelse return null,
-                    .end = self.br.pin(screen) orelse return null,
-                } },
-                .rectangle = self.rectangle,
-            };
-        }
-    };
+    const Selection = @import("embedded_selection.zig").Selection;
+    const rowWrapped = @import("embedded_selection.zig").rowWrapped;
+    const Point = @import("embedded_selection.zig").Point;
+    const Motion = @import("embedded_selection.zig").Motion;
+    const movePoint = @import("embedded_selection.zig").movePoint;
 
     // Reference the conditional exports based on target platform
     // so they're included in the C API.
@@ -2104,6 +2028,50 @@ pub const CAPI = struct {
     /// Returns true if the surface has a selection.
     export fn ghostty_surface_has_selection(surface: *Surface) bool {
         return surface.core_surface.hasSelection();
+    }
+
+    export fn ghostty_surface_set_selection(surface: *Surface, sel: ?*const Selection) bool {
+        const core = &surface.core_surface;
+        core.renderer_state.mutex.lockUncancelable(global.io());
+        defer core.renderer_state.mutex.unlock(global.io());
+
+        const screen = core.io.terminal.screens.active;
+        const selection: ?terminal.Selection = if (sel) |v| v.coreStrict(screen) orelse return false else null;
+        core.setSelection(selection) catch |err| {
+            log.warn("error setting selection err={}", .{err});
+            return false;
+        };
+        core.renderer_thread.wakeup.notify() catch |err| {
+            log.warn("error queueing selection render err={}", .{err});
+        };
+        return true;
+    }
+
+    export fn ghostty_surface_selection(surface: *Surface, result: *Selection) bool {
+        const core = &surface.core_surface;
+        core.renderer_state.mutex.lockUncancelable(global.io());
+        defer core.renderer_state.mutex.unlock(global.io());
+
+        const screen = core.io.terminal.screens.active;
+        const sel = screen.selection orelse return false;
+        result.* = Selection.fromCore(screen, sel) orelse return false;
+        return true;
+    }
+
+    export fn ghostty_surface_row_wrapped(surface: *Surface, y: u32) bool {
+        const core = &surface.core_surface;
+        core.renderer_state.mutex.lockUncancelable(global.io());
+        defer core.renderer_state.mutex.unlock(global.io());
+        return rowWrapped(core.io.terminal.screens.active, y);
+    }
+
+    export fn ghostty_surface_move_point(surface: *Surface, point: Point, motion_raw: c_int, result: *Point) bool {
+        const motion = std.enums.fromInt(Motion, motion_raw) orelse return false;
+        const core = &surface.core_surface;
+        core.renderer_state.mutex.lockUncancelable(global.io());
+        defer core.renderer_state.mutex.unlock(global.io());
+        result.* = movePoint(core.io.terminal.screens.active, point, motion, core.config.selection_word_chars) orelse return false;
+        return true;
     }
 
     /// Same as ghostty_surface_read_text but reads from the user selection,

@@ -1295,7 +1295,7 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
         },
 
         .search_total => |v| {
-            if (!self.searchValueCurrent(v)) return;
+            if (!self.searchValueCurrent(v.generation)) return;
             _ = try self.rt_app.performAction(
                 .{ .surface = self },
                 .search_total,
@@ -1304,11 +1304,11 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
         },
 
         .search_selected => |v| {
-            if (!self.searchValueCurrent(v)) return;
+            if (!self.searchValueCurrent(v.generation)) return;
             _ = try self.rt_app.performAction(
                 .{ .surface = self },
                 .search_selected,
-                .{ .selected = v.value },
+                .{ .selected = v.value, .start = v.start },
             );
         },
     }
@@ -1557,9 +1557,9 @@ fn passwordInput(self: *Surface, v: bool) !void {
     try self.queueRender();
 }
 
-fn searchValueCurrent(self: *const Surface, value: apprt.surface.Message.SearchValue) bool {
+fn searchValueCurrent(self: *const Surface, generation: u64) bool {
     const search = self.search orelse return false;
-    return value.generation == search.generation;
+    return generation == search.generation;
 }
 
 fn retireSearch(self: *Surface, reset: *const fn (*Surface) void) void {
@@ -1575,7 +1575,7 @@ fn resetSearchHost(self: *Surface) void {
     _ = self.rt_app.performAction(.{ .surface = self }, .search_total, .{ .total = null }) catch |err| {
         log.warn("failed to reset search total err={}", .{err});
     };
-    _ = self.rt_app.performAction(.{ .surface = self }, .search_selected, .{ .selected = null }) catch |err| {
+    _ = self.rt_app.performAction(.{ .surface = self }, .search_selected, .{ .selected = null, .start = null }) catch |err| {
         log.warn("failed to reset search selection err={}", .{err});
     };
 }
@@ -1631,8 +1631,16 @@ fn searchCallback_(
                     .forever,
                 );
 
-                // Send the selected index to the surface mailbox
-                self.search.?.surfaceMessage(self.surfaceMailbox(), .{ .search_selected = .{ .generation = self.search.?.generation, .value = sel.idx } });
+                const start = start: {
+                    self.renderer_state.mutex.lockUncancelable(global.io());
+                    defer self.renderer_state.mutex.unlock(global.io());
+                    const pages = &self.renderer_state.terminal.screens.active.pages;
+                    const first = sel.highlight.chunks.get(0);
+                    if (!pages.nodeIsValid(first.node, first.serial)) break :start null;
+                    const p = pages.pointFromPin(.screen, sel.highlight.startPin()) orelse break :start null;
+                    break :start p.screen;
+                };
+                self.search.?.surfaceMessage(self.surfaceMailbox(), .{ .search_selected = .{ .generation = self.search.?.generation, .value = sel.idx, .start = start } });
             } else {
                 // Reset our selected match
                 _ = self.renderer_thread.mailbox.push(
@@ -1642,7 +1650,7 @@ fn searchCallback_(
                 );
 
                 // Reset the selected index
-                self.search.?.surfaceMessage(self.surfaceMailbox(), .{ .search_selected = .{ .generation = self.search.?.generation, .value = null } });
+                self.search.?.surfaceMessage(self.surfaceMailbox(), .{ .search_selected = .{ .generation = self.search.?.generation, .value = null, .start = null } });
             }
 
             try self.renderer_thread.wakeup.notify();
@@ -1672,7 +1680,7 @@ fn searchCallback_(
 
             // Reset search totals in the surface
             self.search.?.surfaceMessage(self.surfaceMailbox(), .{ .search_total = .{ .generation = self.search.?.generation, .value = null } });
-            self.search.?.surfaceMessage(self.surfaceMailbox(), .{ .search_selected = .{ .generation = self.search.?.generation, .value = null } });
+            self.search.?.surfaceMessage(self.surfaceMailbox(), .{ .search_selected = .{ .generation = self.search.?.generation, .value = null, .start = null } });
         },
 
         // Unhandled, so far.
@@ -2650,7 +2658,7 @@ fn copySelectionToClipboards(
 /// also copy per `copy_on_select`, use `setSelectionAndCopy`.
 ///
 /// This must be called with the renderer mutex held.
-fn setSelection(self: *Surface, sel_: ?terminal.Selection) !void {
+pub fn setSelection(self: *Surface, sel_: ?terminal.Selection) !void {
     // Compute the transition before `select` below, which untracks (frees)
     // the previous selection's tracked pins; reading them after would be a
     // use-after-free.
@@ -7346,22 +7354,161 @@ test "search delivery epochs reject accepted events after live reset" {
     var surface: Surface = undefined;
     surface.search = .{ .state = undefined, .thread = undefined, .generation = 1 };
     surface.search_generation = 1;
-    const accepted: apprt.surface.Message.SearchValue = .{ .generation = 1, .value = 12 };
     var queue: App.Mailbox.Queue = .{};
-    try testing.expect(queue.push(global.io(), .{ .surface_message = .{ .surface = &surface, .message = .{ .search_total = accepted } } }, .instant) != 0);
-    try testing.expect(queue.push(global.io(), .{ .surface_message = .{ .surface = &surface, .message = .{ .search_selected = accepted } } }, .instant) != 0);
-    try testing.expect(surface.searchValueCurrent(accepted));
+    try testing.expect(queue.push(global.io(), .{ .surface_message = .{ .surface = &surface, .message = .{ .search_total = .{ .generation = 1, .value = 12 } } } }, .instant) != 0);
+    try testing.expect(queue.push(global.io(), .{ .surface_message = .{ .surface = &surface, .message = .{ .search_selected = .{ .generation = 1, .value = 12, .start = .{ .x = 3, .y = 4 } } } } }, .instant) != 0);
+    try testing.expect(surface.searchValueCurrent(1));
     surface.search = null;
     surface.search_generation = 2;
     while (queue.pop(global.io())) |message| switch (message.surface_message.message) {
-        .search_total, .search_selected => |value| try testing.expect(!surface.searchValueCurrent(value)),
+        .search_total => |value| try testing.expect(!surface.searchValueCurrent(value.generation)),
+        .search_selected => |value| try testing.expect(!surface.searchValueCurrent(value.generation)),
         else => unreachable,
     };
-    try testing.expect(!surface.searchValueCurrent(accepted));
+    try testing.expect(!surface.searchValueCurrent(1));
     surface.search = .{ .state = undefined, .thread = undefined, .generation = 3 };
     surface.search_generation = 3;
-    try testing.expect(!surface.searchValueCurrent(accepted));
-    try testing.expect(surface.searchValueCurrent(.{ .generation = 3, .value = null }));
+    try testing.expect(!surface.searchValueCurrent(1));
+    try testing.expect(surface.searchValueCurrent(3));
+}
+
+test "search selected position follows each navigated match" {
+    const testing = std.testing;
+    const Context = struct {
+        surface: *Surface,
+        complete: std.atomic.Value(bool) = .init(false),
+        fn event(value: terminal.search.Thread.Event, ud: ?*anyopaque) void {
+            const c: *@This() = @ptrCast(@alignCast(ud.?));
+            if (value == .complete) c.complete.store(true, .release);
+            c.surface.searchCallback_(value) catch unreachable;
+        }
+        fn selected(app: *App) !apprt.surface.Message.SearchSelected {
+            for (0..2000) |_| {
+                while (app.mailbox.pop(global.io())) |message| switch (message.surface_message.message) {
+                    .search_selected => |value| if (value.value != null) return value,
+                    else => {},
+                };
+                std.Io.sleep(global.io(), .fromMilliseconds(1), .awake) catch {};
+            }
+            return error.Timeout;
+        }
+    };
+    var app: App = undefined;
+    app.mailbox = .{};
+    var rt_app: apprt.App = undefined;
+    var surface: Surface = undefined;
+    surface.app = &app;
+    surface.rt_app = &rt_app;
+    surface.alloc = testing.allocator;
+    var context: Context = .{ .surface = &surface };
+    var t = try terminal.Terminal.init(testing.io, testing.allocator, .{ .cols = 8, .rows = 2 });
+    defer t.deinit(testing.allocator);
+    var stream = t.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("x ab ab\r\n\u{65E5}\u{672C}ab\r\nzz\r\nzz");
+    var mutex: std.Io.Mutex = .init;
+    surface.renderer_state = .{ .mutex = &mutex, .terminal = &t };
+    surface.renderer_thread.wakeup = try .init();
+    defer surface.renderer_thread.wakeup.deinit();
+    var mailbox: rendererpkg.Thread.Mailbox = .{};
+    surface.renderer_thread.mailbox = &mailbox;
+    defer while (mailbox.pop(global.io())) |message| switch (message) {
+        .search_viewport_matches => |owned| owned.arena.deinit(),
+        .search_selected_match => |value| if (value) |owned| owned.arena.deinit(),
+        else => {},
+    };
+    surface.search = .{
+        .generation = 1,
+        .state = try .init(testing.allocator, .{
+            .mutex = &mutex,
+            .terminal = &t,
+            .event_cb = Context.event,
+            .event_userdata = &context,
+        }),
+        .thread = undefined,
+    };
+    surface.search.?.thread = try .spawn(.{}, terminal.search.Thread.threadMain, .{&surface.search.?.state});
+    defer {
+        surface.search.?.deinit();
+        while (app.mailbox.pop(global.io())) |_| {}
+    }
+    try surface.search.?.state.submit(.{ .change_needle = try .init(testing.allocator, @as([]const u8, "ab")) });
+    for (0..2000) |_| {
+        if (context.complete.load(.acquire)) break;
+        std.Io.sleep(global.io(), .fromMilliseconds(1), .awake) catch {};
+    } else return error.Timeout;
+    for ([_]struct { usize, u16, u32 }{ .{ 0, 4, 1 }, .{ 1, 5, 0 }, .{ 2, 2, 0 }, .{ 1, 5, 0 } }, 0..) |expected, i| {
+        try surface.search.?.state.submit(.{ .select = if (i == 3) .prev else .next });
+        const value = try Context.selected(&app);
+        try testing.expectEqual(@as(u64, 1), value.generation);
+        try testing.expectEqual(@as(?usize, expected[0]), value.value);
+        try testing.expectEqual(terminal.point.Coordinate{ .x = expected[1], .y = expected[2] }, value.start.?);
+    }
+    try testing.expect(t.screens.active.selection == null);
+}
+
+test "search selected position is absent for a stale or other-screen match" {
+    const testing = std.testing;
+    var app: App = undefined;
+    app.mailbox = .{};
+    var rt_app: apprt.App = undefined;
+    var surface: Surface = undefined;
+    surface.app = &app;
+    surface.rt_app = &rt_app;
+    surface.alloc = testing.allocator;
+    surface.search = .{ .state = undefined, .thread = undefined, .generation = 7 };
+    var t = try terminal.Terminal.init(testing.io, testing.allocator, .{ .cols = 8, .rows = 2 });
+    defer t.deinit(testing.allocator);
+    var stream = t.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("row0\r\nrow1\r\nrow2\r\nrow3");
+    var mutex: std.Io.Mutex = .init;
+    surface.renderer_state = .{ .mutex = &mutex, .terminal = &t };
+    surface.renderer_thread.wakeup = try .init();
+    defer surface.renderer_thread.wakeup.deinit();
+    var mailbox: rendererpkg.Thread.Mailbox = .{};
+    surface.renderer_thread.mailbox = &mailbox;
+    defer while (mailbox.pop(global.io())) |message| switch (message) {
+        .search_selected_match => |value| if (value) |owned| owned.arena.deinit(),
+        else => {},
+    };
+    const Probe = struct {
+        fn highlight(pages: *terminal.PageList, x: u16, y: u32) !terminal.highlight.Flattened {
+            const start = pages.pin(.{ .screen = .{ .x = x, .y = y } }).?;
+            var result: terminal.highlight.Flattened = .{ .chunks = .empty, .top_x = x, .bot_x = x + 1 };
+            try result.chunks.append(testing.allocator, .{ .node = start.node, .serial = start.node.serial, .start = start.y, .end = start.y + 1 });
+            return result;
+        }
+        fn deliver(s: *Surface, a: *App, pages: *terminal.PageList, x: u16, y: u32) !?terminal.point.Coordinate {
+            var value = try highlight(pages, x, y);
+            defer value.deinit(testing.allocator);
+            return try deliverHighlight(s, a, value);
+        }
+        fn deliverHighlight(s: *Surface, a: *App, match: terminal.highlight.Flattened) !?terminal.point.Coordinate {
+            try s.searchCallback_(.{ .selected_match = .{ .idx = 3, .highlight = match } });
+            const value = a.mailbox.pop(global.io()).?.surface_message.message.search_selected;
+            try testing.expectEqual(@as(u64, 7), value.generation);
+            try testing.expectEqual(@as(?usize, 3), value.value);
+            return value.start;
+        }
+    };
+    try testing.expectEqual(terminal.point.Coordinate{ .x = 1, .y = 1 }, (try Probe.deliver(&surface, &app, &t.screens.active.pages, 1, 1)).?);
+
+    var old = try Probe.highlight(&t.screens.active.pages, 2, 0);
+    defer old.deinit(testing.allocator);
+    stream.nextSlice("\x1b[?1049hab");
+    try testing.expectEqual(terminal.ScreenSet.Key.alternate, t.screens.active_key);
+    try testing.expectEqual(@as(?terminal.point.Coordinate, null), try Probe.deliverHighlight(&surface, &app, old));
+    try testing.expectEqual(terminal.point.Coordinate{ .x = 0, .y = 0 }, (try Probe.deliver(&surface, &app, &t.screens.active.pages, 0, 0)).?);
+
+    stream.nextSlice("\x1b[?1049l\x1bc");
+    try testing.expectEqual(@as(?terminal.point.Coordinate, null), try Probe.deliverHighlight(&surface, &app, old));
+
+    try surface.searchCallback_(.{ .selected_match = null });
+    const cleared = app.mailbox.pop(global.io()).?.surface_message.message.search_selected;
+    try testing.expectEqual(@as(?usize, null), cleared.value);
+    try testing.expectEqual(@as(?terminal.point.Coordinate, null), cleared.start);
+    try testing.expect(t.screens.active.selection == null);
 }
 
 test "live search retirement with full app capacity publishes final reset" {
