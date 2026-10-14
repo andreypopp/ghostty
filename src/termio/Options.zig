@@ -20,9 +20,8 @@ config: termio.Termio.DerivedConfig,
 /// The backend for termio that implements where reads/writes are sourced.
 backend: termio.Backend,
 
-/// Drop replies generated while parsing terminal output. This is used by
-/// mirror renderers when another terminal core owns the PTY protocol.
-suppress_terminal_responses: bool = false,
+/// Which replies generated while parsing terminal output reach the pty.
+reply_policy: termio.StreamHandler.ReplyPolicy = .{},
 
 /// The mailbox for the terminal. This is how messages are delivered.
 /// If you're using termio.Thread this MUST be "mailbox".

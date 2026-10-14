@@ -87,6 +87,14 @@ pub const Message = union(enum) {
     /// and must eventually destroy it.
     kitty_clipboard_write: *apprt.ClipboardRequest.KittyWrite,
 
+    /// A Kitty clipboard protocol (OSC 5522) write status decided by
+    /// the IO thread, written to the pty by the surface.
+    kitty_clipboard_status: struct {
+        status: terminal.kitty.clipboard.Status,
+        id: WriteReq,
+        terminator: terminal.osc.Terminator,
+    },
+
     /// Write the clipboard contents.
     clipboard_write: struct {
         clipboard_type: apprt.Clipboard,
@@ -162,6 +170,7 @@ pub const Message = union(enum) {
         switch (self) {
             .clipboard_write => |value| value.req.deinit(),
             .pwd_change => |value| value.deinit(),
+            .kitty_clipboard_status => |value| value.id.deinit(),
             .kitty_clipboard_read => |value| value.destroy(),
             .kitty_clipboard_write => |value| value.destroy(),
             else => {},
