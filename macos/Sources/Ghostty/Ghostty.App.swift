@@ -76,7 +76,8 @@ extension Ghostty {
                         state: state,
                         request: request) },
                 write_clipboard_cb: { userdata, loc, content, len, confirm in
-                    App.writeClipboard(userdata, location: loc, content: content, len: len, confirm: confirm) },
+                    App.writeClipboard(userdata, location: loc, content: content, len: len, confirm: confirm)
+                    return GHOSTTY_CLIPBOARD_WRITE_OK },
                 close_surface_cb: { userdata, processAlive in App.closeSurface(userdata, processAlive: processAlive) }
             )
 

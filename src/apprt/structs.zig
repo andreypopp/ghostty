@@ -117,6 +117,15 @@ pub const ClipboardRequest = union(ClipboardRequestType) {
     /// reading any of their data.
     list: Clipboard,
 
+    /// Whether a session grant, such as a paste event's one-time
+    /// password, authorized this request without a prompt.
+    pub fn granted(self: ClipboardRequest) bool {
+        return switch (self) {
+            inline .kitty_read, .kitty_write => |request| request.granted,
+            else => false,
+        };
+    }
+
     pub fn destroy(self: *ClipboardRequest, alloc: std.mem.Allocator) void {
         switch (self.*) {
             inline .kitty_read, .kitty_write => |request| request.destroy(),
