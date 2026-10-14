@@ -107,9 +107,7 @@ pub const StreamHandler = struct {
     /// and XTCHECKSUM may change how it's calculated.
     xt_checksum_report: bool,
 
-    /// When another terminal core owns the PTY protocol, Ghostty is only a
-    /// render/input mirror and must not emit a second copy of protocol replies.
-    suppress_terminal_responses: bool = false,
+    reply_policy: ReplyPolicy = .{},
     restoring: bool = false,
 
     //---------------------------------------------------------------
@@ -147,6 +145,15 @@ pub const StreamHandler = struct {
     seen_title: bool = false,
 
     pub const Stream = terminal.Stream(StreamHandler);
+
+    /// When another terminal core owns the PTY protocol, Ghostty is only a
+    /// render/input mirror and must not emit a second copy of protocol
+    /// replies. A mirror's embedder may still answer the Kitty clipboard
+    /// protocol, whose replies all originate in the surface.
+    pub const ReplyPolicy = struct {
+        suppress: bool = false,
+        kitty_clipboard: bool = true,
+    };
 
     /// True if we have tmux control mode built in.
     pub const tmux_enabled = terminal.options.tmux_control_mode;
@@ -208,7 +215,7 @@ pub const StreamHandler = struct {
             msg.deinit();
             return;
         }
-        if (suppressTerminalResponse(self.suppress_terminal_responses, msg))
+        if (suppressTerminalResponse(self.reply_policy.suppress, msg))
             return;
         self.termio_mailbox.send(msg, self.renderer_state.mutex);
         self.termio_messaged = true;
@@ -1120,7 +1127,7 @@ pub const StreamHandler = struct {
         self: *StreamHandler,
         v: terminal.osc.Command.KittyClipboardProtocol,
     ) error{ OutOfMemory, WriteFailed }!void {
-        if (self.suppress_terminal_responses) return;
+        if (!self.reply_policy.kitty_clipboard or self.restoring) return;
         const kitty_clipboard = terminal.kitty.clipboard;
 
         // Decode and validate the metadata. Malformed structure drops
@@ -1490,29 +1497,24 @@ pub const StreamHandler = struct {
         try self.kittyClipboardWriteStatus(status, state.id, terminator);
     }
 
-    /// Reply to a write transaction with a single status packet.
+    /// Reply to a write transaction with a single status packet. The
+    /// surface writes it, so the reply follows the same path as every
+    /// other Kitty clipboard reply.
     fn kittyClipboardWriteStatus(
         self: *StreamHandler,
         status: terminal.kitty.clipboard.Status,
         id: []const u8,
         terminator: terminal.osc.Terminator,
     ) error{ OutOfMemory, WriteFailed }!void {
-        var stream: std.Io.Writer.Allocating = .init(self.alloc);
-        defer stream.deinit();
-        try (terminal.kitty.clipboard.Response{
-            .op = .write,
+        self.surfaceMessageWriter(.{ .kitty_clipboard_status = .{
             .status = status,
-            .id = id,
+            .id = try .init(self.alloc, id),
             .terminator = terminator,
-        }).encode(&stream.writer);
-        self.messageWriter(.{ .write_alloc = .{
-            .alloc = self.alloc,
-            .data = try stream.toOwnedSlice(),
         } });
     }
 
     /// Drop any in-flight write transaction without responding.
-    fn kittyClipboardWriteAbort(self: *StreamHandler) void {
+    pub fn kittyClipboardWriteAbort(self: *StreamHandler) void {
         if (self.kitty_clipboard_write) |state| {
             state.deinit(self.alloc);
             self.alloc.destroy(state);
@@ -2008,24 +2010,22 @@ test "kitty clipboard read: targets-only never consumes a one-time grant" {
     try testing.expect(!handler.kittyClipboardReadGranted("otp", 1));
 }
 
-test "kitty clipboard write: oversized text replies EFBIG" {
+test "kitty clipboard write: oversized text replies EFBIG through the surface" {
     const testing = std.testing;
 
     var mailbox = try termio.Mailbox.initSPSC(testing.allocator);
     defer mailbox.deinit(testing.allocator);
+    var app: apprt.App = undefined;
+    var surface: @import("../Surface.zig") = undefined;
+    var queue: @import("../App.zig").Mailbox.Queue = .{};
 
-    var mutex: std.Io.Mutex = .init;
-    mutex.lockUncancelable(global.io());
-    defer mutex.unlock(global.io());
-
-    var renderer_state: renderer.State = .{
-        .mutex = &mutex,
-        .terminal = undefined,
-    };
     var handler: StreamHandler = undefined;
     handler.alloc = testing.allocator;
     handler.termio_mailbox = &mailbox;
-    handler.renderer_state = &renderer_state;
+    handler.surface_mailbox = .{ .surface = &surface, .app = .{ .rt_app = &app, .mailbox = &queue } };
+    handler.stopping = .init(false);
+    handler.restoring = false;
+    handler.reply_policy = .{ .suppress = true, .kitty_clipboard = true };
     handler.clipboard_write = .allow;
     handler.clipboard_write_limit = 4;
     handler.kitty_clipboard_write = null;
@@ -2050,21 +2050,15 @@ test "kitty clipboard write: oversized text replies EFBIG" {
     try handler.kittyClipboardWriteFinish(state, .EFBIG, .st);
     try testing.expect(handler.kitty_clipboard_write == null);
 
-    const response = mailbox.spsc.queue.pop(global.io());
-    try testing.expect(response != null);
-    const msg = response.?;
-    defer msg.deinit();
-    switch (msg) {
-        .write_alloc => |v| try testing.expectEqualStrings(
-            "\x1B]5522;type=write:status=EFBIG:id=macos\x1B\\",
-            v.data,
-        ),
-        else => try testing.expect(false),
-    }
-
-    // Teardown leaves no transaction that could be committed and
-    // forwarded to the macOS clipboard path.
+    // A mirror suppresses parser replies, so the status must reach the
+    // surface, which writes every Kitty clipboard reply.
     try testing.expect(mailbox.spsc.queue.pop(global.io()) == null);
+    const msg = queue.pop(global.io()).?.surface_message.message;
+    defer msg.deinit();
+    const status = msg.kitty_clipboard_status;
+    try testing.expectEqual(terminal.kitty.clipboard.Status.EFBIG, status.status);
+    try testing.expectEqualStrings("macos", status.id.slice());
+    try testing.expectEqual(@as(u32, 0), queue.len);
 }
 
 test "OSC52 live reads route once and replay suppresses them in both manual modes" {
@@ -2081,7 +2075,7 @@ test "OSC52 live reads route once and replay suppresses them in both manual mode
     var stream: terminal.Stream(*StreamHandler) = .init(.{ .allocator = testing.allocator, .handler = &handler });
     defer stream.parser.deinit();
     for ([_]bool{ false, true }) |mirror| {
-        handler.suppress_terminal_responses = mirror;
+        handler.reply_policy = .{ .suppress = mirror };
         for ([_]u8{ 'c', 's', 'p' }, [_]apprt.Clipboard{ .standard, .selection, .primary }) |kind, clipboard| {
             var bytes = [_]u8{ 0x1b, ']', '5', '2', ';', kind, ';', '?', 0x07 };
             stream.nextSlice(&bytes);
@@ -2100,13 +2094,56 @@ test "OSC52 live reads route once and replay suppresses them in both manual mode
     try testing.expectEqual(@as(u32, 0), queue.len);
 }
 
-test "manual mirror rejects Kitty clipboard packets without replies or host access" {
+test "manual mirror answers Kitty clipboard packets only when the embedder opts in" {
+    const testing = std.testing;
+    var app: apprt.App = undefined;
+    var surface: @import("../Surface.zig") = undefined;
+    var queue: @import("../App.zig").Mailbox.Queue = .{};
     var handler: StreamHandler = undefined;
-    handler.suppress_terminal_responses = true;
+    handler.alloc = testing.allocator;
+    handler.surface_mailbox = .{ .surface = &surface, .app = .{ .rt_app = &app, .mailbox = &queue } };
+    handler.stopping = .init(false);
+    handler.restoring = false;
     handler.kitty_clipboard_write = null;
+    handler.kitty_clipboard_grants = .{};
+    defer handler.kitty_clipboard_grants.deinit(testing.allocator);
+    defer while (queue.pop(global.io())) |message| message.surface_message.message.deinit();
+
+    handler.reply_policy = .{ .suppress = true, .kitty_clipboard = false };
     for ([_][]const u8{ "type=read", "type=write", "type=wdata", "type=walias" }) |metadata| {
-        try handler.kittyClipboard(.{ .metadata = metadata, .payload = "SGVsbG8=", .terminator = .st });
-        try std.testing.expect(handler.kitty_clipboard_write == null);
+        try handler.kittyClipboard(.{ .metadata = metadata, .payload = "aW1hZ2UvcG5n", .terminator = .st });
+        try testing.expect(handler.kitty_clipboard_write == null);
+    }
+    try testing.expectEqual(@as(u32, 0), queue.len);
+
+    handler.reply_policy = .{ .suppress = true, .kitty_clipboard = true };
+    try handler.kittyClipboard(.{ .metadata = "type=read", .payload = "aW1hZ2UvcG5n", .terminator = .st });
+    const msg = queue.pop(global.io()).?.surface_message.message;
+    defer msg.deinit();
+    try testing.expectEqualStrings("image/png", msg.kitty_clipboard_read.mimes[0]);
+}
+
+test "kitty clipboard read: a paste event password authorizes exactly one read" {
+    const testing = std.testing;
+    var app: apprt.App = undefined;
+    var surface: @import("../Surface.zig") = undefined;
+    var queue: @import("../App.zig").Mailbox.Queue = .{};
+    var handler: StreamHandler = undefined;
+    handler.alloc = testing.allocator;
+    handler.surface_mailbox = .{ .surface = &surface, .app = .{ .rt_app = &app, .mailbox = &queue } };
+    handler.stopping = .init(false);
+    handler.restoring = false;
+    handler.reply_policy = .{ .suppress = true, .kitty_clipboard = true };
+    handler.kitty_clipboard_grants = .{};
+    defer handler.kitty_clipboard_grants.deinit(testing.allocator);
+    try handler.kitty_clipboard_grants.grant(testing.allocator, "otp", .read, true);
+
+    for ([_]bool{ true, false }) |expected| {
+        try handler.kittyClipboard(.{ .metadata = "type=read:name=eA==:pw=b3Rw", .payload = "aW1hZ2UvcG5n", .terminator = .st });
+        const msg = queue.pop(global.io()).?.surface_message.message;
+        defer msg.deinit();
+        const request: apprt.ClipboardRequest = .{ .kitty_read = msg.kitty_clipboard_read };
+        try testing.expectEqual(expected, request.granted());
     }
 }
 

@@ -227,6 +227,7 @@ fn pasteKittyEvent(
     // and revoked if the event fails to be written so a failure never
     // leaves a grant for an event that was never sent. Using a
     // one-time grant consumes it, which is the revocation.
+    kitty.grants.revokeOneTime(ctx.alloc);
     try kitty.grants.grant(ctx.alloc, &otp, .read, true);
     errdefer _ = kitty.grants.use(ctx.alloc, &otp, .read);
 

@@ -67,8 +67,8 @@ manual_linefeed_mode: std.atomic.Value(bool) = .{ .raw = false },
 /// from the child process and calls callbacks in the stream handler.
 terminal_stream: StreamHandler.Stream,
 
-/// True when another terminal core owns protocol replies for this PTY.
-suppress_terminal_responses: bool,
+/// Which protocol replies this PTY's terminal core leaves to Ghostty.
+reply_policy: StreamHandler.ReplyPolicy,
 
 /// Last time the cursor was reset. This is used to prevent message
 /// flooding with cursor resets.
@@ -330,7 +330,7 @@ pub fn init(self: *Termio, alloc: Allocator, opts: termio.Options) !void {
         .clipboard_write_limit = opts.config.clipboard_write_limit,
         .enquiry_response = opts.config.enquiry_response,
         .xt_checksum_report = opts.config.xt_checksum_report,
-        .suppress_terminal_responses = opts.suppress_terminal_responses,
+        .reply_policy = opts.reply_policy,
     };
 
     const thread_enter_state = try ThreadEnterState.create(
@@ -354,7 +354,7 @@ pub fn init(self: *Termio, alloc: Allocator, opts: termio.Options) !void {
             .handler = handler,
         }),
         .thread_enter_state = thread_enter_state,
-        .suppress_terminal_responses = opts.suppress_terminal_responses,
+        .reply_policy = opts.reply_policy,
     };
 }
 
@@ -490,13 +490,13 @@ fn queueMessageManual(self: *Termio, msg: termio.Message) void {
         },
         .kitty_clipboard_grant_read => |v| {
             defer v.alloc.free(v.pw);
-            if (!self.suppress_terminal_responses) self.kittyClipboardGrant(v.pw, .read) catch |err| {
+            if (self.reply_policy.kitty_clipboard) self.kittyClipboardGrant(v.pw, .read) catch |err| {
                 log.warn("manual clipboard grant failed err={}", .{err});
             };
         },
         .kitty_clipboard_grant_write => |v| {
             defer v.alloc.free(v.pw);
-            if (!self.suppress_terminal_responses) self.kittyClipboardGrant(v.pw, .write) catch |err| {
+            if (self.reply_policy.kitty_clipboard) self.kittyClipboardGrant(v.pw, .write) catch |err| {
                 log.warn("manual clipboard grant failed err={}", .{err});
             };
         },
@@ -666,7 +666,7 @@ pub fn sizeReport(self: *Termio, td: *ThreadData, style: termio.Message.SizeRepo
 }
 
 fn sizeReportLocked(self: *Termio, td: *ThreadData, style: termio.Message.SizeReport) !void {
-    if (self.suppress_terminal_responses) return;
+    if (self.reply_policy.suppress) return;
     const grid_size = self.size.grid();
     const report_size: terminalpkg.size_report.Size = .{
         .rows = grid_size.rows,
@@ -770,7 +770,7 @@ pub fn focusGained(self: *Termio, td: *ThreadData, focused: bool) !void {
     self.renderer_state.mutex.unlock(global.io());
 
     // If we have focus events enabled, we send the focus event.
-    if (focus_event and !self.suppress_terminal_responses) {
+    if (focus_event and !self.reply_policy.suppress) {
         var buf: [terminalpkg.focus.max_encode_size]u8 = undefined;
         var writer: std.Io.Writer = .fixed(&buf);
         terminalpkg.focus.encode(&writer, if (focused) .gained else .lost) catch |err| {
@@ -790,7 +790,17 @@ pub fn restoreOutput(self: *Termio, buf: []const u8) void {
     self.terminal_stream.resetParser();
     self.terminal_stream.handler.restoring = true;
     defer self.terminal_stream.handler.restoring = false;
+    self.terminal_stream.handler.kittyClipboardWriteAbort();
     self.processOutputLocked(buf);
+
+    // A replayed OSC that may still become a Kitty clipboard packet must
+    // not be finished by live output. Other partial OSCs, such as OSC 52,
+    // deliberately complete live.
+    const parser = &self.terminal_stream.parser;
+    if (parser.state == .osc_string) switch (parser.osc_parser.state) {
+        .@"5", .@"55", .@"552", .@"5522" => self.terminal_stream.resetParser(),
+        else => {},
+    };
 }
 
 /// Process output from the pty. This is the manual API that users can
@@ -877,7 +887,7 @@ pub fn colorSchemeReport(self: *Termio, td: *ThreadData, force: bool) !void {
 }
 
 pub fn colorSchemeReportLocked(self: *Termio, td: *ThreadData, force: bool) !void {
-    if (self.suppress_terminal_responses) return;
+    if (self.reply_policy.suppress) return;
     if (!force and !self.renderer_state.terminal.modes.get(.report_color_scheme)) {
         return;
     }
@@ -900,7 +910,7 @@ pub fn visibilityReport(
     visible: bool,
     force: bool,
 ) !void {
-    if (self.suppress_terminal_responses) return;
+    if (self.reply_policy.suppress) return;
     self.renderer_state.mutex.lockUncancelable(global.io());
     defer self.renderer_state.mutex.unlock(global.io());
 
@@ -977,7 +987,7 @@ test "manual process_output parses split UTF-8 and resizes inline" {
         .size = size,
         .config = try DerivedConfig.init(testing.allocator, &config),
         .backend = .{ .manual = try .init(testing.allocator, .{}) },
-        .suppress_terminal_responses = true,
+        .reply_policy = .{ .suppress = true, .kitty_clipboard = false },
         .mailbox = try termio.Mailbox.initSPSC(testing.allocator),
         .renderer_state = &state,
         .renderer_wakeup = wakeup,
@@ -997,7 +1007,7 @@ test "manual process_output parses split UTF-8 and resizes inline" {
             .clipboard_write_limit = 1024,
             .enquiry_response = "",
             .xt_checksum_report = false,
-            .suppress_terminal_responses = true,
+            .reply_policy = .{ .suppress = true, .kitty_clipboard = false },
         } }),
     };
     defer io.deinit();
@@ -1006,12 +1016,12 @@ test "manual process_output parses split UTF-8 and resizes inline" {
     const cell = io.terminal.screens.active.pages.getCell(.{ .active = .{} }).?.cell;
     try testing.expectEqual(@as(u21, 0x3bb), cell.codepoint());
     try testing.expect(io.mailbox.spsc.queue.pop(testing.io) == null);
-    io.terminal_stream.handler.suppress_terminal_responses = false;
+    io.terminal_stream.handler.reply_policy = .{};
     io.processOutput("\x1b[6n");
     const reply = io.mailbox.spsc.queue.pop(testing.io).?;
     defer reply.deinit();
     try testing.expectEqual(std.meta.Tag(termio.Message).write_small, std.meta.activeTag(reply));
-    io.terminal_stream.handler.suppress_terminal_responses = true;
+    io.terminal_stream.handler.reply_policy = .{ .suppress = true, .kitty_clipboard = false };
     try testing.expectEqual(termio.backend.Kind.manual, std.meta.activeTag(io.backend));
     var resized = size;
     resized.screen = .{ .width = 160, .height = 96 };
@@ -1020,7 +1030,7 @@ test "manual process_output parses split UTF-8 and resizes inline" {
     try testing.expectEqual(@as(u16, 6), io.terminal.rows);
     try testing.expect(io.terminal_stream.handler.kitty_clipboard_write == null);
     io.terminal_stream.handler.clipboard_write = .allow;
-    io.terminal_stream.handler.suppress_terminal_responses = false;
+    io.terminal_stream.handler.reply_policy = .{};
     io.processOutput("\x1b]52;c;unfinished");
     io.restoreOutput("\x1b[2J\x1b[Hrestored\x1b[6n\x1b]52;c;aGVsbG8=\x1b\\\x1b]2;title\x1b\\\x07\x1b]5522;type=read;\x1b\\");
     try testing.expect(!io.terminal_stream.handler.restoring);
@@ -1049,4 +1059,115 @@ test "manual process_output parses split UTF-8 and resizes inline" {
     try testing.expectEqual(std.math.maxInt(usize), pages.limits.max(.bytes));
     try testing.expectEqual(std.math.maxInt(usize), pages.limits.max(.lines));
     while (io.mailbox.spsc.queue.pop(testing.io)) |message| message.deinit();
+}
+
+test "restore drops an in-flight Kitty clipboard write so replayed data never commits" {
+    const testing = std.testing;
+    var config = try configpkg.Config.default(testing.allocator);
+    defer config.deinit();
+    var io: Termio = undefined;
+    var mutex: std.Io.Mutex = .init;
+    var state: renderer.State = .{ .mutex = &mutex, .terminal = &io.terminal };
+    var wakeup = try xev.Async.init();
+    defer wakeup.deinit();
+    const render_mailbox = try renderer.Thread.Mailbox.create(testing.allocator);
+    defer render_mailbox.destroy(testing.allocator);
+    var app: apprt.App = undefined;
+    var surface: @import("../Surface.zig") = undefined;
+    var queue: @import("../App.zig").Mailbox.Queue = .{};
+    defer while (queue.pop(testing.io)) |message| message.surface_message.message.deinit();
+    const policy: StreamHandler.ReplyPolicy = .{ .suppress = true, .kitty_clipboard = true };
+    io = .{
+        .alloc = testing.allocator,
+        .terminal = try terminalpkg.Terminal.init(testing.io, testing.allocator, .{ .cols = 10, .rows = 3 }),
+        .size = .{ .screen = .{ .width = 80, .height = 48 }, .cell = .{ .width = 8, .height = 16 }, .padding = .{} },
+        .config = try DerivedConfig.init(testing.allocator, &config),
+        .backend = .{ .manual = try .init(testing.allocator, .{}) },
+        .reply_policy = policy,
+        .mailbox = try termio.Mailbox.initSPSC(testing.allocator),
+        .renderer_state = &state,
+        .renderer_wakeup = wakeup,
+        .renderer_mailbox = render_mailbox,
+        .surface_mailbox = undefined,
+        .terminal_stream = .init(.{ .allocator = testing.allocator, .handler = .{
+            .alloc = testing.allocator,
+            .terminal = &io.terminal,
+            .size = &io.size,
+            .renderer_state = &state,
+            .renderer_wakeup = wakeup,
+            .renderer_mailbox = render_mailbox,
+            .surface_mailbox = .{ .surface = &surface, .app = .{ .rt_app = &app, .mailbox = &queue } },
+            .termio_mailbox = &io.mailbox,
+            .osc_color_report_format = config.@"osc-color-report-format",
+            .clipboard_write = .allow,
+            .clipboard_write_limit = 1024,
+            .enquiry_response = "",
+            .xt_checksum_report = false,
+            .reply_policy = policy,
+        } }),
+    };
+    defer io.deinit();
+    io.processOutput("\x1b]5522;type=write\x1b\\");
+    io.restoreOutput("\x1b]5522;type=wdata:mime=dGV4dC9wbGFpbg==;aGVsbG8=\x1b\\");
+    io.processOutput("\x1b]5522;type=wdata\x1b\\");
+    try testing.expect(io.terminal_stream.handler.kitty_clipboard_write == null);
+    try testing.expectEqual(@as(u32, 0), queue.len);
+
+    io.restoreOutput("\x1b]5522;type=write\x1b\\\x1b]5522;type=wdata:mime=dGV4dC9wbGFpbg==;aGVsbG8=\x1b\\");
+    io.processOutput("\x1b]5522;type=wdata\x1b\\");
+    try testing.expect(io.terminal_stream.handler.kitty_clipboard_write == null);
+    try testing.expectEqual(@as(u32, 0), queue.len);
+}
+
+test "a Kitty clipboard read cut by the end of a replay is not finished live" {
+    const testing = std.testing;
+    var config = try configpkg.Config.default(testing.allocator);
+    defer config.deinit();
+    var io: Termio = undefined;
+    var mutex: std.Io.Mutex = .init;
+    var state: renderer.State = .{ .mutex = &mutex, .terminal = &io.terminal };
+    var wakeup = try xev.Async.init();
+    defer wakeup.deinit();
+    const render_mailbox = try renderer.Thread.Mailbox.create(testing.allocator);
+    defer render_mailbox.destroy(testing.allocator);
+    var app: apprt.App = undefined;
+    var surface: @import("../Surface.zig") = undefined;
+    var queue: @import("../App.zig").Mailbox.Queue = .{};
+    defer while (queue.pop(testing.io)) |message| message.surface_message.message.deinit();
+    const policy: StreamHandler.ReplyPolicy = .{ .suppress = true, .kitty_clipboard = true };
+    io = .{
+        .alloc = testing.allocator,
+        .terminal = try terminalpkg.Terminal.init(testing.io, testing.allocator, .{ .cols = 10, .rows = 3 }),
+        .size = .{ .screen = .{ .width = 80, .height = 48 }, .cell = .{ .width = 8, .height = 16 }, .padding = .{} },
+        .config = try DerivedConfig.init(testing.allocator, &config),
+        .backend = .{ .manual = try .init(testing.allocator, .{}) },
+        .reply_policy = policy,
+        .mailbox = try termio.Mailbox.initSPSC(testing.allocator),
+        .renderer_state = &state,
+        .renderer_wakeup = wakeup,
+        .renderer_mailbox = render_mailbox,
+        .surface_mailbox = undefined,
+        .terminal_stream = .init(.{ .allocator = testing.allocator, .handler = .{
+            .alloc = testing.allocator,
+            .terminal = &io.terminal,
+            .size = &io.size,
+            .renderer_state = &state,
+            .renderer_wakeup = wakeup,
+            .renderer_mailbox = render_mailbox,
+            .surface_mailbox = .{ .surface = &surface, .app = .{ .rt_app = &app, .mailbox = &queue } },
+            .termio_mailbox = &io.mailbox,
+            .osc_color_report_format = config.@"osc-color-report-format",
+            .clipboard_write = .allow,
+            .clipboard_write_limit = 1024,
+            .enquiry_response = "",
+            .xt_checksum_report = false,
+            .reply_policy = policy,
+        } }),
+    };
+    defer io.deinit();
+    io.restoreOutput("\x1b]5522;type=read;aW1h");
+    io.processOutput("Z2UvcG5n\x1b\\");
+    try testing.expectEqual(@as(u32, 0), queue.len);
+    io.processOutput("\x1b]5522;type=read;aW1hZ2UvcG5n\x1b\\");
+    try testing.expectEqual(@as(u32, 1), queue.len);
 }
