@@ -1059,14 +1059,25 @@ pub const SearchTotal = struct {
 pub const SearchSelected = struct {
     selected: ?usize,
 
+    /// The screen point of the selected match's first cell, where row 0
+    /// is the first loaded row, as of the event.
+    start: ?terminal.point.Coordinate,
+
     // Sync with: ghostty_action_search_selected_s
     pub const C = extern struct {
         selected: isize,
+        has_start: bool,
+        start_x: u32,
+        start_y: u32,
     };
 
     pub fn cval(self: SearchSelected) C {
+        const start = self.start orelse terminal.point.Coordinate{};
         return .{
             .selected = if (self.selected) |s| @intCast(s) else -1,
+            .has_start = self.start != null,
+            .start_x = start.x,
+            .start_y = start.y,
         };
     }
 };
