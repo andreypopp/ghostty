@@ -1395,6 +1395,17 @@ GHOSTTY_API bool ghostty_clipboard_request_granted(const void*);
 // Consumes a started request without a PTY reply; the pointer is invalid afterward.
 GHOSTTY_API void ghostty_surface_cancel_clipboard_request(ghostty_surface_t, void*);
 GHOSTTY_API bool ghostty_surface_has_selection(ghostty_surface_t);
+// Selection points are exact screen coordinates: row zero is the first loaded
+// history row (or the first active row when there is no history). NULL clears.
+// Call on the main/UI thread. Invalid input returns false without a change.
+// The selection_changed action is sent synchronously with the renderer mutex
+// held; its callback must not re-enter selection or read APIs.
+GHOSTTY_API bool ghostty_surface_set_selection(ghostty_surface_t,
+                                            const ghostty_selection_s*);
+// Call on the main/UI thread. Returns false if there is no selection.
+// Returns raw endpoints, which may be reversed (start after end).
+GHOSTTY_API bool ghostty_surface_selection(ghostty_surface_t,
+                                        ghostty_selection_s*);
 GHOSTTY_API bool ghostty_surface_read_selection(ghostty_surface_t, ghostty_text_s*);
 GHOSTTY_API bool ghostty_surface_read_text(ghostty_surface_t,
                                               ghostty_selection_s,
