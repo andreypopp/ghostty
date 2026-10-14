@@ -125,6 +125,13 @@ typedef enum {
   GHOSTTY_CLIPBOARD_READ_UNSUPPORTED,
 } ghostty_clipboard_read_result_e;
 
+// The embedder's answer to a clipboard write.
+typedef enum {
+  GHOSTTY_CLIPBOARD_WRITE_OK,
+  GHOSTTY_CLIPBOARD_WRITE_EINVAL,
+  GHOSTTY_CLIPBOARD_WRITE_EIO,
+} ghostty_clipboard_write_result_e;
+
 typedef enum {
   GHOSTTY_MOUSE_RELEASE,
   GHOSTTY_MOUSE_PRESS,
@@ -534,6 +541,9 @@ typedef struct {
   ghostty_surface_io_mode_e io_mode;
   ghostty_io_write_cb io_write_cb;
   void* io_write_userdata;
+  // A MANUAL_MIRROR surface still answers the Kitty clipboard protocol
+  // (OSC 5522) through the clipboard callbacks.
+  bool kitty_clipboard;
 } ghostty_surface_config_s;
 
 typedef struct {
@@ -1096,11 +1106,12 @@ typedef void (*ghostty_runtime_confirm_read_clipboard_cb)(
     const ghostty_clipboard_confirm_s*,
     void*,
     ghostty_clipboard_request_e);
-typedef void (*ghostty_runtime_write_clipboard_cb)(void*,
-                                                   ghostty_clipboard_e,
-                                                   const ghostty_clipboard_content_s*,
-                                                   size_t,
-                                                   bool);
+typedef ghostty_clipboard_write_result_e (*ghostty_runtime_write_clipboard_cb)(
+    void*,
+    ghostty_clipboard_e,
+    const ghostty_clipboard_content_s*,
+    size_t,
+    bool);
 typedef void (*ghostty_runtime_close_surface_cb)(void*, bool);
 typedef bool (*ghostty_runtime_action_cb)(ghostty_app_t,
                                           ghostty_target_s,
@@ -1350,6 +1361,9 @@ GHOSTTY_API void ghostty_surface_complete_clipboard_request(
 GHOSTTY_API void ghostty_surface_deny_clipboard_request(ghostty_surface_t,
                                                            void*);
 GHOSTTY_API ghostty_clipboard_request_e ghostty_clipboard_request_kind(const void*);
+// Whether a session grant, such as a paste event's one-time password,
+// authorized the request without a prompt.
+GHOSTTY_API bool ghostty_clipboard_request_granted(const void*);
 // Consumes a started request without a PTY reply; the pointer is invalid afterward.
 GHOSTTY_API void ghostty_surface_cancel_clipboard_request(ghostty_surface_t, void*);
 GHOSTTY_API bool ghostty_surface_has_selection(ghostty_surface_t);

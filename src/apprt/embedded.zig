@@ -16,6 +16,7 @@ const input = @import("../input.zig");
 const internal_os = @import("../os/main.zig");
 const renderer = @import("../renderer.zig");
 const terminal = @import("../terminal/main.zig");
+const termio = @import("../termio.zig");
 const CoreApp = @import("../App.zig");
 const CoreInspector = @import("../inspector/main.zig").Inspector;
 const CoreSurface = @import("../Surface.zig");
@@ -87,18 +88,22 @@ pub const App = struct {
             apprt.ClipboardRequestType,
         ) callconv(.c) void,
 
-        /// Write the clipboard value.
+        /// Write the clipboard value, reporting whether the embedder
+        /// rejected a representation or failed to write.
         write_clipboard: *const fn (
             SurfaceUD,
             c_int,
             [*]const CAPI.ClipboardContent,
             usize,
             bool,
-        ) callconv(.c) void,
+        ) callconv(.c) ClipboardWriteResult,
 
         /// Close the current surface given by this function.
         close_surface: ?*const fn (SurfaceUD, bool) callconv(.c) void = null,
     };
+
+    /// C type: ghostty_clipboard_write_result_e
+    pub const ClipboardWriteResult = enum(c_int) { ok, einval, eio };
 
     /// This is the key event sent for ghostty_surface_key and
     /// ghostty_app_key.
@@ -472,6 +477,7 @@ pub const Surface = struct {
     io_mode: IoMode = .exec,
     io_write_cb: ?IoWriteCallback = null,
     io_write_userdata: ?*anyopaque = null,
+    kitty_clipboard: bool = false,
 
     font_size_action_cb: ?FontSizeActionCallback = null,
     font_size_action_userdata: ?*anyopaque = null,
@@ -534,6 +540,10 @@ pub const Surface = struct {
 
         /// Userdata passed to io_write_cb.
         io_write_userdata: ?*anyopaque = null,
+
+        /// Whether a manual mirror still answers the Kitty clipboard
+        /// protocol (OSC 5522) through the embedder.
+        kitty_clipboard: bool = false,
     };
 
     pub fn init(self: *Surface, app: *App, opts: Options) !void {
@@ -551,6 +561,7 @@ pub const Surface = struct {
             .io_mode = opts.io_mode,
             .io_write_cb = opts.io_write_cb,
             .io_write_userdata = opts.io_write_userdata,
+            .kitty_clipboard = opts.kitty_clipboard,
         };
 
         // Add ourselves to the list of surfaces on the app.
@@ -745,8 +756,9 @@ pub const Surface = struct {
         );
     }
 
-    pub fn suppressTerminalResponses(self: *const Surface) bool {
-        return self.io_mode.suppressesTerminalResponses();
+    pub fn replyPolicy(self: *const Surface) termio.StreamHandler.ReplyPolicy {
+        const suppress = self.io_mode.suppressesTerminalResponses();
+        return .{ .suppress = suppress, .kitty_clipboard = !suppress or self.kitty_clipboard };
     }
 
     pub fn usesManualIo(self: *const Surface) bool {
@@ -1051,13 +1063,17 @@ pub const Surface = struct {
             };
         }
 
-        self.app.opts.write_clipboard(
+        switch (self.app.opts.write_clipboard(
             self.userdata,
             @intCast(@backingInt(clipboard_type)),
             array.ptr,
             array.len,
             confirm,
-        );
+        )) {
+            .ok => {},
+            .einval => return error.InvalidRepresentation,
+            .eio => return error.WriteFailed,
+        }
     }
 
     pub fn getCursorPos(self: *const Surface) !apprt.CursorPos {
@@ -1318,6 +1334,7 @@ pub const Surface = struct {
             .io_mode = self.io_mode,
             .io_write_cb = self.io_write_cb,
             .io_write_userdata = self.io_write_userdata,
+            .kitty_clipboard = self.kitty_clipboard,
         };
     }
 
@@ -2622,6 +2639,10 @@ pub const CAPI = struct {
 
     export fn ghostty_clipboard_request_kind(state: *const apprt.ClipboardRequest) c_int {
         return @intCast(@intFromEnum(std.meta.activeTag(state.*)));
+    }
+
+    export fn ghostty_clipboard_request_granted(state: *const apprt.ClipboardRequest) bool {
+        return state.granted();
     }
 
     export fn ghostty_surface_cancel_clipboard_request(ptr: *Surface, state: *apprt.ClipboardRequest) void {

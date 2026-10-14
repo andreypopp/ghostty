@@ -95,6 +95,17 @@ pub const Grants = struct {
         return allowed;
     }
 
+    /// Drop every one-time grant, so only the newest paste event's
+    /// password can read.
+    pub fn revokeOneTime(self: *Grants, alloc: Allocator) void {
+        var i: usize = 0;
+        while (i < self.entries.items.len) {
+            if (self.entries.items[i].one_time) {
+                alloc.free(self.entries.swapRemove(i).pw);
+            } else i += 1;
+        }
+    }
+
     fn findIndex(self: *const Grants, pw: []const u8) ?usize {
         for (self.entries.items, 0..) |*entry, idx| {
             if (std.mem.eql(u8, entry.pw, pw)) return idx;
