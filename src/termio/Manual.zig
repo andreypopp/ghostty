@@ -157,4 +157,5 @@ test "manual mirror IO mode distinguishes transport and response ownership" {
 
 test {
     _ = @import("../apprt/embedded_grid.zig");
+    _ = @import("../apprt/embedded_selection.zig");
 }
