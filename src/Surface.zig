@@ -797,10 +797,10 @@ pub fn init(
             .full_config = config,
             .config = io_config,
             .backend = io_backend,
-            .suppress_terminal_responses = if (comptime @hasDecl(apprt.runtime.Surface, "usesManualIo"))
-                rt_surface.suppressTerminalResponses()
+            .reply_policy = if (comptime @hasDecl(apprt.runtime.Surface, "usesManualIo"))
+                rt_surface.replyPolicy()
             else
-                false,
+                .{},
             .mailbox = io_mailbox,
             .renderer_state = &self.renderer_state,
             .renderer_wakeup = self.renderer_thread.wakeup,
@@ -1208,6 +1208,11 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
         .kitty_clipboard_read => |req| try self.kittyClipboardRead(req),
 
         .kitty_clipboard_write => |req| try self.kittyClipboardWrite(req),
+
+        .kitty_clipboard_status => |v| {
+            defer v.id.deinit();
+            try self.kittyClipboardStatus(.write, v.id.slice(), v.terminator, v.status);
+        },
 
         .clipboard_write => |w| switch (w.req) {
             .small => |v| try self.clipboardWrite(v.data[0..v.len], w.clipboard_type),
@@ -6551,7 +6556,7 @@ pub fn completeClipboardRequest(
                     .write,
                     kitty.id,
                     kitty.terminator,
-                    .EIO,
+                    if (@as(anyerror, err) == error.InvalidRepresentation) .EINVAL else .EIO,
                 );
                 return;
             };
