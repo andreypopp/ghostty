@@ -45,6 +45,7 @@ pub const App = struct {
 
         /// True if the selection clipboard is supported.
         supports_selection_clipboard: bool = false,
+        supports_paste_events: bool = true,
 
         /// Callback called to wakeup the event loop. This should trigger
         /// a full tick of the app loop.
@@ -769,6 +770,10 @@ pub const Surface = struct {
 
     pub fn getTitle(self: *Surface) ?[:0]const u8 {
         return self.title;
+    }
+
+    pub fn supportsPasteEvents(self: *const Surface) bool {
+        return self.app.opts.supports_paste_events;
     }
 
     pub fn supportsClipboard(
