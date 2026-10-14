@@ -6636,6 +6636,12 @@ fn startClipboardRequest(
 ) !apprt.ClipboardReadResult {
     const effective_req: apprt.ClipboardRequest = switch (req) {
         .paste => |clipboard| effective: {
+            const supported = if (@hasDecl(apprt.Surface, "supportsPasteEvents"))
+                self.rt_surface.supportsPasteEvents()
+            else
+                true;
+            if (!supported) break :effective req;
+
             // Snapshot the mode before asking the apprt for clipboard data.
             // Event pastes request only a MIME listing, while ordinary
             // pastes request the text representation as before.

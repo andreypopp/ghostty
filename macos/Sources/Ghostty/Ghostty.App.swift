@@ -58,6 +58,7 @@ extension Ghostty {
             var runtime_cfg = ghostty_runtime_config_s(
                 userdata: Unmanaged.passUnretained(self).toOpaque(),
                 supports_selection_clipboard: true,
+                supports_paste_events: true,
                 wakeup_cb: { userdata in App.wakeup(userdata) },
                 action_cb: { app, target, action in App.action(app!, target: target, action: action) },
                 read_clipboard_cb: { userdata, loc, state, mimes, mimesLen, list in

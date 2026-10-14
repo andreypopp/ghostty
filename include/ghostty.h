@@ -1164,6 +1164,7 @@ typedef struct {
 typedef struct {
   void* userdata;
   bool supports_selection_clipboard;
+  bool supports_paste_events;
   ghostty_runtime_wakeup_cb wakeup_cb;
   ghostty_runtime_action_cb action_cb;
   ghostty_runtime_read_clipboard_cb read_clipboard_cb;
