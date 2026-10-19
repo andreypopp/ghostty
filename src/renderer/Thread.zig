@@ -305,16 +305,6 @@ fn threadMain_(self: *Thread) !void {
     // Send an initial wakeup message so that we render right away.
     try self.wakeup.notify();
 
-    // Start blinking the cursor.
-    self.cursor_h.run(
-        &self.loop,
-        &self.cursor_c,
-        cursorBlinkInterval(),
-        Thread,
-        self,
-        cursorTimerCallback,
-    );
-
     // Arm the animation timer in case the renderer already needs
     // animation wakes (e.g. custom shaders loaded at startup).
     self.armAnimationTimer();
@@ -411,40 +401,13 @@ fn drainMailbox(self: *Thread) !void {
                 // the animation timer for the new state.
                 self.armAnimationTimer();
 
-                if (!v) {
-                    // If we're not focused, then we stop the cursor blink
-                    if (self.cursor_c.state() == .active and
-                        self.cursor_c_cancel.state() == .dead)
-                    {
-                        self.cursor_h.cancel(
-                            &self.loop,
-                            &self.cursor_c,
-                            &self.cursor_c_cancel,
-                            void,
-                            null,
-                            timerCancelCallback,
-                        );
-                    }
-                } else {
-                    // If we're focused, we immediately show the cursor again
-                    // and then restart the timer.
-                    if (self.cursor_c.state() != .active) {
-                        self.flags.cursor_blink_visible = true;
-                        self.cursor_h.run(
-                            &self.loop,
-                            &self.cursor_c,
-                            cursorBlinkInterval(),
-                            Thread,
-                            self,
-                            cursorTimerCallback,
-                        );
-                    }
-                }
+                if (v) self.flags.cursor_blink_visible = true;
+                self.syncCursorTimer();
             },
 
             .reset_cursor_blink => {
                 self.flags.cursor_blink_visible = true;
-                if (self.cursor_c.state() == .active) {
+                if (self.cursorBlinking() and self.cursor_c.state() == .active) {
                     self.cursor_h.reset(
                         &self.loop,
                         &self.cursor_c,
@@ -652,6 +615,8 @@ fn renderCallback(
     ) catch |err|
         log.warn("error rendering err={}", .{err});
 
+    t.syncCursorTimer();
+
     // Draw
     t.drawFrame(false);
 
@@ -761,6 +726,8 @@ fn cursorTimerCallback(
         return .disarm;
     };
 
+    if (!t.cursorBlinking()) return .disarm;
+
     t.flags.cursor_blink_visible = !t.flags.cursor_blink_visible;
     t.wakeup.notify() catch {};
 
@@ -816,6 +783,28 @@ fn stopCallback(
     _ = r catch unreachable;
     self_.?.loop.stop();
     return .disarm;
+}
+
+/// Start the cursor blink timer when the focused terminal blinks its cursor.
+/// The timer disarms itself when it is no longer wanted, so focus and mode
+/// changes never cancel a timer that a later start could race.
+fn syncCursorTimer(self: *Thread) void {
+    if (!self.cursorBlinking()) return;
+    if (self.cursor_c.state() == .active) return;
+    self.cursor_h.run(
+        &self.loop,
+        &self.cursor_c,
+        cursorBlinkInterval(),
+        Thread,
+        self,
+        cursorTimerCallback,
+    );
+}
+
+/// Whether the focused renderer snapshot blinks the cursor. Every frame
+/// refreshes the snapshot, and a mode or config change produces a frame.
+fn cursorBlinking(self: *Thread) bool {
+    return self.flags.focused and self.renderer.terminal_state.cursor.blinking;
 }
 
 /// Returns the interval for the blinking cursor in milliseconds.
