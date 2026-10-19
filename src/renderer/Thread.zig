@@ -863,21 +863,15 @@ const Compression = struct {
         if (comptime !terminalpkg.compression_enabled) return;
         if (!thread.config.scrollback_compression) return;
 
-        // PageList activity, rather than a generic renderer wake, restarts the
-        // idle interval. In particular, the inspector wakes the renderer every
-        // frame without changing terminal contents and must not starve this
-        // timer indefinitely.
+        // Keep an active deadline: resetting it wakes the timer on each
+        // viewport move. The callback checks activity before compressing.
+        if (self.completion.state() == .active) return;
+
         if (thread.state.mutex.tryLock()) {
             defer thread.state.mutex.unlock(global.io());
             const activity = thread.state.terminal.compressionActivity();
             if (self.activity == activity) return;
             self.activity = activity;
-        } else if (self.completion.state() == .active) {
-            // Contention doesn't prove that compression-relevant activity
-            // changed. Keep an existing deadline so frequent inspector frames
-            // cannot postpone compression forever. The timer rechecks both the
-            // activity token and lock availability before doing any work.
-            return;
         }
 
         // Contention may mean parsing is active. Scheduling is a harmless
