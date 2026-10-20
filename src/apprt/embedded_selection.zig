@@ -41,7 +41,10 @@ pub const Point = extern struct {
 
         // Clamp our point to the screen bounds.
         const clamped_x = @min(self.x, screen.pages.cols -| 1);
-        const clamped_y = @min(self.y, screen.pages.rows -| 1);
+        const clamped_y = switch (tag) {
+            .screen, .history => self.y,
+            .active, .viewport => @min(self.y, screen.pages.rows -| 1),
+        };
 
         return switch (self.coord_tag) {
             // Exact coordinates require a specific pin.
