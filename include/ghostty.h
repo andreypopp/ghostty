@@ -498,6 +498,18 @@ typedef struct {
 } ghostty_selection_s;
 
 typedef struct {
+  uint16_t x;
+  uint8_t width;
+  uint8_t bold;
+} ghostty_row_cell_s;
+
+typedef struct {
+  uint32_t text_len;
+  uint32_t cell_count;
+  bool wrapped;
+} ghostty_row_s;
+
+typedef struct {
   const char* key;
   const char* value;
 } ghostty_env_var_s;
@@ -1422,14 +1434,17 @@ GHOSTTY_API bool ghostty_surface_selection(ghostty_surface_t,
 // True if the row soft-wraps onto the next row; false if not or out of range.
 GHOSTTY_API bool ghostty_surface_row_wrapped(ghostty_surface_t, uint32_t y);
 // Call on the main/UI thread. Row y uses the selection's screen coordinates.
-// Writes 1 or 0 (SGR bold) per Unicode scalar of the text that
-// ghostty_surface_read_text returns for the full row. *count is always the
-// needed size; false if y is out of range or cap is too small.
-GHOSTTY_API bool ghostty_surface_read_row_bold(ghostty_surface_t,
-                                            uint32_t y,
-                                            uint8_t* bold,
-                                            uint32_t cap,
-                                            uint32_t* count);
+// Writes the UTF-8 text that ghostty_surface_read_text returns for the full row,
+// and for each Unicode scalar of it the cell column, the cell width and the bold
+// flag. info is set whenever the row exists; the result is false when y is out
+// of range or a buffer is too small (info then holds the needed sizes).
+GHOSTTY_API bool ghostty_surface_read_row(ghostty_surface_t,
+                                       uint32_t y,
+                                       char* text,
+                                       uint32_t text_cap,
+                                       ghostty_row_cell_s* cells,
+                                       uint32_t cell_cap,
+                                       ghostty_row_s* info);
 // Call on the main/UI thread. Moves an exact screen point within the loaded
 // rows without changing any state; false for an invalid point or motion.
 GHOSTTY_API bool ghostty_surface_move_point(ghostty_surface_t,

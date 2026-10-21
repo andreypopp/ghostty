@@ -113,23 +113,56 @@ pub fn rowWrapped(screen: *const terminal.Screen, y: u32) bool {
     return pin.rowAndCell().row.wrap;
 }
 
-pub fn rowBold(alloc: std.mem.Allocator, screen: *terminal.Screen, y: u32, bold: []u8, count: *u32) bool {
+/// ghostty_row_cell_s
+pub const RowCell = extern struct {
+    x: u16,
+    width: u8,
+    bold: u8,
+};
+
+/// ghostty_row_s
+pub const RowInfo = extern struct {
+    text_len: u32,
+    cell_count: u32,
+    wrapped: bool,
+};
+
+/// The full row as ghostty_surface_read_text gives it, with the cell of each Unicode scalar.
+/// `info` is set whenever the row exists; the result is false when a buffer is too small.
+pub fn readRow(
+    alloc: std.mem.Allocator,
+    screen: *terminal.Screen,
+    y: u32,
+    text: []u8,
+    cells: []RowCell,
+    info: *RowInfo,
+) bool {
     const cols = screen.pages.cols;
     const tl = screen.pages.pin(.{ .screen = .{ .x = 0, .y = y } }) orelse return false;
     const br = screen.pages.pin(.{ .screen = .{ .x = cols - 1, .y = y } }) orelse return false;
     const map = screen.selectionStringMap(alloc, .{ .sel = .init(tl, br, false), .trim = false }) catch return false;
     defer map.deinit(alloc);
-    var n: u32 = 0;
+    var text_len: u32 = 0;
+    var count: u32 = 0;
     for (map.string, 0..) |byte, i| {
+        if (byte == '\n' or byte == '\r') break;
+        text_len += 1;
         if (byte & 0xC0 == 0x80) continue;
-        if (n < bold.len) {
+        if (count < cells.len) {
             const pin = map.map.get(i) orelse return false;
-            bold[n] = @intFromBool(pin.style(pin.rowAndCell().cell).flags.bold);
+            const cell = pin.rowAndCell().cell;
+            cells[count] = .{
+                .x = pin.x,
+                .width = if (cell.wide == .wide) 2 else 1,
+                .bold = @intFromBool(pin.style(cell).flags.bold),
+            };
         }
-        n += 1;
+        count += 1;
     }
-    count.* = n;
-    return n <= bold.len;
+    info.* = .{ .text_len = text_len, .cell_count = count, .wrapped = tl.rowAndCell().row.wrap };
+    if (text_len > text.len or count > cells.len) return false;
+    @memcpy(text[0..text_len], map.string[0..text_len]);
+    return true;
 }
 
 // ghostty_point_motion_e
@@ -305,9 +338,9 @@ test "embedded selection row wrapped" {
     try testing.expect(!rowWrapped(alternate, 5));
 }
 
-test "embedded selection row bold" {
+test "embedded selection read row" {
     const testing = std.testing;
-    var t = try terminal.Terminal.init(testing.io, testing.allocator, .{ .cols = 20, .rows = 2 });
+    var t = try terminal.Terminal.init(testing.io, testing.allocator, .{ .cols = 20, .rows = 3 });
     defer t.deinit(testing.allocator);
     try t.printString("ab ");
     try t.setAttribute(.{ .bold = {} });
@@ -315,24 +348,32 @@ test "embedded selection row bold" {
     try t.setAttribute(.{ .unset = {} });
     try t.printString(" 界😀e\u{301}x");
     const screen = t.screens.active;
-    var bold: [32]u8 = undefined;
-    var count: u32 = 0;
-    try testing.expect(rowBold(testing.allocator, screen, 0, &bold, &count));
-    const text = try screen.selectionString(testing.allocator, .{
-        .sel = .init(
-            screen.pages.pin(.{ .screen = .{ .x = 0, .y = 0 } }).?,
-            screen.pages.pin(.{ .screen = .{ .x = 19, .y = 0 } }).?,
-            false,
-        ),
-        .trim = false,
-    });
-    defer testing.allocator.free(text);
-    try testing.expectEqual(try std.unicode.utf8CountCodepoints(text), count);
-    try testing.expectEqualSlices(u8, &.{ 0, 0, 0, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0 }, bold[0..@min(count, 13)]);
-    var small: [2]u8 = undefined;
-    try testing.expect(!rowBold(testing.allocator, screen, 0, &small, &count));
-    try testing.expect(count > 2);
-    try testing.expect(!rowBold(testing.allocator, screen, 99, &bold, &count));
+    var text: [64]u8 = undefined;
+    var cells: [32]RowCell = undefined;
+    var info: RowInfo = undefined;
+    try testing.expect(readRow(testing.allocator, screen, 0, &text, &cells, &info));
+    try testing.expectEqualStrings("ab bold 界😀e\u{301}x", text[0..info.text_len]);
+    try testing.expect(!info.wrapped);
+    try testing.expectEqual(@as(u32, 13), info.cell_count);
+    const bold = [_]u8{ 0, 0, 0, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0 };
+    const x = [_]u16{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 12, 13 };
+    const width = [_]u8{ 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 1, 1, 1 };
+    for (0..13) |i| {
+        try testing.expectEqual(bold[i], cells[i].bold);
+        try testing.expectEqual(x[i], cells[i].x);
+        try testing.expectEqual(width[i], cells[i].width);
+    }
+    var small_text: [2]u8 = undefined;
+    try testing.expect(!readRow(testing.allocator, screen, 0, &small_text, &cells, &info));
+    try testing.expectEqual(@as(u32, 13), info.cell_count);
+    try testing.expect(info.text_len > 2);
+    var small_cells: [2]RowCell = undefined;
+    try testing.expect(!readRow(testing.allocator, screen, 0, &text, &small_cells, &info));
+    try testing.expectEqual(@as(u32, 13), info.cell_count);
+    try testing.expect(!readRow(testing.allocator, screen, 99, &text, &cells, &info));
+    try t.printString("\r\n12345678901234567890123");
+    try testing.expect(readRow(testing.allocator, screen, 1, &text, &cells, &info));
+    try testing.expect(info.wrapped);
 }
 
 test "embedded selection strict round trip" {
