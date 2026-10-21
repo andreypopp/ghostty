@@ -1421,6 +1421,15 @@ GHOSTTY_API bool ghostty_surface_selection(ghostty_surface_t,
 // Call on the main/UI thread. Row y uses the selection's screen coordinates.
 // True if the row soft-wraps onto the next row; false if not or out of range.
 GHOSTTY_API bool ghostty_surface_row_wrapped(ghostty_surface_t, uint32_t y);
+// Call on the main/UI thread. Row y uses the selection's screen coordinates.
+// Writes 1 or 0 (SGR bold) per Unicode scalar of the text that
+// ghostty_surface_read_text returns for the full row. *count is always the
+// needed size; false if y is out of range or cap is too small.
+GHOSTTY_API bool ghostty_surface_read_row_bold(ghostty_surface_t,
+                                            uint32_t y,
+                                            uint8_t* bold,
+                                            uint32_t cap,
+                                            uint32_t* count);
 // Call on the main/UI thread. Moves an exact screen point within the loaded
 // rows without changing any state; false for an invalid point or motion.
 GHOSTTY_API bool ghostty_surface_move_point(ghostty_surface_t,

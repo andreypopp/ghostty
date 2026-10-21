@@ -113,6 +113,25 @@ pub fn rowWrapped(screen: *const terminal.Screen, y: u32) bool {
     return pin.rowAndCell().row.wrap;
 }
 
+pub fn rowBold(alloc: std.mem.Allocator, screen: *terminal.Screen, y: u32, bold: []u8, count: *u32) bool {
+    const cols = screen.pages.cols;
+    const tl = screen.pages.pin(.{ .screen = .{ .x = 0, .y = y } }) orelse return false;
+    const br = screen.pages.pin(.{ .screen = .{ .x = cols - 1, .y = y } }) orelse return false;
+    const map = screen.selectionStringMap(alloc, .{ .sel = .init(tl, br, false), .trim = false }) catch return false;
+    defer map.deinit(alloc);
+    var n: u32 = 0;
+    for (map.string, 0..) |byte, i| {
+        if (byte & 0xC0 == 0x80) continue;
+        if (n < bold.len) {
+            const pin = map.map.get(i) orelse return false;
+            bold[n] = @intFromBool(pin.style(pin.rowAndCell().cell).flags.bold);
+        }
+        n += 1;
+    }
+    count.* = n;
+    return n <= bold.len;
+}
+
 // ghostty_point_motion_e
 pub const Motion = enum(c_int) {
     left = 0,
@@ -284,6 +303,36 @@ test "embedded selection row wrapped" {
     try testing.expect(!rowWrapped(alternate, 1));
     try testing.expect(!rowWrapped(alternate, 3));
     try testing.expect(!rowWrapped(alternate, 5));
+}
+
+test "embedded selection row bold" {
+    const testing = std.testing;
+    var t = try terminal.Terminal.init(testing.io, testing.allocator, .{ .cols = 20, .rows = 2 });
+    defer t.deinit(testing.allocator);
+    try t.printString("ab ");
+    try t.setAttribute(.{ .bold = {} });
+    try t.printString("bold");
+    try t.setAttribute(.{ .unset = {} });
+    try t.printString(" 界😀e\u{301}x");
+    const screen = t.screens.active;
+    var bold: [32]u8 = undefined;
+    var count: u32 = 0;
+    try testing.expect(rowBold(testing.allocator, screen, 0, &bold, &count));
+    const text = try screen.selectionString(testing.allocator, .{
+        .sel = .init(
+            screen.pages.pin(.{ .screen = .{ .x = 0, .y = 0 } }).?,
+            screen.pages.pin(.{ .screen = .{ .x = 19, .y = 0 } }).?,
+            false,
+        ),
+        .trim = false,
+    });
+    defer testing.allocator.free(text);
+    try testing.expectEqual(try std.unicode.utf8CountCodepoints(text), count);
+    try testing.expectEqualSlices(u8, &.{ 0, 0, 0, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0 }, bold[0..@min(count, 13)]);
+    var small: [2]u8 = undefined;
+    try testing.expect(!rowBold(testing.allocator, screen, 0, &small, &count));
+    try testing.expect(count > 2);
+    try testing.expect(!rowBold(testing.allocator, screen, 99, &bold, &count));
 }
 
 test "embedded selection strict round trip" {

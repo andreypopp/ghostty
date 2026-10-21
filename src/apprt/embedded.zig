@@ -1708,6 +1708,7 @@ pub const CAPI = struct {
 
     const Selection = @import("embedded_selection.zig").Selection;
     const rowWrapped = @import("embedded_selection.zig").rowWrapped;
+    const rowBold = @import("embedded_selection.zig").rowBold;
     const Point = @import("embedded_selection.zig").Point;
     const Motion = @import("embedded_selection.zig").Motion;
     const movePoint = @import("embedded_selection.zig").movePoint;
@@ -2063,6 +2064,13 @@ pub const CAPI = struct {
         core.renderer_state.mutex.lockUncancelable(global.io());
         defer core.renderer_state.mutex.unlock(global.io());
         return rowWrapped(core.io.terminal.screens.active, y);
+    }
+
+    export fn ghostty_surface_read_row_bold(surface: *Surface, y: u32, bold: [*]u8, cap: u32, count: *u32) bool {
+        const core = &surface.core_surface;
+        core.renderer_state.mutex.lockUncancelable(global.io());
+        defer core.renderer_state.mutex.unlock(global.io());
+        return rowBold(global.alloc(), core.io.terminal.screens.active, y, bold[0..cap], count);
     }
 
     export fn ghostty_surface_move_point(surface: *Surface, point: Point, motion_raw: c_int, result: *Point) bool {
