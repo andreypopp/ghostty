@@ -28,6 +28,18 @@ pub fn execute(
     terminal: *Terminal,
     cmd: *const Command,
 ) ?Response {
+    return executeRestoring(io, alloc, terminal, cmd, false);
+}
+
+pub fn executeRestoring(
+    io: std.Io,
+    alloc: Allocator,
+    terminal: *Terminal,
+    cmd: *const Command,
+    restoring: bool,
+) ?Response {
+    _ = restoring;
+
     // If storage is disabled then we disable the full protocol. This means
     // we don't even respond to queries so the terminal completely acts as
     // if this feature is not supported.
@@ -398,7 +410,7 @@ fn display(
     // like kitty.
     switch (p.location) {
         .virtual, .relative => {},
-        .pin => |pin| switch (d.cursor_movement) {
+        .pin => |pin| if (!img.data.isPending()) switch (d.cursor_movement) {
             .none => {},
             .after => {
                 // We use terminal.index to properly handle scroll regions.

@@ -159,6 +159,7 @@ pub const Handler = struct {
     /// Empty names and names longer than `max_terminfo_name_bytes` are
     /// silently ignored.
     terminfo_name: ?[]const u8 = null,
+    restoring: bool = false,
 
     /// Maximum byte length accepted for `terminfo_name`.
     pub const max_terminfo_name_bytes = 128;
@@ -2308,6 +2309,7 @@ pub const Handler = struct {
                     io,
                     alloc,
                     kitty_cmd,
+                    self.restoring,
                 )) |resp| resp: {
                     // Don't waste time encoding if we can't write responses
                     // anyways.
