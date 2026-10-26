@@ -461,7 +461,8 @@ pub const State = struct {
         // For animated images this is the current animation frame;
         // the image generation changes whenever the current frame
         // does, so the upload cache stays coherent.
-        const data = image.renderData().bytes() orelse unreachable;
+        const source = image.renderData();
+        const data = source.bytes() orelse unreachable;
         try self.prepImage(
             alloc,
             .{ .kitty = image.id },
@@ -480,7 +481,10 @@ pub const State = struct {
                 // constCasts are always gross but this one is safe is because
                 // the data is only read from here and copied into its own
                 // buffer.
-                .data = @constCast(data.ptr),
+                .data = switch (source) {
+                    .mapped => |mapping| .{ .mapped = mapping },
+                    else => .{ .owned = @constCast(data.ptr) },
+                },
             },
         );
     }
@@ -602,10 +606,20 @@ pub const Image = union(enum) {
         pixel_format: PixelFormat,
 
         /// Data is always expected to be (width * height * bpp).
-        data: [*]u8,
+        data: union(enum) { owned: [*]u8, mapped: *terminal.kitty.graphics.Image.Mapping },
 
         pub fn dataSlice(self: Pending) []u8 {
-            return self.data[0..self.len()];
+            return switch (self.data) {
+                .owned => |data| data[0..self.len()],
+                .mapped => |mapping| @constCast(mapping.bytes()),
+            };
+        }
+
+        fn deinit(self: Pending, alloc: Allocator) void {
+            switch (self.data) {
+                .owned => alloc.free(self.dataSlice()),
+                .mapped => |mapping| mapping.release(),
+            }
         }
 
         pub fn len(self: Pending) usize {
@@ -658,8 +672,8 @@ pub const Image = union(enum) {
                 .rgba => unreachable,
                 .bgra => wuffs.swizzle.bgraToRgba(alloc, data),
             };
-            alloc.free(data);
-            self.data = rgba.ptr;
+            self.deinit(alloc);
+            self.data = .{ .owned = rgba.ptr };
             self.pixel_format = .rgba;
         }
 
@@ -667,6 +681,12 @@ pub const Image = union(enum) {
         /// If the data is already owned, use `convertReplace()` to be a no-op for data already
         /// in a format that can be uploaded.
         fn convertCopy(self: *const Image.Pending, alloc: Allocator) wuffs.Error!Image {
+            if (self.data == .mapped) {
+                assert(self.pixel_format == .rgba);
+                var pending = self.*;
+                pending.data = .{ .mapped = self.data.mapped.retain() };
+                return .{ .pending = pending };
+            }
             // As things stand, we currently convert all images to RGBA before
             // uploading to the GPU. This just makes things easier. In the future
             // we may want to support other formats.
@@ -683,7 +703,7 @@ pub const Image = union(enum) {
                 .height = self.height,
                 .width = self.width,
                 .pixel_format = .rgba,
-                .data = rgba.ptr,
+                .data = .{ .owned = rgba.ptr },
             } };
             return result;
         }
@@ -699,10 +719,10 @@ pub const Image = union(enum) {
         switch (self) {
             .pending,
             .unload_pending,
-            => |p| alloc.free(p.dataSlice()),
+            => |p| p.deinit(alloc),
 
             .replace, .unload_replace => |r| {
-                alloc.free(r.pending.dataSlice());
+                r.pending.deinit(alloc);
                 r.texture.deinit();
             },
 
@@ -734,7 +754,7 @@ pub const Image = union(enum) {
 
         // If we have pending data right now, free it.
         if (self.getPending()) |p| {
-            alloc.free(p.dataSlice());
+            p.deinit(alloc);
         }
         // If we have an existing texture, use it in the replace.
         if (self.getTexture()) |t| {
@@ -793,12 +813,19 @@ pub const Image = union(enum) {
         try p.prepForUpload(alloc);
 
         // Create our texture
-        const texture = Texture.init(
-            api.imageTextureOptions(.rgba, true),
-            @intCast(p.width),
-            @intCast(p.height),
-            p.dataSlice(),
-        ) catch return error.UploadFailed;
+        const texture = mapped: {
+            if (comptime @hasDecl(Texture, "initMapped")) {
+                if (p.data == .mapped) {
+                    if (Texture.initMapped(api.imageTextureOptions(.rgba, true), p.width, p.height, p.data.mapped) catch null) |texture| break :mapped texture;
+                }
+            }
+            break :mapped Texture.init(
+                api.imageTextureOptions(.rgba, true),
+                @intCast(p.width),
+                @intCast(p.height),
+                p.dataSlice(),
+            ) catch return error.UploadFailed;
+        };
         errdefer comptime unreachable;
 
         // Uploaded. We can now clear our data and change our state.
@@ -857,6 +884,30 @@ pub const Image = union(enum) {
         };
     }
 };
+
+test "renderer: shared memory mapped pending retains source without copy" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const memory = try std.posix.mmap(null, std.heap.pageSize(), .{ .READ = true, .WRITE = true }, .{ .TYPE = .PRIVATE, .ANONYMOUS = true }, -1, 0);
+    @memcpy(memory[0..4], &[_]u8{ 255, 0, 0, 255 });
+    const mapping = try terminal.kitty.graphics.Image.Mapping.init(alloc, memory, 0, 4);
+    var image: terminal.kitty.graphics.Image = .{ .id = 7, .width = 1, .height = 1, .format = .rgba, .data = .{ .mapped = mapping } };
+    defer image.deinit(alloc);
+    var state: State = .empty;
+    defer state.deinit(alloc);
+    try state.prepKittyImage(alloc, &image);
+    try testing.expectEqual(@as(usize, 2), mapping.refs.load(.acquire));
+    const pending = state.images.getPtr(.{ .kitty = 7 }).?.image.getPendingPointer().?;
+    try testing.expect(pending.data == .mapped);
+    try testing.expectEqual(mapping.bytes().ptr, pending.dataSlice().ptr);
+    try image.data.makeOwned(alloc);
+    try testing.expectEqual(@as(usize, 1), mapping.refs.load(.acquire));
+    @constCast(image.data.complete)[0] = 0;
+    try testing.expectEqualSlices(u8, &.{ 255, 0, 0, 255 }, pending.dataSlice());
+    image.generation = terminal.kitty.graphics.nextGeneration(testing.io);
+    try state.prepKittyImage(alloc, &image);
+    try testing.expectEqualSlices(u8, &.{ 0, 0, 0, 255 }, state.images.get(.{ .kitty = 7 }).?.image.getPending().?.dataSlice());
+}
 
 test "kitty renderer ignores pending payloads and removes replaced placements" {
     const testing = std.testing;

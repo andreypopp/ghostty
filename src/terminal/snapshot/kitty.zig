@@ -1896,7 +1896,7 @@ pub fn decodePayload(
             0 => break :ticket null,
             1 => switch (img.data) {
                 .pending => |len| len,
-                .complete => break :ticket null,
+                .complete, .mapped => break :ticket null,
             },
             else => expected: {
                 const anim = img.animation orelse break :ticket null;

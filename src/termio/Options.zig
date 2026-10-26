@@ -22,6 +22,7 @@ backend: termio.Backend,
 
 /// Which replies generated while parsing terminal output reach the pty.
 reply_policy: termio.StreamHandler.ReplyPolicy = .{},
+image_loading_limits: ?@import("../terminal/main.zig").kitty.graphics.LoadingImage.Limits = null,
 
 /// The mailbox for the terminal. This is how messages are delivered.
 /// If you're using termio.Thread this MUST be "mailbox".

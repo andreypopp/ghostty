@@ -297,7 +297,7 @@ pub fn init(self: *Termio, alloc: Allocator, opts: termio.Options) !void {
                 .palette = .default,
             },
             .kitty_image_storage_limit = opts.config.image_storage_limit,
-            .kitty_image_loading_limits = .allWithTempDir(global.tmpDirPath()),
+            .kitty_image_loading_limits = opts.image_loading_limits orelse .allWithTempDir(global.tmpDirPath()),
         };
     });
     errdefer term.deinit(alloc);
@@ -613,7 +613,6 @@ pub fn changeConfig(self: *Termio, td: *ThreadData, config: *DerivedConfig) !voi
 
     // Set the image limits
     self.terminal.setKittyGraphicsSizeLimit(self.alloc, config.image_storage_limit);
-    self.terminal.setKittyGraphicsLoadingLimits(.allWithTempDir(global.tmpDirPath()));
 
     // The config could have changed any of our colors so update mode 2031.
     // This is written directly rather than queued as a color_scheme_report
