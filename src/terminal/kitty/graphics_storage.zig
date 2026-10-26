@@ -2335,6 +2335,31 @@ fn stars() []u8 {
     return result;
 }
 
+test "kittygfx restore pending snapshot retransmit releases frames" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var t = try terminal.Terminal.init(testing.io, alloc, .{ .cols = 3, .rows = 3 });
+    defer t.deinit(alloc);
+    const storage = &t.screens.active.kitty_images;
+    _ = try storage.addPendingImage(testing.io, alloc, t.screens.active, .{
+        .id = 1,
+        .width = 1,
+        .height = 1,
+        .format = .rgba,
+        .data = .{ .pending = 4 },
+    });
+    const anim = try alloc.create(animation.Animation);
+    anim.* = .{};
+    storage.images.getPtr(1).?.animation = anim;
+    try anim.frames.append(alloc, .{ .data = try alloc.dupe(u8, "old!"), .gap_ms = 10 });
+    try storage.reserveAnimationBytes(testing.io, alloc, t.screens.active, 1, 4);
+    const cmd = try terminal.kitty.graphics.CommandParser.parseString(alloc, "a=t,i=1,f=32,s=1,v=1;/wAA/w==");
+    defer cmd.deinit(alloc);
+    try testing.expect(terminal.kitty.graphics.execute(testing.io, alloc, &t, &cmd).?.ok());
+    try testing.expectEqual(@as(usize, 4), storage.total_bytes);
+    try testing.expect(storage.imageById(1).?.animation == null);
+}
+
 test "storage: add placement with zero placement id" {
     const testing = std.testing;
     const alloc = testing.allocator;

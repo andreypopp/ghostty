@@ -2590,7 +2590,7 @@ pub const CAPI = struct {
     }
 
     export fn ghostty_clipboard_request_kind(state: *const apprt.ClipboardRequest) c_int {
-        return @intCast(@intFromEnum(std.meta.activeTag(state.*)));
+        return @intCast(@backingInt(std.meta.activeTag(state.*)));
     }
 
     export fn ghostty_clipboard_request_granted(state: *const apprt.ClipboardRequest) bool {

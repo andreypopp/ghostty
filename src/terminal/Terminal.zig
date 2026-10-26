@@ -3964,8 +3964,9 @@ pub fn kittyGraphics(
     io_impl: std.Io,
     alloc: Allocator,
     cmd: *kitty.graphics.Command,
+    restoring: bool,
 ) ?kitty.graphics.Response {
-    return kitty.graphics.execute(io_impl, alloc, self, cmd);
+    return kitty.graphics.executeRestoring(io_impl, alloc, self, cmd, restoring);
 }
 
 /// Execute a Glyph Protocol APC command against this terminal's per-session
