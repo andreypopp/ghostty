@@ -36,6 +36,11 @@ const style = @import("style.zig");
 const PageList = @import("PageList.zig");
 const Screen = @import("Screen.zig");
 const ScreenSet = @import("ScreenSet.zig");
+const ImageFill = struct {
+    terminal: Terminal,
+    stream: Stream,
+    pending: ?kitty.graphics.ImageStorage.PendingImage = null,
+};
 const Page = pagepkg.Page;
 const Cell = pagepkg.Cell;
 const Row = pagepkg.Row;
@@ -101,6 +106,7 @@ glyph_glossary: glyph.Glossary = .empty,
 /// so a terminal that never runs a drag and drop aware program pays
 /// nothing for it. Non-null means a client currently accepts drops.
 kitty_dnd: ?*kitty.dnd.State = null,
+image_fill: ?*ImageFill = null,
 
 /// These are just a packed set of flags we may set on the terminal.
 flags: packed struct {
@@ -503,19 +509,83 @@ pub fn historyScratch(io_impl: std.Io, alloc: Allocator, cols: size.CellCountInt
     var scratch = try init(io_impl, alloc, .{ .cols = cols, .rows = 1, .max_scrollback_bytes = null, .max_scrollback_lines = null });
     errdefer scratch.deinit(alloc);
     var stream = scratch.vtStream();
+    stream.handler.restoring = true;
     defer stream.deinit();
     stream.nextSlice(bytes);
     return scratch;
+}
+
+pub fn parseImageFill(self: *Terminal, alloc: Allocator, bytes: []const u8, limit: usize) !void {
+    const fill = self.image_fill orelse fill: {
+        const state = try alloc.create(ImageFill);
+        errdefer alloc.destroy(state);
+        state.* = .{ .terminal = try init(self.io(), alloc, .{ .cols = 1, .rows = 1, .kitty_image_storage_limit = limit }), .stream = undefined };
+        state.stream = state.terminal.vtStream();
+        self.image_fill = state;
+        break :fill state;
+    };
+    if (fill.terminal.screens.active.kitty_images.total_limit != limit) fill.terminal.setKittyGraphicsSizeLimit(alloc, limit);
+    fill.stream.nextSlice(bytes);
+}
+
+pub fn completeImageFill(self: *Terminal, alloc: Allocator, alternate: bool) !void {
+    const screen = self.screens.get(if (alternate) .alternate else .primary) orelse return;
+    const storage = &screen.kitty_images;
+    if (!storage.enabled()) return;
+    const fill = self.image_fill orelse return;
+    const scratch = &fill.terminal.screens.active.kitty_images;
+    var images = scratch.images.iterator();
+    while (images.next()) |entry| {
+        defer entry.value_ptr.deinit(alloc);
+        const held = storage.imageById(entry.key_ptr.*) orelse continue;
+        if (!held.data.isPending() or entry.value_ptr.data.isPending()) continue;
+        const token: kitty.graphics.ImageStorage.PendingImage = if (fill.pending) |pending|
+            (if (pending.id == held.id) pending else .{ .id = held.id, .transmission = held.transmission })
+        else
+            .{ .id = held.id, .transmission = held.transmission };
+        if (token.completeImage(storage, self.io(), alloc, screen, entry.value_ptr.*) catch false) {
+            entry.value_ptr.data = .{ .complete = "" };
+            entry.value_ptr.animation = null;
+        }
+    }
+    scratch.images.clearRetainingCapacity();
+    scratch.total_bytes = 0;
+    if (scratch.loading) |loading| {
+        if (fill.pending == null or fill.pending.?.id != loading.image.id) {
+            const held = storage.imageById(loading.image.id);
+            fill.pending = if (held) |img| .{ .id = img.id, .transmission = img.transmission } else null;
+        }
+    } else fill.pending = null;
+}
+
+pub fn fillImagesForTest(self: *Terminal, alloc: Allocator, bytes: []const u8, alternate: bool) !void {
+    const screen = self.screens.get(if (alternate) .alternate else .primary) orelse return;
+    if (!screen.kitty_images.enabled()) return;
+    try self.parseImageFill(alloc, bytes, screen.kitty_images.total_limit);
+    try self.completeImageFill(alloc, alternate);
+}
+
+pub fn resetImageFill(self: *Terminal) void {
+    const fill = self.image_fill orelse return;
+    fill.stream.deinit();
+    fill.terminal.fullReset();
+    fill.pending = null;
+    fill.stream = fill.terminal.vtStream();
 }
 
 pub fn prependHistory(self: *Terminal, alloc: Allocator, bytes: []const u8) !usize {
     if (self.screens.active_key != .primary or bytes.len == 0) return 0;
     var scratch = try historyScratch(self.io(), alloc, self.cols, bytes);
     defer scratch.deinit(alloc);
-    return self.screens.active.pages.prepend(&scratch.screens.active.pages);
+    return kitty.graphics.ImageStorage.prepend(self.io(), alloc, self.screens.active, scratch.screens.active);
 }
 
 pub fn deinit(self: *Terminal, alloc: Allocator) void {
+    if (self.image_fill) |fill| {
+        fill.stream.deinit();
+        fill.terminal.deinit(alloc);
+        alloc.destroy(fill);
+    }
     self.tabstops.deinit(alloc);
     self.screens.deinit(alloc);
     self.colors.palette.deinit(alloc);
@@ -4087,8 +4157,9 @@ pub fn kittyGraphics(
     io_impl: std.Io,
     alloc: Allocator,
     cmd: *kitty.graphics.Command,
+    restoring: bool,
 ) ?kitty.graphics.Response {
-    return kitty.graphics.execute(io_impl, alloc, self, cmd);
+    return kitty.graphics.executeRestoring(io_impl, alloc, self, cmd, restoring);
 }
 
 /// Execute a Glyph Protocol APC command against this terminal's per-session

@@ -69,6 +69,10 @@ terminal_stream: StreamHandler.Stream,
 
 /// Which protocol replies this PTY's terminal core leaves to Ghostty.
 reply_policy: StreamHandler.ReplyPolicy,
+image_fill_mutex: std.Io.Mutex = .init,
+image_fill_generation: std.atomic.Value(u64) = .init(0),
+image_fill_parsed_generation: ?u64 = null,
+pending_image_state: terminalpkg.RenderState = .pending,
 
 /// Last time the cursor was reset. This is used to prevent message
 /// flooding with cursor resets.
@@ -360,6 +364,7 @@ pub fn init(self: *Termio, alloc: Allocator, opts: termio.Options) !void {
 
 pub fn deinit(self: *Termio) void {
     self.backend.deinit();
+    self.pending_image_state.deinit(self.alloc);
     self.terminal.deinit(self.alloc);
     self.config.deinit();
     self.mailbox.deinit(self.alloc);
@@ -725,6 +730,68 @@ pub fn raiseScrollbackLimit(self: *Termio) void {
     pages.setMaxLines(pages.limits.max(.lines) *| 2);
 }
 
+pub fn pendingImageRows(self: *Termio, start: i64, alternate: bool, rows: []bool) void {
+    @memset(rows, false);
+    self.renderer_state.mutex.lockUncancelable(global.io());
+    defer self.renderer_state.mutex.unlock(global.io());
+    const key: terminalpkg.ScreenSet.Key = if (alternate) .alternate else .primary;
+    const screen = self.terminal.screens.get(key) orelse return;
+    if (screen.kitty_images.placements.count() == 0) return;
+    var images = screen.kitty_images.images.valueIterator();
+    while (images.next()) |image| {
+        if (image.data.isPending() and image.metadata.placement_count > 0) break;
+    } else return;
+    const history: i64 = @intCast(screen.pages.total_rows - screen.pages.rows);
+    const viewport: i64 = @intCast(screen.pages.pointFromPin(.screen, screen.pages.getTopLeft(.viewport)).?.coord().y);
+    const state = &self.pending_image_state;
+    state.rows = 0;
+    state.overscan_request = .{
+        .above = @intCast(@max(0, viewport - history - start)),
+        .below = @intCast(@max(0, history + start + @as(i64, @intCast(rows.len)) - viewport - screen.pages.rows)),
+    };
+    const active = .{ .key = self.terminal.screens.active_key, .screen = self.terminal.screens.active };
+    self.terminal.screens.active_key = key;
+    self.terminal.screens.active = screen;
+    defer {
+        self.terminal.screens.active_key = active.key;
+        self.terminal.screens.active = active.screen;
+    }
+    state.update(self.alloc, &self.terminal) catch return;
+    var placements = state.imagePlacementIterator();
+    while (placements.next()) |placement| {
+        const row = viewport - history + placement.y;
+        const first = @max(0, row - start);
+        const last = @min(@as(i64, @intCast(rows.len)), row + placement.rows - start);
+        if (first < last) @memset(rows[@intCast(first)..@intCast(last)], true);
+    }
+}
+
+pub fn resetImageFill(self: *Termio) void {
+    _ = self.image_fill_generation.fetchAdd(1, .acq_rel);
+}
+
+pub fn fillImages(self: *Termio, bytes: []const u8, alternate: bool) void {
+    self.image_fill_mutex.lockUncancelable(global.io());
+    defer self.image_fill_mutex.unlock(global.io());
+    const generation = self.image_fill_generation.load(.acquire);
+    if (self.image_fill_parsed_generation != generation) self.terminal.resetImageFill();
+    self.image_fill_parsed_generation = generation;
+    self.renderer_state.mutex.lockUncancelable(global.io());
+    const limit = if (self.terminal.screens.get(if (alternate) .alternate else .primary)) |screen| screen.kitty_images.total_limit else 0;
+    self.renderer_state.mutex.unlock(global.io());
+    if (limit == 0) return;
+    self.terminal.parseImageFill(self.alloc, bytes, limit) catch return;
+    self.completeImageFill(generation, alternate);
+}
+
+fn completeImageFill(self: *Termio, generation: u64, alternate: bool) void {
+    self.renderer_state.mutex.lockUncancelable(global.io());
+    defer self.renderer_state.mutex.unlock(global.io());
+    if (self.image_fill_generation.load(.acquire) != generation) return;
+    self.terminal.completeImageFill(self.alloc, alternate) catch return;
+    self.renderer_wakeup.notify() catch {};
+}
+
 pub fn prependHistory(self: *Termio, bytes: []const u8) !usize {
     self.renderer_state.mutex.lockUncancelable(global.io());
     const cols = self.terminal.cols;
@@ -744,7 +811,7 @@ pub fn prependHistory(self: *Termio, bytes: []const u8) !usize {
         self.terminal.screens.generation(.primary) != generation or
         self.terminal.screens.active.pages.row_space_revision != revision or
         self.terminal.screens.active.pages.page_serial_epoch != epoch) return 0;
-    const count = try self.terminal.screens.active.pages.prepend(&scratch.screens.active.pages);
+    const count = try terminalpkg.kitty.graphics.ImageStorage.prepend(global.io(), self.alloc, self.terminal.screens.active, scratch.screens.active);
     if (count > 0) {
         self.terminal.flags.dirty = .{ .clear = true };
         self.renderer_wakeup.notify() catch {};
@@ -1069,6 +1136,34 @@ test "manual process_output parses split UTF-8 and resizes inline" {
     try testing.expectEqual(std.math.maxInt(usize), pages.limits.max(.bytes));
     try testing.expectEqual(std.math.maxInt(usize), pages.limits.max(.lines));
     while (io.mailbox.spsc.queue.pop(testing.io)) |message| message.deinit();
+}
+
+test "kittygfx restore reset rejects decoded fill before transfer" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var io: Termio = undefined;
+    io.alloc = alloc;
+    io.terminal = try terminalpkg.Terminal.init(testing.io, alloc, .{ .cols = 10, .rows = 3 });
+    defer io.terminal.deinit(alloc);
+    io.image_fill_mutex = .init;
+    io.image_fill_generation = .init(0);
+    io.image_fill_parsed_generation = null;
+    var mutex: std.Io.Mutex = .init;
+    var state: renderer.State = .{ .mutex = &mutex, .terminal = &io.terminal };
+    io.renderer_state = &state;
+    io.renderer_wakeup = try xev.Async.init();
+    defer io.renderer_wakeup.deinit();
+    var stream = io.terminal.vtStream();
+    defer stream.deinit();
+    stream.handler.restoring = true;
+    stream.nextSlice("\x1b_Ga=p,i=7,c=2,r=1,C=1\x1b\\");
+    try io.terminal.parseImageFill(alloc, "\x1b_Ga=t,i=7,f=24,s=1,v=1;/wAA\x1b\\", 1024);
+    io.resetImageFill();
+    io.completeImageFill(0, false);
+    const storage = &io.terminal.screens.active.kitty_images;
+    try testing.expect(storage.imageById(7).?.data.isPending());
+    io.fillImages("\x1b_Ga=t,i=7,f=24,s=1,v=1;AAD/\x1b\\", false);
+    try testing.expectEqualSlices(u8, &.{ 0, 0, 255 }, storage.imageById(7).?.data.bytes().?);
 }
 
 test "restore drops an in-flight Kitty clipboard write so replayed data never commits" {

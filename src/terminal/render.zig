@@ -342,6 +342,7 @@ pub const RenderState = struct {
     /// `viewportStart()` reads it and `row_data` is laid out for it by the
     /// update. Changing it causes the next update to be a full redraw.
     overscan_request: Overscan = .{},
+    image_mode: enum { render, pending } = .render,
     pixel_offset: f32 = 0,
 
     /// The number of rows above and below the viewport that the last
@@ -397,6 +398,12 @@ pub const RenderState = struct {
         .row_data = .empty,
         .dirty = .false,
         .screen = .primary,
+    };
+
+    pub const pending: RenderState = init: {
+        var state: RenderState = .empty;
+        state.image_mode = .pending;
+        break :init state;
     };
 
     /// The color state for the terminal.
@@ -1201,7 +1208,7 @@ pub const RenderState = struct {
             // We consume (clear) it now; each node appears at most once in
             // this iteration and we're the only consumer of dirty state.
             const page_dirty = p.dirty;
-            if (page_dirty) p.dirty = false;
+            if (page_dirty and self.image_mode == .render) p.dirty = false;
 
             // Get our contiguous rows for this chunk.
             const page_rows: []page.Row = p.rows.ptr(p.memory)[chunk.start..][0..take];
@@ -1251,7 +1258,7 @@ pub const RenderState = struct {
 
                     for (page_rows[i..][0..RowDirtyMask.group_len], i..) |*page_row, j| {
                         if (!page_row.dirty) continue;
-                        page_row.dirty = false;
+                        if (self.image_mode == .render) page_row.dirty = false;
                         any_dirty = true;
                         try builder.row(p, page_row, y + j);
                     }
@@ -1259,7 +1266,7 @@ pub const RenderState = struct {
                 while (i < take) : (i += 1) {
                     const page_row = &page_rows[i];
                     if (!page_row.dirty) continue;
-                    page_row.dirty = false;
+                    if (self.image_mode == .render) page_row.dirty = false;
                     any_dirty = true;
                     try builder.row(p, page_row, y + i);
                 }
@@ -1267,7 +1274,7 @@ pub const RenderState = struct {
                 // Rebuild every row in the chunk.
                 any_dirty = true;
                 for (page_rows, 0..) |*page_row, i| {
-                    page_row.dirty = false;
+                    if (self.image_mode == .render) page_row.dirty = false;
                     try builder.row(p, page_row, y + i);
                 }
             }
@@ -1402,12 +1409,14 @@ pub const RenderState = struct {
             self.dirty = .partial;
         }
 
-        if (redraw or any_dirty) t.flags.search_viewport_dirty = true;
+        if (self.image_mode == .render and (redraw or any_dirty)) t.flags.search_viewport_dirty = true;
 
         // Clear our dirty flags
         self.pixel_offset = pixel_offset;
-        t.flags.dirty = .{};
-        s.dirty = .{};
+        if (self.image_mode == .render) {
+            t.flags.dirty = .{};
+            s.dirty = .{};
+        }
     }
 
     /// Complete a prior `beginUpdate` call by performing any deferred
@@ -2200,6 +2209,7 @@ const Kitty = struct {
                         run,
                         cell_width,
                         cell_height,
+                        state.image_mode == .pending,
                     );
                 }
             }
@@ -2425,6 +2435,7 @@ const Kitty = struct {
                         kv.key_ptr.*,
                         kv.value_ptr,
                         .fixed,
+                        state.image_mode == .pending,
                     ) orelse continue,
                 },
 
@@ -2450,6 +2461,7 @@ const Kitty = struct {
                             kv.key_ptr.*,
                             kv.value_ptr,
                             .relative,
+                            state.image_mode == .pending,
                         ) orelse continue,
                     };
                 },
@@ -2470,11 +2482,16 @@ const Kitty = struct {
         key: PlacementKey,
         p: *const kitty_gfx.ImageStorage.Placement,
         kind: Placement.Kind,
+        pending: bool,
     ) ?RenderState.ImagePlacement {
         // Nothing to draw until the displayed pixels arrive. For an
         // animation, those are the current frame's pixels.
-        const image = storage.imageById(key.image_id) orelse return null;
-        if (image.renderData().isPending()) return null;
+        var image = storage.imageById(key.image_id) orelse return null;
+        if (image.renderData().isPending() != pending) return null;
+        if (pending) {
+            if (image.width == 0) image.width = @max(1, p.source_x +| p.source_width);
+            if (image.height == 0) image.height = @max(1, p.source_y +| p.source_height);
+        }
 
         // The size is zero when the terminal has no cell size in pixels.
         // Then there is nothing to draw.
@@ -2520,6 +2537,7 @@ const Kitty = struct {
         run: *Placeholder,
         cell_width: u32,
         cell_height: u32,
+        pending: bool,
     ) void {
         run.state = .hidden;
         run.target = null;
@@ -2536,7 +2554,22 @@ const Kitty = struct {
         // Nothing to draw until the displayed pixels arrive, as in
         // `template`.
         const image = storage.imageById(run.image_id) orelse return;
-        if (image.renderData().isPending()) return;
+        if (image.renderData().isPending() != pending) return;
+        if (pending) {
+            run.geometry = .{
+                .image_generation = image.generation,
+                .offset_x = 0,
+                .offset_y = 0,
+                .width = run.width * cell_width,
+                .height = cell_height,
+                .source_x = 0,
+                .source_y = 0,
+                .source_width = 0,
+                .source_height = 0,
+            };
+            run.state = .visible;
+            return;
+        }
 
         // Without a cell size in pixels, there is no size to draw at.
         if (cell_width == 0 or cell_height == 0) return;
@@ -2942,6 +2975,44 @@ const RowBuilder = struct {
         );
     }
 };
+
+test "kittygfx restore pending render state preserves the terminal dirty flags" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var t = try Terminal.init(testing.io, alloc, .{ .cols = 10, .rows = 4 });
+    defer t.deinit(alloc);
+    t.width_px = 100;
+    t.height_px = 40;
+    var stream = t.vtStream();
+    defer stream.deinit();
+    stream.handler.restoring = true;
+    stream.nextSlice("\x1b_Ga=p,i=7,p=1,c=2,r=2,C=1;\x1b\\" ++
+        "\x1b_Ga=p,i=7,p=2,c=1,r=1,P=7,Q=1,V=2,H=2;\x1b\\" ++
+        "\x1b_Ga=p,U=1,i=8,p=3,c=1,r=1;\x1b\\" ++
+        "\x1b[4;1H\x1b[38;2;0;0;8m\x1b[58;2;0;0;3m\u{10eeee}");
+    const dirty = t.screens.active.dirty;
+    const pin = t.screens.active.pages.getTopLeft(.active);
+    pin.node.page().dirty = true;
+    pin.rowAndCell().row.dirty = true;
+    var state: RenderState = .pending;
+    defer state.deinit(alloc);
+    t.flags.search_viewport_dirty = false;
+    try state.update(alloc, &t);
+    try testing.expect(!t.flags.search_viewport_dirty);
+    try testing.expectEqualDeep(dirty, t.screens.active.dirty);
+    try testing.expect(pin.node.page().dirty);
+    try testing.expect(pin.rowAndCell().row.dirty);
+    var placements = state.imagePlacementIterator();
+    var count: usize = 0;
+    var pending_rows = [_]bool{ false, false, false, false };
+    while (placements.next()) |placement| {
+        count += 1;
+        const first: usize = @intCast(placement.y);
+        @memset(pending_rows[first..][0..placement.rows], true);
+    }
+    try testing.expectEqual(@as(usize, 3), count);
+    try testing.expectEqualSlices(bool, &.{ true, true, true, true }, &pending_rows);
+}
 
 test "styled" {
     const testing = std.testing;

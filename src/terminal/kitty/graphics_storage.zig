@@ -210,6 +210,32 @@ pub const ImageStorage = struct {
         /// apart from any later image with the same ID.
         transmission: u64,
 
+        pub fn completeImage(
+            self: PendingImage,
+            storage: *ImageStorage,
+            io: std.Io,
+            alloc: Allocator,
+            s: *terminal.Screen,
+            incoming: Image,
+        ) Allocator.Error!bool {
+            const old = self.image(storage) orelse return false;
+            if (!old.data.isPending()) return false;
+            const previous = old.*;
+            const old_len = previous.storageSize();
+            const len = incoming.storageSize();
+            if (len > old_len) {
+                try storage.reserveAnimationBytes(io, alloc, s, self.id, len - old_len);
+            } else storage.releaseAnimationBytes(old_len - len);
+            const img = storage.images.getPtr(self.id).?;
+            img.deinit(alloc);
+            img.* = incoming;
+            img.generation = previous.generation;
+            img.transmission = previous.transmission;
+            img.metadata.placement_count = previous.metadata.placement_count;
+            storage.markMutated(io);
+            return true;
+        }
+
         /// Attach the image's decoded pixels.
         ///
         /// Returns true if the image is still the one this ticket was
@@ -396,6 +422,87 @@ pub const ImageStorage = struct {
         if (mode == .implicit) self.next_image_id = id +% 1;
 
         return id;
+    }
+
+    pub fn prepend(
+        io: std.Io,
+        alloc: Allocator,
+        target: *terminal.Screen,
+        source: *terminal.Screen,
+    ) !usize {
+        const dst = &target.kitty_images;
+        if (!dst.enabled()) return target.pages.prepend(&source.pages);
+        const src = &source.kitty_images;
+        var bytes: usize = 0;
+        var images = src.images.iterator();
+        while (images.next()) |entry| {
+            if (!dst.images.contains(entry.key_ptr.*))
+                bytes = std.math.add(usize, bytes, entry.value_ptr.storageSize()) catch return 0;
+        }
+        if (bytes > dst.total_limit -| dst.total_bytes) return 0;
+        try dst.images.ensureUnusedCapacity(alloc, src.images.count());
+        try dst.placements.ensureUnusedCapacity(alloc, src.placements.count());
+        const Move = struct { key: PlacementKey, placement: Placement, coord: ?point.Coordinate };
+        var moves: std.ArrayList(Move) = .empty;
+        defer moves.deinit(alloc);
+        try moves.ensureTotalCapacity(alloc, src.placements.count());
+        var committed = false;
+        defer if (!committed) {
+            for (moves.items) |move| if (move.coord != null) target.pages.untrackPin(move.placement.location.pin);
+        };
+        var next_id = dst.next_internal_placement_id;
+        var placements = src.placements.iterator();
+        while (placements.next()) |entry| {
+            var key = entry.key_ptr.*;
+            if (key.placement_id.tag == .internal) {
+                key.placement_id.id = next_id;
+                next_id +%= 1;
+            }
+            var p = entry.value_ptr.*;
+            const coord: ?point.Coordinate = switch (p.location) {
+                .pin => |pin| blk: {
+                    const coord = source.pages.pointFromPin(.screen, pin.*).?.coord();
+                    p.location = .{ .pin = try target.pages.trackPin(target.pages.getTopLeft(.active)) };
+                    break :blk coord;
+                },
+                else => null,
+            };
+            moves.appendAssumeCapacity(.{ .key = key, .placement = p, .coord = coord });
+        }
+        const rows = try target.pages.prepend(&source.pages);
+        if (rows == 0) return 0;
+        committed = true;
+        images = src.images.iterator();
+        while (images.next()) |entry| {
+            if (dst.images.contains(entry.key_ptr.*)) continue;
+            var img = entry.value_ptr.*;
+            img.metadata.placement_count = 0;
+            dst.images.putAssumeCapacity(entry.key_ptr.*, img);
+            entry.value_ptr.data = .{ .complete = "" };
+            entry.value_ptr.animation = null;
+        }
+        dst.total_bytes += bytes;
+        for (moves.items) |move| {
+            var p = move.placement;
+            if (move.coord) |coord| p.location.pin.* = target.pages.pin(.{ .screen = coord }).?;
+            if (dst.placements.get(move.key)) |old| {
+                if (old.location == .pin) {
+                    if (move.coord) |coord| {
+                        const lower = target.pages.pointFromPin(.screen, old.location.pin.*).?.coord();
+                        p.rows = @max(p.rows, @as(u32, @intCast(lower.y -| coord.y)) +| old.rows);
+                        p.source_height = if (p.source_height == 0 or old.source_height == 0) 0 else @max(p.source_y +| p.source_height, old.source_y +| old.source_height) - @min(p.source_y, old.source_y);
+                        p.source_y = @min(p.source_y, old.source_y);
+                    }
+                    target.pages.untrackPin(old.location.pin);
+                }
+                dst.images.getPtr(move.key.image_id).?.metadata.placement_count -= 1;
+            }
+            dst.placements.putAssumeCapacity(move.key, p);
+            dst.images.getPtr(move.key.image_id).?.metadata.placement_count += 1;
+        }
+        dst.next_internal_placement_id = next_id;
+        dst.markMutated(io);
+        return rows;
     }
 
     /// Add an image to the storage. This will automatically free any existing
@@ -2333,6 +2440,31 @@ fn stars() []u8 {
     const result = std.testing.allocator.alloc(u8, 64) catch @panic("OOM");
     @memset(result, '*');
     return result;
+}
+
+test "kittygfx restore pending snapshot retransmit releases frames" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var t = try terminal.Terminal.init(testing.io, alloc, .{ .cols = 3, .rows = 3 });
+    defer t.deinit(alloc);
+    const storage = &t.screens.active.kitty_images;
+    _ = try storage.addPendingImage(testing.io, alloc, t.screens.active, .{
+        .id = 1,
+        .width = 1,
+        .height = 1,
+        .format = .rgba,
+        .data = .{ .pending = 4 },
+    });
+    const anim = try alloc.create(animation.Animation);
+    anim.* = .{};
+    storage.images.getPtr(1).?.animation = anim;
+    try anim.frames.append(alloc, .{ .data = try alloc.dupe(u8, "old!"), .gap_ms = 10 });
+    try storage.reserveAnimationBytes(testing.io, alloc, t.screens.active, 1, 4);
+    const cmd = try terminal.kitty.graphics.CommandParser.parseString(alloc, "a=t,i=1,f=32,s=1,v=1;/wAA/w==");
+    defer cmd.deinit(alloc);
+    try testing.expect(terminal.kitty.graphics.execute(testing.io, alloc, &t, &cmd).?.ok());
+    try testing.expectEqual(@as(usize, 4), storage.total_bytes);
+    try testing.expect(storage.imageById(1).?.animation == null);
 }
 
 test "storage: add placement with zero placement id" {

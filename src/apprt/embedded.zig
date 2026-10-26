@@ -2366,6 +2366,18 @@ pub const CAPI = struct {
         surface.preeditCallback(if (len == 0) null else ptr[0..len]);
     }
 
+    export fn ghostty_surface_pending_image_rows(surface: *Surface, start: i64, alternate: bool, rows: [*]bool, len: usize) void {
+        surface.core_surface.io.pendingImageRows(start, alternate, rows[0..len]);
+    }
+
+    export fn ghostty_surface_fill_images_reset(surface: *Surface) void {
+        surface.core_surface.io.resetImageFill();
+    }
+
+    export fn ghostty_surface_fill_images(surface: *Surface, ptr: [*]const u8, len: usize, alternate: bool) void {
+        surface.core_surface.io.fillImages(ptr[0..len], alternate);
+    }
+
     export fn ghostty_surface_prepend_history(surface: *Surface, ptr: [*]const u8, len: usize) usize {
         return surface.core_surface.io.prependHistory(ptr[0..len]) catch 0;
     }
@@ -2606,7 +2618,7 @@ pub const CAPI = struct {
     }
 
     export fn ghostty_clipboard_request_kind(state: *const apprt.ClipboardRequest) c_int {
-        return @intCast(@intFromEnum(std.meta.activeTag(state.*)));
+        return @intCast(@backingInt(std.meta.activeTag(state.*)));
     }
 
     export fn ghostty_clipboard_request_granted(state: *const apprt.ClipboardRequest) bool {

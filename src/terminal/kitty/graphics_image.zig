@@ -33,6 +33,7 @@ pub const LoadingImage = struct {
 
     /// The data that is being built up.
     data: std.ArrayListUnmanaged(u8) = .empty,
+    pending_token: ?@import("graphics_storage.zig").ImageStorage.PendingImage = null,
 
     /// This is non-null when a transmit and display command is given
     /// so that we display the image after it is fully loaded.

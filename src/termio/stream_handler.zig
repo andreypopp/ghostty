@@ -583,7 +583,7 @@ pub const StreamHandler = struct {
         switch (result) {
             .unknown => return,
             .kitty => |*kitty_cmd| {
-                if (self.terminal.kittyGraphics(global.io(), self.alloc, kitty_cmd)) |resp| {
+                if (self.terminal.kittyGraphics(global.io(), self.alloc, kitty_cmd, self.restoring)) |resp| {
                     var buf: [1024]u8 = undefined;
                     var writer: std.Io.Writer = .fixed(&buf);
                     try resp.encode(&writer);

@@ -1294,6 +1294,9 @@ GHOSTTY_API bool ghostty_surface_set_grid_size(ghostty_surface_t,
                                                uint16_t columns,
                                                uint16_t rows,
                                                ghostty_surface_size_s* resolved);
+GHOSTTY_API void ghostty_surface_pending_image_rows(ghostty_surface_t, int64_t, bool, bool*, size_t);
+GHOSTTY_API void ghostty_surface_fill_images_reset(ghostty_surface_t);
+GHOSTTY_API void ghostty_surface_fill_images(ghostty_surface_t, const char*, size_t, bool);
 GHOSTTY_API size_t ghostty_surface_prepend_history(ghostty_surface_t, const char*, size_t);
 GHOSTTY_API void ghostty_surface_raise_scrollback_limit(ghostty_surface_t);
 GHOSTTY_API void ghostty_surface_restore_output(ghostty_surface_t, const char*, size_t);

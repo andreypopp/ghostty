@@ -30,6 +30,7 @@ pub const Response = command.Response;
 pub const nextGeneration = storage.nextGeneration;
 
 pub const execute = exec.execute;
+pub const executeRestoring = exec.executeRestoring;
 
 test {
     @import("std").testing.refAllDecls(@This());

@@ -28,6 +28,16 @@ pub fn execute(
     terminal: *Terminal,
     cmd: *const Command,
 ) ?Response {
+    return executeRestoring(io, alloc, terminal, cmd, false);
+}
+
+pub fn executeRestoring(
+    io: std.Io,
+    alloc: Allocator,
+    terminal: *Terminal,
+    cmd: *const Command,
+    restoring: bool,
+) ?Response {
     // If storage is disabled then we disable the full protocol. This means
     // we don't even respond to queries so the terminal completely acts as
     // if this feature is not supported.
@@ -68,7 +78,7 @@ pub fn execute(
 
     const resp_: ?Response = switch (cmd.control) {
         .query => query(io, alloc, terminal, cmd),
-        .display => display(io, alloc, terminal, cmd),
+        .display => display(io, alloc, terminal, cmd, restoring),
         .delete => delete(io, alloc, terminal, cmd),
 
         .transmit, .transmit_and_display, .transmit_animation_frame => resp: {
@@ -244,7 +254,7 @@ fn transmit(
         result = display(io, alloc, terminal, &.{
             .control = .{ .display = d_copy },
             .quiet = cmd.quiet,
-        });
+        }, false);
     }
 
     // If there are more chunks expected we do not respond.
@@ -267,6 +277,7 @@ fn display(
     alloc: Allocator,
     terminal: *Terminal,
     cmd: *const Command,
+    restoring: bool,
 ) Response {
     const d = cmd.display().?;
 
@@ -291,6 +302,15 @@ fn display(
 
     // Verify the requested image exists if we have an ID
     const storage = &terminal.screens.active.kitty_images;
+    if (restoring and d.image_id != 0 and storage.imageById(d.image_id) == null) {
+        _ = storage.addPendingImage(io, alloc, terminal.screens.active, .{
+            .id = d.image_id,
+            .data = .{ .pending = 0 },
+        }) catch {
+            result.message = "ENOMEM: out of memory";
+            return result;
+        };
+    }
     const img_: ?Image = if (d.image_id != 0)
         storage.imageById(d.image_id)
     else
@@ -1039,6 +1059,12 @@ fn loadAndAddImage(
     } else loading: {
         // Reusing a specific image ID deletes the old image and all of its
         // placements when the new transmission begins, not when it completes.
+        const held = storage.imageById(t.image_id);
+        if (cmd.control == .transmit and held != null and held.?.data.isPending()) {
+            var pending = try LoadingImage.init(io, alloc, cmd, storage.image_limits);
+            pending.pending_token = .{ .id = held.?.id, .transmission = held.?.transmission };
+            break :loading pending;
+        }
         if (t.image_id > 0) {
             storage.delete(io, alloc, terminal, .{ .id = .{
                 .image_id = t.image_id,
@@ -1082,7 +1108,11 @@ fn loadAndAddImage(
     // Validate and store our image
     var img = try loading.complete(alloc);
     errdefer img.deinit(alloc);
-    try storage.addImage(io, alloc, terminal.screens.active, img);
+    if (loading.pending_token) |token| {
+        if (!try token.completeImage(storage, io, alloc, terminal.screens.active, img)) img.deinit(alloc);
+    } else {
+        try storage.addImage(io, alloc, terminal.screens.active, img);
+    }
 
     // Get our display settings
     const display_ = loading.display;
@@ -3757,4 +3787,174 @@ test "kittygfx animation: control negative gap makes frame gapless" {
 
     const anim = storage.imagePtrByIdOrNumber(1, 0).?.animation.?;
     try testing.expectEqual(@as(u32, 0), anim.frames.items[0].gap_ms);
+}
+
+test "kittygfx restore held placements and pixels" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+    var t = try Terminal.init(io, alloc, .{ .rows = 5, .cols = 10 });
+    defer t.deinit(alloc);
+    const storage = &t.screens.active.kitty_images;
+    const placement = try command.Parser.parseString(alloc, "a=p,i=7,p=3,c=4,r=2,C=1");
+    defer placement.deinit(alloc);
+    try testing.expect(executeRestoring(io, alloc, &t, &placement, true).?.ok());
+    try testing.expect(storage.imageById(7).?.data.isPending());
+    try testing.expectEqual(@as(u32, 1), storage.placements.count());
+    const key: ImageStorage.PlacementKey = .{ .image_id = 7, .placement_id = .{ .tag = .external, .id = 3 } };
+    const pin = storage.placements.get(key).?.location.pin;
+    const pixels = try command.Parser.parseString(alloc, "a=t,i=7,f=24,s=1,v=1;/wAA");
+    defer pixels.deinit(alloc);
+    try testing.expect(executeRestoring(io, alloc, &t, &pixels, true).?.ok());
+    try testing.expectEqualSlices(u8, &.{ 255, 0, 0 }, storage.imageById(7).?.data.bytes().?);
+    try testing.expectEqual(pin, storage.placements.get(key).?.location.pin);
+    try t.fillImagesForTest(alloc, "\x1b_Ga=t,i=7,f=24,s=1,v=1;AAD/\x1b\\", false);
+    try testing.expectEqualSlices(u8, &.{ 255, 0, 0 }, storage.imageById(7).?.data.bytes().?);
+    try testing.expectEqual(@as(u32, 1), storage.placements.count());
+    try testing.expectEqual(pin, storage.placements.get(key).?.location.pin);
+    const held = try command.Parser.parseString(alloc, "a=p,i=8,c=2,r=2,C=1");
+    defer held.deinit(alloc);
+    _ = executeRestoring(io, alloc, &t, &held, true);
+    const deletion = try command.Parser.parseString(alloc, "a=d,d=I,i=8");
+    defer deletion.deinit(alloc);
+    _ = execute(io, alloc, &t, &deletion);
+    try t.fillImagesForTest(alloc, "\x1b_Ga=t,i=8,f=24,s=1,v=1;AAD/\x1b\\", false);
+    try testing.expect(storage.imageById(8) == null);
+    try testing.expectEqual(@as(u32, 1), storage.placements.count());
+}
+
+test "kittygfx restore prepend retains independent implicit placements" {
+    const alloc = std.testing.allocator;
+    var t = try Terminal.init(std.testing.io, alloc, .{ .rows = 5, .cols = 10 });
+    defer t.deinit(alloc);
+    var stream = t.vtStream();
+    defer stream.deinit();
+    stream.handler.restoring = true;
+    stream.nextSlice("\x1b_Ga=p,i=7,c=2,r=1,C=1\x1b\\");
+    _ = try t.prependHistory(alloc, "\x1b_Ga=p,i=7,c=2,r=1,C=1\x1b\\older");
+    try std.testing.expectEqual(@as(u32, 2), t.screens.active.kitty_images.placements.count());
+}
+
+test "kittygfx restore prepend joins explicit placement fragments" {
+    const alloc = std.testing.allocator;
+    var t = try Terminal.init(std.testing.io, alloc, .{ .rows = 5, .cols = 10 });
+    defer t.deinit(alloc);
+    var stream = t.vtStream();
+    defer stream.deinit();
+    stream.handler.restoring = true;
+    stream.nextSlice("\x1b_Ga=p,i=7,p=3,y=2,w=4,h=2,c=4,r=2,C=1\x1b\\");
+    _ = try t.prependHistory(alloc, "\x1b_Ga=p,i=7,p=3,w=4,h=2,c=4,r=2,C=1\x1b\\older\r\nolder");
+    const storage = &t.screens.active.kitty_images;
+    try std.testing.expectEqual(@as(u32, 1), storage.placements.count());
+    const p = storage.placements.get(.{ .image_id = 7, .placement_id = .{ .tag = .external, .id = 3 } }).?;
+    try std.testing.expectEqual(@as(u32, 0), p.source_y);
+    try std.testing.expectEqual(@as(u32, 4), p.source_height);
+    try std.testing.expectEqual(@as(u32, 4), p.rows);
+    try std.testing.expectEqual(@as(usize, 0), t.screens.active.pages.pointFromPin(.screen, p.location.pin.*).?.coord().y);
+}
+
+test "kittygfx restore prepend repins held and complete images" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+    var t = try Terminal.init(io, alloc, .{ .rows = 5, .cols = 10, .max_scrollback_bytes = null });
+    defer t.deinit(alloc);
+    const bytes = "\x1b_Ga=p,i=7,p=3,c=4,r=2,C=1\x1b\\row\r\n" ++
+        "\x1b_Ga=T,i=8,f=24,s=1,v=1,c=2,r=1,C=1;/wAA\x1b\\end";
+    const rows = try t.prependHistory(alloc, bytes);
+    try testing.expect(rows > 0);
+    const storage = &t.screens.active.kitty_images;
+    try testing.expect(storage.imageById(7).?.data.isPending());
+    try testing.expect(!storage.imageById(8).?.data.isPending());
+    try testing.expectEqual(@as(u32, 2), storage.placements.count());
+    var it = storage.placements.iterator();
+    while (it.next()) |entry| {
+        const pt = t.screens.active.pages.pointFromPin(.screen, entry.value_ptr.location.pin.*).?.coord();
+        try testing.expectEqual(@as(u32, if (entry.key_ptr.image_id == 7) 0 else 1), pt.y);
+    }
+    _ = try t.prependHistory(alloc, "\x1b_Ga=T,i=8,p=9,f=24,s=1,v=1,c=2,r=1,C=1;AAD/\x1b\\clash");
+    try testing.expectEqualSlices(u8, &.{ 255, 0, 0 }, storage.imageById(8).?.data.bytes().?);
+    const before_rows = t.screens.active.pages.total_rows;
+    const before_placements = storage.placements.count();
+    storage.total_limit = storage.total_bytes;
+    try testing.expectEqual(@as(usize, 0), try t.prependHistory(alloc, "\x1b_Ga=T,i=9,f=24,s=1,v=1,c=2,r=1,C=1;AAD/\x1b\\refused"));
+    try testing.expectEqual(before_rows, t.screens.active.pages.total_rows);
+    try testing.expectEqual(before_placements, storage.placements.count());
+    try testing.expect(storage.imageById(9) == null);
+    storage.total_limit = 0;
+    try testing.expect(try t.prependHistory(alloc, "\x1b_Ga=p,i=10,c=2,r=1,C=1\x1b\\disabled") > 0);
+    try testing.expect(storage.imageById(10) == null);
+}
+
+test "kittygfx restore fill leaves live APC and chunk assembly intact" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var t = try Terminal.init(testing.io, alloc, .{ .rows = 5, .cols = 10 });
+    defer t.deinit(alloc);
+    var stream = t.vtStream();
+    defer stream.deinit();
+    stream.handler.restoring = true;
+    stream.nextSlice("\x1b_Ga=p,i=7,c=2,r=1,C=1\x1b\\");
+    stream.handler.restoring = false;
+    stream.nextSlice("\x1b_Ga=t,i=9,f=24,s=1,v=1,m=1;/wAA\x1b\\");
+    const loading = t.screens.active.kitty_images.loading.?;
+    stream.nextSlice("\x1b_Ga=p,i=7,p=");
+    try t.fillImagesForTest(alloc, "\x1b_Ga=t,i=7,f=24,s=1,v=1,m=1;AAD/\x1b\\\n\x1b_Gm=0;\x1b\\\n", false);
+    try testing.expectEqual(loading, t.screens.active.kitty_images.loading.?);
+    stream.nextSlice("3,c=2,r=1,C=1\x1b\\");
+    try testing.expectEqual(@as(u32, 2), t.screens.active.kitty_images.placements.count());
+    stream.nextSlice("\x1b_Gm=0;\x1b\\");
+    try testing.expect(t.screens.active.kitty_images.loading == null);
+    try testing.expectEqualSlices(u8, &.{ 0, 0, 255 }, t.screens.active.kitty_images.imageById(7).?.data.bytes().?);
+    try testing.expectEqualSlices(u8, &.{ 255, 0, 0 }, t.screens.active.kitty_images.imageById(9).?.data.bytes().?);
+}
+
+test "kittygfx restore fill targets its captured screen" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var t = try Terminal.init(testing.io, alloc, .{ .rows = 5, .cols = 10 });
+    defer t.deinit(alloc);
+    var stream = t.vtStream();
+    defer stream.deinit();
+    stream.handler.restoring = true;
+    stream.nextSlice("\x1b_Ga=p,i=7,c=2,r=1,C=1\x1b\\\x1b[?1049h\x1b_Ga=p,i=7,c=2,r=1,C=1\x1b\\\x1b[?1049l");
+    try t.fillImagesForTest(alloc, "\x1b_Ga=t,i=7,f=24,s=1,v=1;/wAA\x1b\\", true);
+    try testing.expect(t.screens.get(.primary).?.kitty_images.imageById(7).?.data.isPending());
+    try testing.expectEqualSlices(u8, &.{ 255, 0, 0 }, t.screens.get(.alternate).?.kitty_images.imageById(7).?.data.bytes().?);
+}
+
+test "kittygfx restore virtual placement survives prepend and fill" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var t = try Terminal.init(testing.io, alloc, .{ .rows = 5, .cols = 10 });
+    defer t.deinit(alloc);
+    _ = try t.prependHistory(alloc, "\x1b_Ga=p,U=1,i=7,p=3,c=2,r=1\x1b\\\x1b[38;2;0;0;7m\x1b[58;2;0;0;3m\u{10eeee}");
+    const storage = &t.screens.active.kitty_images;
+    const key: ImageStorage.PlacementKey = .{ .image_id = 7, .placement_id = .{ .tag = .external, .id = 3 } };
+    try testing.expect(storage.placements.get(key).?.location == .virtual);
+    try testing.expect(storage.imageById(7).?.data.isPending());
+    try t.fillImagesForTest(alloc, "\x1b_Ga=t,i=7,f=24,s=1,v=1;/wAA\x1b\\", false);
+    try testing.expectEqualSlices(u8, &.{ 255, 0, 0 }, storage.imageById(7).?.data.bytes().?);
+    try testing.expect(storage.placements.get(key).?.location == .virtual);
+}
+
+test "kittygfx restore fill pages and reset" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var t = try Terminal.init(testing.io, alloc, .{ .rows = 5, .cols = 10 });
+    defer t.deinit(alloc);
+    var stream = t.vtStream();
+    defer stream.deinit();
+    stream.handler.restoring = true;
+    stream.nextSlice("\x1b_Ga=p,i=7,c=2,r=1,C=1\x1b\\\x1b_Ga=p,i=8,c=2,r=1,C=1\x1b\\");
+    try t.fillImagesForTest(alloc, "\x1b_Ga=t,i=7,f=24,s=1,v=1,m=1;/wAA\x1b\\", false);
+    try testing.expect(t.screens.active.kitty_images.imageById(7).?.data.isPending());
+    try t.fillImagesForTest(alloc, "\x1b_Gm=0;\x1b\\", false);
+    try testing.expectEqualSlices(u8, &.{ 255, 0, 0 }, t.screens.active.kitty_images.imageById(7).?.data.bytes().?);
+    t.resetImageFill();
+    try t.fillImagesForTest(alloc, "\x1b_Ga=t,i=8,f=24,s=1,v=1,m=1;AAD/\x1b\\", false);
+    t.resetImageFill();
+    try t.fillImagesForTest(alloc, "\x1b_Gm=0;\x1b\\", false);
+    try testing.expect(t.screens.active.kitty_images.imageById(8).?.data.isPending());
+    try testing.expectEqual(@as(u32, 2), t.screens.active.kitty_images.placements.count());
 }
