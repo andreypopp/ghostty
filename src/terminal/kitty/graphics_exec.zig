@@ -418,7 +418,7 @@ fn display(
     // like kitty.
     switch (p.location) {
         .virtual, .relative => {},
-        .pin => |pin| switch (d.cursor_movement) {
+        .pin => |pin| if (!img.data.isPending()) switch (d.cursor_movement) {
             .none => {},
             .after => {
                 // We use terminal.index to properly handle scroll regions.
@@ -3787,6 +3787,56 @@ test "kittygfx animation: control negative gap makes frame gapless" {
 
     const anim = storage.imagePtrByIdOrNumber(1, 0).?.animation.?;
     try testing.expectEqual(@as(u32, 0), anim.frames.items[0].gap_ms);
+}
+
+test "kittygfx restore native size from fill" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+    for ([_]struct {
+        input: []const u8,
+        restoring: bool,
+        pixels: [2]u32,
+        cells: [2]u32,
+        z: i32,
+        cursor: [2]u16,
+    }{
+        .{ .input = "a=p,i=7,p=2,X=1,Y=1,z=-1", .restoring = false, .pixels = .{ 3, 2 }, .cells = .{ 2, 2 }, .z = -1, .cursor = .{ 0, 0 } },
+        .{ .input = "a=p,i=7,p=2,c=0,r=2,X=1,Y=1,z=4,C=1", .restoring = true, .pixels = .{ 5, 3 }, .cells = .{ 3, 2 }, .z = 4, .cursor = .{ 0, 0 } },
+        .{ .input = "a=p,i=7,p=2,c=3,r=0,X=1,Y=1,z=4,C=1", .restoring = false, .pixels = .{ 5, 3 }, .cells = .{ 3, 2 }, .z = 4, .cursor = .{ 0, 0 } },
+        .{ .input = "a=p,i=7,p=2,c=0,r=0,X=1,Y=1,z=-1,C=1", .restoring = true, .pixels = .{ 3, 2 }, .cells = .{ 2, 2 }, .z = -1, .cursor = .{ 0, 0 } },
+    }) |case| {
+        var t = try Terminal.init(io, alloc, .{ .rows = 5, .cols = 10 });
+        defer t.deinit(alloc);
+        t.width_px = 20;
+        t.height_px = 10;
+        const held = try command.Parser.parseString(alloc, "a=p,i=7,p=1,c=2,r=2,C=1");
+        defer held.deinit(alloc);
+        _ = executeRestoring(io, alloc, &t, &held, true);
+        const placement = try command.Parser.parseString(alloc, case.input);
+        defer placement.deinit(alloc);
+        try testing.expect(executeRestoring(io, alloc, &t, &placement, case.restoring).?.ok());
+        try testing.expectEqual(case.cursor[0], t.screens.active.cursor.x);
+        try testing.expectEqual(case.cursor[1], t.screens.active.cursor.y);
+        const storage = &t.screens.active.kitty_images;
+        const key: ImageStorage.PlacementKey = .{ .image_id = 7, .placement_id = .{ .tag = .external, .id = 2 } };
+        const p = storage.placements.get(key).?;
+        try testing.expectEqual(@as(u32, 1), p.x_offset);
+        try testing.expectEqual(@as(u32, 1), p.y_offset);
+        try testing.expectEqual(case.z, p.z);
+        const pending = storage.imageById(7).?;
+        try testing.expect(pending.data.isPending());
+        _ = p.rect(pending, &t);
+        try t.fillImagesForTest(alloc, "\x1b_Ga=t,i=7,f=24,s=3,v=2;AAAAAAAAAAAAAAAAAAAAAAAA\x1b\\", false);
+        const img = storage.imageById(7).?;
+        const pixels = p.pixelSize(img, &t);
+        try testing.expectEqual(case.pixels[0], pixels.width);
+        try testing.expectEqual(case.pixels[1], pixels.height);
+        const grid = p.gridSize(img, &t);
+        try testing.expectEqual(case.cells[0], grid.cols);
+        try testing.expectEqual(case.cells[1], grid.rows);
+        try testing.expect(p.rect(img, &t) != null);
+    }
 }
 
 test "kittygfx restore held placements and pixels" {
