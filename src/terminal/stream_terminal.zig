@@ -160,6 +160,8 @@ pub const Handler = struct {
     /// silently ignored.
     terminfo_name: ?[]const u8 = null,
     restoring: bool = false,
+    image_fill_ids: ?*const std.AutoHashMapUnmanaged(u32, @import("kitty/graphics_storage.zig").ImageStorage.PendingImage) = null,
+    image_fill_root: ?u32 = null,
 
     /// Maximum byte length accepted for `terminfo_name`.
     pub const max_terminfo_name_bytes = 128;
@@ -2294,6 +2296,19 @@ pub const Handler = struct {
                 } });
             },
             .kitty => |*kitty_cmd| if (comptime build_options.kitty_graphics) {
+                if (self.image_fill_ids) |ids| {
+                    const id = switch (kitty_cmd.control) {
+                        .transmit => |t| root: {
+                            if (t.image_id != 0) self.image_fill_root = t.image_id;
+                            break :root t.image_id;
+                        },
+                        .transmit_animation_frame => |f| f.transmission.image_id,
+                        .control_animation => |a| a.image_id,
+                        else => return,
+                    };
+                    if (id != 0 and !ids.contains(id)) return;
+                    if (id == 0 and self.terminal.screens.active.kitty_images.loading == null) return;
+                }
                 if (self.terminal.kittyGraphics(
                     io,
                     alloc,

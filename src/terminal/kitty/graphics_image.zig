@@ -22,6 +22,11 @@ const max_dimension = 10000;
 /// Maximum size in bytes, taken from Kitty.
 const max_size = 400 * 1024 * 1024; // 400MB
 
+fn validateDimensions(image: *const Image) error{ DimensionsRequired, DimensionsTooLarge }!void {
+    if (image.width == 0 or image.height == 0) return error.DimensionsRequired;
+    if (image.width > max_dimension or image.height > max_dimension) return error.DimensionsTooLarge;
+}
+
 /// An image that is still being loaded. The image should be initialized
 /// using init on the first chunk and then addData for each subsequent
 /// chunk. Once all chunks have been added, complete should be called
@@ -99,6 +104,17 @@ pub const LoadingImage = struct {
             };
         }
 
+        pub fn allows(self: Limits, medium: command.Transmission.Medium) bool {
+            return switch (medium) {
+                .direct => true,
+                .file => self.file,
+                .temporary_file => self.temporary_file != .disabled,
+                .shared_memory => self.shared_memory,
+            };
+        }
+
+        pub const local: Limits = .{ .file = false, .temporary_file = .disabled, .shared_memory = true };
+
         pub const direct: Limits = .{
             .file = false,
             .temporary_file = .disabled,
@@ -165,13 +181,9 @@ pub const LoadingImage = struct {
             }
 
             // Verify the medium is allowed
-            switch (t.medium) {
-                .direct => unreachable,
-                .file => if (!limits.file) return error.UnsupportedMedium,
-                .temporary_file => if (limits.temporary_file == .disabled) return error.UnsupportedMedium,
-                .shared_memory => if (!limits.shared_memory) return error.UnsupportedMedium,
-            }
+            if (!limits.allows(t.medium)) return error.UnsupportedMedium;
         }
+        if (t.format != .png) try validateDimensions(&result.image);
 
         // Otherwise, the payload data is guaranteed to be a path.
 
@@ -232,7 +244,7 @@ pub const LoadingImage = struct {
             .SUCCESS => {},
             else => |err| {
                 log.warn("unable to open shared memory {s}: {}", .{ path, err });
-                return error.InvalidData;
+                return error.MediumUnavailable;
             },
         }
         const file: std.Io.File = .{
@@ -253,7 +265,7 @@ pub const LoadingImage = struct {
         const stat_size: usize = stat: {
             const stat = file.stat(io) catch |err| {
                 log.warn("unable to fstat shared memory {s}: {}", .{ path, err });
-                return error.InvalidData;
+                return error.MediumUnavailable;
             };
             if (stat.size <= 0) return error.InvalidData;
             break :stat std.math.cast(usize, stat.size) orelse
@@ -264,21 +276,28 @@ pub const LoadingImage = struct {
         // it doesn't overflow.
         const range = try self.sharedMemoryRange(t, stat_size);
 
+        const map_offset = std.mem.alignBackward(usize, range.start, std.heap.pageSize());
         const map = std.posix.mmap(
             null,
-            stat_size, // mmap always uses the stat size
+            range.end - map_offset,
             .{ .READ = true },
             std.c.MAP{ .TYPE = .SHARED },
             fd,
-            0,
+            @intCast(map_offset),
         ) catch |err| {
             log.warn("unable to mmap shared memory {s}: {}", .{ path, err });
-            return error.InvalidData;
+            return if (err == error.OutOfMemory) error.OutOfMemory else error.MediumUnavailable;
         };
-        defer std.posix.munmap(map);
+        defer if (self.image.data != .mapped) std.posix.munmap(map);
+        if (comptime builtin.target.os.tag == .macos) {
+            if (t.format == .rgba and t.compression == .none and !t.more_chunks) {
+                self.image.data = .{ .mapped = try Image.Mapping.init(alloc, map, range.start - map_offset, range.end - map_offset) };
+                return;
+            }
+        }
 
         assert(self.data.items.len == 0);
-        try self.data.appendSlice(alloc, map[range.start..range.end]);
+        try self.data.appendSlice(alloc, map[range.start - map_offset .. range.end - map_offset]);
     }
 
     const SharedMemoryRange = struct {
@@ -380,7 +399,7 @@ pub const LoadingImage = struct {
             .{},
         ) catch |err| {
             log.warn("failed to open image file: {}", .{err});
-            return error.InvalidData;
+            return error.MediumUnavailable;
         };
 
         // We'll populate a delete path if this is a temporary file.
@@ -431,7 +450,7 @@ pub const LoadingImage = struct {
             }
         } else |err| {
             log.warn("failed to stat file: {}", .{err});
-            return error.InvalidData;
+            return error.MediumUnavailable;
         }
 
         var buf: [4096]u8 = undefined;
@@ -439,7 +458,7 @@ pub const LoadingImage = struct {
         if (t.offset > 0) {
             buf_reader.seekTo(@intCast(t.offset)) catch |err| {
                 log.warn("failed to seek to offset {}: {}", .{ t.offset, err });
-                return error.InvalidData;
+                return error.MediumUnavailable;
             };
         }
         const reader = &buf_reader.interface;
@@ -459,14 +478,19 @@ pub const LoadingImage = struct {
                 log.warn("failed to read image file: {}", .{err});
                 return switch (err) {
                     error.OutOfMemory => error.OutOfMemory,
-                    else => error.InvalidData,
+                    error.EndOfStream => error.InvalidData,
+                    else => error.MediumUnavailable,
                 };
             };
             managed = .fromOwnedSlice(data);
         } else {
-            reader.appendRemaining(alloc, &managed, .limited(max_size)) catch {
+            reader.appendRemaining(alloc, &managed, .limited(max_size)) catch |err| {
                 log.warn("failed to read image file: {?}", .{buf_reader.err});
-                return error.InvalidData;
+                return switch (err) {
+                    error.OutOfMemory => error.OutOfMemory,
+                    error.ReadFailed => error.MediumUnavailable,
+                    else => error.InvalidData,
+                };
             };
         }
 
@@ -577,13 +601,12 @@ pub const LoadingImage = struct {
         if (img.format == .png) try self.decodePng(alloc);
 
         // Validate our dimensions.
-        if (img.width == 0 or img.height == 0) return error.DimensionsRequired;
-        if (img.width > max_dimension or img.height > max_dimension) return error.DimensionsTooLarge;
+        try validateDimensions(img);
 
         // Data length must be what we expect.
         const bpp = command.Transmission.formatBpp(img.format);
         const expected_len = img.width * img.height * bpp;
-        const actual_len = self.data.items.len;
+        const actual_len = if (img.data == .mapped) img.data.len() else self.data.items.len;
         if (self.frame != null) {
             // Kitty allows animation frames to exceed their expected length
             // and just truncates it. Not sure if thats expected but lets
@@ -595,7 +618,7 @@ pub const LoadingImage = struct {
                 );
                 return error.InsufficientData;
             }
-            self.data.items.len = expected_len;
+            if (img.data == .mapped) img.data.mapped.end = img.data.mapped.start + expected_len else self.data.items.len = expected_len;
         } else if (actual_len != expected_len) {
             std.log.warn(
                 "unexpected length image id={} width={} height={} bpp={} expected_len={} actual_len={}",
@@ -606,7 +629,7 @@ pub const LoadingImage = struct {
 
         // Everything looks good, copy the image data over.
         var result = self.image;
-        result.data = .{ .complete = try self.data.toOwnedSlice(alloc) };
+        result.data = if (img.data == .mapped) img.data else .{ .complete = try self.data.toOwnedSlice(alloc) };
         errdefer result.deinit(alloc);
         self.image = .{};
         return result;
@@ -807,21 +830,61 @@ pub const Image = struct {
         TemporaryFileNotNamedCorrectly,
         UnsupportedFormat,
         UnsupportedMedium,
+        MediumUnavailable,
         UnsupportedDepth,
     };
 
+    pub const Mapping = struct {
+        memory: []align(std.heap.page_size_min) u8,
+        start: usize,
+        end: usize,
+        refs: std.atomic.Value(usize) = .init(1),
+        allocator: Allocator,
+
+        pub fn init(alloc: Allocator, memory: []align(std.heap.page_size_min) u8, start: usize, end: usize) !*Mapping {
+            assert(start <= end and end <= memory.len);
+            const result = try alloc.create(Mapping);
+            result.* = .{
+                .memory = memory.ptr[0..std.mem.alignForward(usize, memory.len, std.heap.pageSize())],
+                .start = start,
+                .end = end,
+                .allocator = alloc,
+            };
+            return result;
+        }
+
+        pub fn bytes(self: *const Mapping) []const u8 {
+            return self.memory[self.start..self.end];
+        }
+
+        pub fn retain(self: *Mapping) *Mapping {
+            const previous = self.refs.fetchAdd(1, .monotonic);
+            assert(previous > 0 and previous < std.math.maxInt(usize));
+            return self;
+        }
+
+        pub fn release(self: *Mapping) void {
+            if (self.refs.fetchSub(1, .acq_rel) != 1) return;
+            std.posix.munmap(self.memory);
+            self.allocator.destroy(self);
+        }
+    };
+
     pub const Data = union(enum) {
+        mapped: *Mapping,
         /// Owned, decoded image bytes. The empty default is not allocated.
         complete: []const u8,
 
         /// Expected decoded byte length for a payload that has not arrived.
         pending: usize,
+        unread: usize,
 
         /// Bytes reserved against the storage limit.
         pub fn len(self: Data) usize {
             return switch (self) {
                 .complete => |data| data.len,
-                .pending => |expected_len| expected_len,
+                .mapped => |mapping| mapping.end - mapping.start,
+                .pending, .unread => |expected_len| expected_len,
             };
         }
 
@@ -829,18 +892,27 @@ pub const Image = struct {
         pub fn bytes(self: Data) ?[]const u8 {
             return switch (self) {
                 .complete => |data| data,
-                .pending => null,
+                .mapped => |mapping| mapping.bytes(),
+                .pending, .unread => null,
             };
         }
 
+        pub fn makeOwned(self: *Data, alloc: Allocator) !void {
+            if (self.* != .mapped) return;
+            const owned = try alloc.dupe(u8, self.mapped.bytes());
+            self.mapped.release();
+            self.* = .{ .complete = owned };
+        }
+
         pub fn isPending(self: Data) bool {
-            return self == .pending;
+            return self == .pending or self == .unread;
         }
 
         pub fn deinit(self: *Data, alloc: Allocator) void {
             switch (self.*) {
                 .complete => |data| if (data.len > 0) alloc.free(data),
-                .pending => {},
+                .mapped => |mapping| mapping.release(),
+                .pending, .unread => {},
             }
         }
     };
@@ -969,6 +1041,60 @@ test "temporary file path must be inside directory" {
     try testing.expect(!isPathInDir("/tmp", "/tmpX/tty-graphics-protocol-image.data"));
     try testing.expect(!isPathInDir("/dev/shm", "/dev/shm-evil/tty-graphics-protocol-image.data"));
     try testing.expect(!isPathInDir("/custom/tmp", "/custom/tmp-suffix/tty-graphics-protocol-image.data"));
+}
+
+test "shared memory mapped RGBA retains the object and unlinks both name forms" {
+    if (builtin.target.os.tag != .macos) return error.SkipZigTest;
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    for ([_]struct { prefix: []const u8, offset: usize }{
+        .{ .prefix = "/", .offset = std.heap.pageSize() },
+        .{ .prefix = "", .offset = std.heap.pageSize() + 1 },
+    }, 0..) |case, index| {
+        var buffer: [32]u8 = undefined;
+        const name = try std.fmt.bufPrintSentinel(&buffer, "{s}kmap{d}-{d}", .{ case.prefix, std.c.getpid(), index }, 0);
+        defer _ = std.c.shm_unlink(name);
+        const fd = std.c.shm_open(name, @as(c_int, @bitCast(std.c.O{ .ACCMODE = .RDWR, .CREAT = true, .EXCL = true })), @as(u16, 0o600));
+        try testing.expect(fd >= 0);
+        defer _ = std.c.close(fd);
+        try testing.expectEqual(@as(c_int, 0), std.c.ftruncate(fd, @intCast(case.offset + 4)));
+        const producer = try std.posix.mmap(null, case.offset + 4, .{ .READ = true, .WRITE = true }, .{ .TYPE = .SHARED }, fd, 0);
+        defer std.posix.munmap(producer);
+        @memcpy(producer[case.offset..][0..4], &[_]u8{ 255, 0, 0, 255 });
+        var cmd: command.Command = .{
+            .control = .{ .transmit = .{ .format = .rgba, .medium = .shared_memory, .width = 1, .height = 1, .image_id = 7, .offset = @intCast(case.offset) } },
+            .data = try alloc.dupe(u8, name),
+        };
+        defer cmd.deinit(alloc);
+        var loading = try LoadingImage.init(testing.io, alloc, &cmd, .local);
+        defer loading.deinit(alloc);
+        try testing.expectEqual(@as(usize, 0), loading.data.items.len);
+        var image = try loading.complete(alloc);
+        defer image.deinit(alloc);
+        try testing.expect(image.data == .mapped);
+        try testing.expectEqualSlices(u8, &.{ 255, 0, 0, 255 }, image.data.bytes().?);
+        try testing.expectEqual(std.heap.pageSize(), image.data.mapped.memory.len);
+        try testing.expectEqual(case.offset % std.heap.pageSize(), image.data.mapped.start);
+        producer[case.offset] = 23;
+        try testing.expectEqual(@as(u8, 23), image.data.bytes().?[0]);
+        const reopened = std.c.shm_open(name, @as(c_int, @bitCast(std.c.O{ .ACCMODE = .RDONLY })), @as(u16, 0));
+        if (reopened >= 0) _ = std.c.close(reopened);
+        try testing.expect(reopened < 0);
+    }
+}
+
+test "shared memory mapped missing objects report unavailable" {
+    if (comptime builtin.target.abi.isAndroid() or builtin.target.os.tag == .windows or !builtin.link_libc) return error.SkipZigTest;
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var buffer: [32]u8 = undefined;
+    const name = try std.fmt.bufPrint(&buffer, "kido-missing-{d}", .{std.c.getpid()});
+    var cmd: command.Command = .{
+        .control = .{ .transmit = .{ .format = .rgb, .medium = .shared_memory, .width = 1, .height = 1, .image_id = 31 } },
+        .data = try alloc.dupe(u8, name),
+    };
+    defer cmd.deinit(alloc);
+    try testing.expectError(error.MediumUnavailable, LoadingImage.init(testing.io, alloc, &cmd, .local));
 }
 
 test "shared memory names" {

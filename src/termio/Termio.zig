@@ -71,6 +71,7 @@ terminal_stream: StreamHandler.Stream,
 reply_policy: StreamHandler.ReplyPolicy,
 image_fill_mutex: std.Io.Mutex = .init,
 image_fill_generation: std.atomic.Value(u64) = .init(0),
+unread_images: std.atomic.Value(bool) = .init(false),
 image_fill_parsed_generation: ?u64 = null,
 pending_image_state: terminalpkg.RenderState = .pending,
 
@@ -301,7 +302,7 @@ pub fn init(self: *Termio, alloc: Allocator, opts: termio.Options) !void {
                 .palette = .default,
             },
             .kitty_image_storage_limit = opts.config.image_storage_limit,
-            .kitty_image_loading_limits = .allWithTempDir(global.tmpDirPath()),
+            .kitty_image_loading_limits = opts.image_loading_limits orelse .allWithTempDir(global.tmpDirPath()),
         };
     });
     errdefer term.deinit(alloc);
@@ -618,7 +619,6 @@ pub fn changeConfig(self: *Termio, td: *ThreadData, config: *DerivedConfig) !voi
 
     // Set the image limits
     self.terminal.setKittyGraphicsSizeLimit(self.alloc, config.image_storage_limit);
-    self.terminal.setKittyGraphicsLoadingLimits(.allWithTempDir(global.tmpDirPath()));
 
     // The config could have changed any of our colors so update mode 2031.
     // This is written directly rather than queued as a color_scheme_report
@@ -730,6 +730,22 @@ pub fn raiseScrollbackLimit(self: *Termio) void {
     pages.setMaxLines(pages.limits.max(.lines) *| 2);
 }
 
+pub fn takeUnreadImages(self: *Termio) terminalpkg.kitty.graphics.ImageStorage.Recovery {
+    if (!self.unread_images.load(.acquire)) return .none;
+    self.renderer_state.mutex.lockUncancelable(global.io());
+    defer self.renderer_state.mutex.unlock(global.io());
+    self.unread_images.store(false, .release);
+    var recovery: terminalpkg.kitty.graphics.ImageStorage.Recovery = .none;
+    var screens = self.terminal.screens.all.iterator();
+    while (screens.next()) |entry| {
+        const next = entry.value.*.kitty_images.takeUnreadImages();
+        if (next == .none) continue;
+        if (next == .restore or entry.value.* != self.terminal.screens.active) recovery = .restore else if (recovery == .none) recovery = .fetch;
+    }
+    if (recovery != .none) _ = self.resetImageFill();
+    return recovery;
+}
+
 pub fn pendingImageRows(self: *Termio, start: i64, alternate: bool, rows: []bool) void {
     @memset(rows, false);
     self.renderer_state.mutex.lockUncancelable(global.io());
@@ -766,29 +782,34 @@ pub fn pendingImageRows(self: *Termio, start: i64, alternate: bool, rows: []bool
     }
 }
 
-pub fn resetImageFill(self: *Termio) void {
-    _ = self.image_fill_generation.fetchAdd(1, .acq_rel);
+pub fn resetImageFill(self: *Termio) u64 {
+    return self.image_fill_generation.fetchAdd(1, .acq_rel) +% 1;
 }
 
-pub fn fillImages(self: *Termio, bytes: []const u8, alternate: bool) void {
+pub fn fillImages(self: *Termio, bytes: []const u8, alternate: bool, generation: u64, final: bool) void {
+    if (self.image_fill_generation.load(.acquire) != generation) return;
     self.image_fill_mutex.lockUncancelable(global.io());
     defer self.image_fill_mutex.unlock(global.io());
-    const generation = self.image_fill_generation.load(.acquire);
+    if (self.image_fill_generation.load(.acquire) != generation) return;
     if (self.image_fill_parsed_generation != generation) self.terminal.resetImageFill();
     self.image_fill_parsed_generation = generation;
-    self.renderer_state.mutex.lockUncancelable(global.io());
-    const limit = if (self.terminal.screens.get(if (alternate) .alternate else .primary)) |screen| screen.kitty_images.total_limit else 0;
-    self.renderer_state.mutex.unlock(global.io());
-    if (limit == 0) return;
-    self.terminal.parseImageFill(self.alloc, bytes, limit) catch return;
-    self.completeImageFill(generation, alternate);
+    const config = locked: {
+        self.renderer_state.mutex.lockUncancelable(global.io());
+        defer self.renderer_state.mutex.unlock(global.io());
+        const screen = self.terminal.screens.get(if (alternate) .alternate else .primary) orelse return;
+        self.terminal.prepareImageFill(self.alloc, alternate, screen.kitty_images.total_limit, screen.kitty_images.image_limits) catch return;
+        break :locked screen.kitty_images.total_limit;
+    };
+    if (config == 0) return;
+    self.terminal.parseImageFill(bytes);
+    self.completeImageFill(generation, alternate, final);
 }
 
-fn completeImageFill(self: *Termio, generation: u64, alternate: bool) void {
+fn completeImageFill(self: *Termio, generation: u64, alternate: bool, final: bool) void {
     self.renderer_state.mutex.lockUncancelable(global.io());
     defer self.renderer_state.mutex.unlock(global.io());
     if (self.image_fill_generation.load(.acquire) != generation) return;
-    self.terminal.completeImageFill(self.alloc, alternate) catch return;
+    self.terminal.completeImageFill(self.alloc, alternate, final) catch return;
     self.renderer_wakeup.notify() catch {};
 }
 
@@ -800,9 +821,10 @@ pub fn prependHistory(self: *Termio, bytes: []const u8) !usize {
     const revision = self.terminal.screens.active.pages.row_space_revision;
     const epoch = self.terminal.screens.active.pages.page_serial_epoch;
     const available = bytes.len > 0 and self.terminal.screens.active_key == .primary;
+    const limits = self.terminal.screens.active.kitty_images.image_limits;
     self.renderer_state.mutex.unlock(global.io());
     if (!available) return 0;
-    var scratch = try terminalpkg.Terminal.historyScratch(global.io(), self.alloc, cols, bytes);
+    var scratch = try terminalpkg.Terminal.historyScratch(global.io(), self.alloc, cols, limits, bytes);
     defer scratch.deinit(self.alloc);
     self.renderer_state.mutex.lockUncancelable(global.io());
     defer self.renderer_state.mutex.unlock(global.io());
@@ -932,6 +954,16 @@ fn processOutputLocked(self: *Termio, buf: []const u8) void {
         }
     } else {
         self.terminal_stream.nextSlice(buf);
+    }
+
+    if (comptime terminalpkg.options.kitty_graphics) {
+        var screens = self.terminal.screens.all.iterator();
+        while (screens.next()) |entry| {
+            if (entry.value.*.kitty_images.has_unread) {
+                self.unread_images.store(true, .release);
+                break;
+            }
+        }
     }
 
     // If our stream handling caused messages to be sent to the mailbox
@@ -1138,6 +1170,40 @@ test "manual process_output parses split UTF-8 and resizes inline" {
     while (io.mailbox.spsc.queue.pop(testing.io)) |message| message.deinit();
 }
 
+test "kittygfx pending rows use a native placement crop before fill" {
+    const testing = std.testing;
+    var io: Termio = undefined;
+    io.alloc = testing.allocator;
+    io.pending_image_state = .pending;
+    defer io.pending_image_state.deinit(testing.allocator);
+    io.terminal = try terminalpkg.Terminal.init(testing.io, testing.allocator, .{ .cols = 10, .rows = 3 });
+    defer io.terminal.deinit(testing.allocator);
+    io.terminal.width_px = 20;
+    io.terminal.height_px = 6;
+    var mutex: std.Io.Mutex = .init;
+    var state: renderer.State = .{ .mutex = &mutex, .terminal = &io.terminal };
+    io.renderer_state = &state;
+    var stream = io.terminal.vtStream();
+    defer stream.deinit();
+    stream.handler.restoring = true;
+    stream.nextSlice("\x1b_Ga=p,i=7,c=0,r=0,y=2,w=2,h=8,Y=1,C=1\x1b\\");
+    var rows: [4]bool = undefined;
+    io.pendingImageRows(2, false, &rows);
+    try testing.expectEqualSlices(bool, &.{ true, true, true, false }, &rows);
+    const capacity = io.pending_image_state.row_data.capacity;
+    const roots = io.pending_image_state.kitty.roots.items.ptr;
+    stream.nextSlice("\x1b[?1049h");
+    io.pendingImageRows(2, false, &rows);
+    try testing.expectEqualSlices(bool, &.{ true, true, true, false }, &rows);
+    try testing.expectEqual(capacity, io.pending_image_state.row_data.capacity);
+    try testing.expect(roots == io.pending_image_state.kitty.roots.items.ptr);
+    try testing.expectEqual(terminalpkg.ScreenSet.Key.alternate, io.terminal.screens.active_key);
+    var removed = io.terminal.screens.get(.primary).?.kitty_images.takeImage(7).?;
+    removed.deinit(testing.allocator);
+    io.pendingImageRows(2, false, &rows);
+    try testing.expectEqualSlices(bool, &.{ false, false, false, false }, &rows);
+}
+
 test "kittygfx restore reset rejects decoded fill before transfer" {
     const testing = std.testing;
     const alloc = testing.allocator;
@@ -1147,6 +1213,7 @@ test "kittygfx restore reset rejects decoded fill before transfer" {
     defer io.terminal.deinit(alloc);
     io.image_fill_mutex = .init;
     io.image_fill_generation = .init(0);
+    io.unread_images = .init(false);
     io.image_fill_parsed_generation = null;
     var mutex: std.Io.Mutex = .init;
     var state: renderer.State = .{ .mutex = &mutex, .terminal = &io.terminal };
@@ -1157,13 +1224,22 @@ test "kittygfx restore reset rejects decoded fill before transfer" {
     defer stream.deinit();
     stream.handler.restoring = true;
     stream.nextSlice("\x1b_Ga=p,i=7,c=2,r=1,C=1\x1b\\");
-    try io.terminal.parseImageFill(alloc, "\x1b_Ga=t,i=7,f=24,s=1,v=1;/wAA\x1b\\", 1024);
-    io.resetImageFill();
-    io.completeImageFill(0, false);
+    try io.terminal.prepareImageFill(alloc, false, 1024, .direct);
+    io.terminal.parseImageFill("\x1b_Ga=t,i=7,f=24,s=1,v=1;/wAA\x1b\\");
+    const generation = io.resetImageFill();
+    io.completeImageFill(0, false, true);
     const storage = &io.terminal.screens.active.kitty_images;
     try testing.expect(storage.imageById(7).?.data.isPending());
-    io.fillImages("\x1b_Ga=t,i=7,f=24,s=1,v=1;AAD/\x1b\\", false);
+    io.fillImages("\x1b_Ga=t,i=7,f=24,s=1,v=1;/wAA\x1b\\", false, 0, true);
+    try testing.expect(storage.imageById(7).?.data.isPending());
+    io.fillImages("\x1b_Ga=t,i=7,f=24,s=1,v=1;AAD/\x1b\\", false, generation, true);
     try testing.expectEqualSlices(u8, &.{ 0, 0, 255 }, storage.imageById(7).?.data.bytes().?);
+    try testing.expect(storage.holdImage(testing.io, alloc, 7));
+    io.unread_images.store(true, .release);
+    try testing.expectEqual(terminalpkg.kitty.graphics.ImageStorage.Recovery.fetch, io.takeUnreadImages());
+    try testing.expectEqual(generation + 1, io.image_fill_generation.load(.acquire));
+    try testing.expectEqual(terminalpkg.kitty.graphics.ImageStorage.Recovery.none, io.takeUnreadImages());
+    try testing.expectEqual(generation + 1, io.image_fill_generation.load(.acquire));
 }
 
 test "restore drops an in-flight Kitty clipboard write so replayed data never commits" {

@@ -801,6 +801,10 @@ pub fn init(
                 rt_surface.replyPolicy()
             else
                 .{},
+            .image_loading_limits = if (comptime @hasDecl(apprt.runtime.Surface, "imageLoadingLimits"))
+                rt_surface.imageLoadingLimits()
+            else
+                null,
             .mailbox = io_mailbox,
             .renderer_state = &self.renderer_state,
             .renderer_wakeup = self.renderer_thread.wakeup,

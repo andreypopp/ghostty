@@ -530,6 +530,18 @@ typedef enum {
   GHOSTTY_SURFACE_IO_MANUAL_MIRROR = 2,
 } ghostty_surface_io_mode_e;
 
+typedef enum {
+  GHOSTTY_IMAGE_MEDIA_ALL,
+  GHOSTTY_IMAGE_MEDIA_DIRECT,
+  GHOSTTY_IMAGE_MEDIA_LOCAL,
+} ghostty_image_media_e;
+
+typedef enum {
+  GHOSTTY_IMAGE_RECOVERY_NONE,
+  GHOSTTY_IMAGE_RECOVERY_FETCH,
+  GHOSTTY_IMAGE_RECOVERY_RESTORE,
+} ghostty_image_recovery_e;
+
 // The callback borrows bytes for the duration of the call. Its userdata must
 // remain valid until surface destruction; output callers must first quiesce.
 typedef void (*ghostty_io_write_cb)(void*, const char*, uintptr_t);
@@ -553,6 +565,7 @@ typedef struct {
   // A MANUAL_MIRROR surface still answers the Kitty clipboard protocol
   // (OSC 5522) through the clipboard callbacks.
   bool kitty_clipboard;
+  ghostty_image_media_e kitty_image_media;
 } ghostty_surface_config_s;
 
 typedef struct {
@@ -1294,9 +1307,10 @@ GHOSTTY_API bool ghostty_surface_set_grid_size(ghostty_surface_t,
                                                uint16_t columns,
                                                uint16_t rows,
                                                ghostty_surface_size_s* resolved);
+GHOSTTY_API ghostty_image_recovery_e ghostty_surface_take_unread_images(ghostty_surface_t);
 GHOSTTY_API void ghostty_surface_pending_image_rows(ghostty_surface_t, int64_t, bool, bool*, size_t);
-GHOSTTY_API void ghostty_surface_fill_images_reset(ghostty_surface_t);
-GHOSTTY_API void ghostty_surface_fill_images(ghostty_surface_t, const char*, size_t, bool);
+GHOSTTY_API uint64_t ghostty_surface_fill_images_reset(ghostty_surface_t);
+GHOSTTY_API void ghostty_surface_fill_images(ghostty_surface_t, const char*, size_t, bool, uint64_t, bool);
 GHOSTTY_API size_t ghostty_surface_prepend_history(ghostty_surface_t, const char*, size_t);
 GHOSTTY_API void ghostty_surface_raise_scrollback_limit(ghostty_surface_t);
 GHOSTTY_API void ghostty_surface_restore_output(ghostty_surface_t, const char*, size_t);

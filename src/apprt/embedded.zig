@@ -451,6 +451,7 @@ pub const EnvVar = extern struct {
 };
 
 pub const IoMode = @import("../termio/Manual.zig").IoMode;
+pub const ImageMedia = enum(c_int) { all, direct, local };
 
 pub const IoWriteCallback = *const fn (?*anyopaque, [*]const u8, usize) callconv(.c) void;
 pub const RenderPresentedCallback = *const fn (?*anyopaque, u64) callconv(.c) void;
@@ -478,6 +479,7 @@ pub const Surface = struct {
     io_write_cb: ?IoWriteCallback = null,
     io_write_userdata: ?*anyopaque = null,
     kitty_clipboard: bool = false,
+    kitty_image_media: ImageMedia = .all,
 
     font_size_action_cb: ?FontSizeActionCallback = null,
     font_size_action_userdata: ?*anyopaque = null,
@@ -544,6 +546,7 @@ pub const Surface = struct {
         /// Whether a manual mirror still answers the Kitty clipboard
         /// protocol (OSC 5522) through the embedder.
         kitty_clipboard: bool = false,
+        kitty_image_media: ImageMedia = .all,
     };
 
     pub fn init(self: *Surface, app: *App, opts: Options) !void {
@@ -562,6 +565,7 @@ pub const Surface = struct {
             .io_write_cb = opts.io_write_cb,
             .io_write_userdata = opts.io_write_userdata,
             .kitty_clipboard = opts.kitty_clipboard,
+            .kitty_image_media = opts.kitty_image_media,
         };
 
         // Add ourselves to the list of surfaces on the app.
@@ -763,6 +767,14 @@ pub const Surface = struct {
 
     pub fn usesManualIo(self: *const Surface) bool {
         return self.io_mode.usesManualIo();
+    }
+
+    pub fn imageLoadingLimits(self: *const Surface) ?terminal.kitty.graphics.LoadingImage.Limits {
+        return switch (self.kitty_image_media) {
+            .all => null,
+            .direct => .direct,
+            .local => .local,
+        };
     }
 
     pub fn ioWriteCallback(self: *const Surface) ?IoWriteCallback {
@@ -1335,6 +1347,7 @@ pub const Surface = struct {
             .io_write_cb = self.io_write_cb,
             .io_write_userdata = self.io_write_userdata,
             .kitty_clipboard = self.kitty_clipboard,
+            .kitty_image_media = self.kitty_image_media,
         };
     }
 
@@ -2366,16 +2379,20 @@ pub const CAPI = struct {
         surface.preeditCallback(if (len == 0) null else ptr[0..len]);
     }
 
+    export fn ghostty_surface_take_unread_images(surface: *Surface) terminal.kitty.graphics.ImageStorage.Recovery {
+        return surface.core_surface.io.takeUnreadImages();
+    }
+
     export fn ghostty_surface_pending_image_rows(surface: *Surface, start: i64, alternate: bool, rows: [*]bool, len: usize) void {
         surface.core_surface.io.pendingImageRows(start, alternate, rows[0..len]);
     }
 
-    export fn ghostty_surface_fill_images_reset(surface: *Surface) void {
-        surface.core_surface.io.resetImageFill();
+    export fn ghostty_surface_fill_images_reset(surface: *Surface) u64 {
+        return surface.core_surface.io.resetImageFill();
     }
 
-    export fn ghostty_surface_fill_images(surface: *Surface, ptr: [*]const u8, len: usize, alternate: bool) void {
-        surface.core_surface.io.fillImages(ptr[0..len], alternate);
+    export fn ghostty_surface_fill_images(surface: *Surface, ptr: [*]const u8, len: usize, alternate: bool, generation: u64, final: bool) void {
+        surface.core_surface.io.fillImages(ptr[0..len], alternate, generation, final);
     }
 
     export fn ghostty_surface_prepend_history(surface: *Surface, ptr: [*]const u8, len: usize) usize {

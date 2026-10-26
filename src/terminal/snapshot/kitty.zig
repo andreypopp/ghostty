@@ -1895,8 +1895,8 @@ pub fn decodePayload(
         const expected: usize = switch (frame) {
             0 => break :ticket null,
             1 => switch (img.data) {
-                .pending => |len| len,
-                .complete => break :ticket null,
+                .pending, .unread => |len| len,
+                .complete, .mapped => break :ticket null,
             },
             else => expected: {
                 const anim = img.animation orelse break :ticket null;

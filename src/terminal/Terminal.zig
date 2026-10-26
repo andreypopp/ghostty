@@ -39,7 +39,8 @@ const ScreenSet = @import("ScreenSet.zig");
 const ImageFill = struct {
     terminal: Terminal,
     stream: Stream,
-    pending: ?kitty.graphics.ImageStorage.PendingImage = null,
+    pending: std.AutoHashMapUnmanaged(u32, kitty.graphics.ImageStorage.PendingImage) = .empty,
+    initialized: bool = false,
 };
 const Page = pagepkg.Page;
 const Cell = pagepkg.Cell;
@@ -480,7 +481,7 @@ test "Terminal prepend history allocation refusal preserves compressed and resid
         try chunk.writer.print("{d}", .{i});
     }
     for ([_]bool{ false, true }) |do_compress| {
-        var source = try historyScratch(testing.io, testing.allocator, 80, chunk.written());
+        var source = try historyScratch(testing.io, testing.allocator, 80, .direct, chunk.written());
         defer source.deinit(testing.allocator);
         if (do_compress) _ = source.screens.active.pages.compress(.full);
         const was_compressed = std.meta.activeTag(source.screens.active.pages.pages.first.?.data) == .compressed;
@@ -505,8 +506,8 @@ test "Terminal prepend history allocation refusal preserves compressed and resid
     }
 }
 
-pub fn historyScratch(io_impl: std.Io, alloc: Allocator, cols: size.CellCountInt, bytes: []const u8) !Terminal {
-    var scratch = try init(io_impl, alloc, .{ .cols = cols, .rows = 1, .max_scrollback_bytes = null, .max_scrollback_lines = null });
+pub fn historyScratch(io_impl: std.Io, alloc: Allocator, cols: size.CellCountInt, limits: kitty.graphics.LoadingImage.Limits, bytes: []const u8) !Terminal {
+    var scratch = try init(io_impl, alloc, .{ .cols = cols, .rows = 1, .max_scrollback_bytes = null, .max_scrollback_lines = null, .kitty_image_loading_limits = limits });
     errdefer scratch.deinit(alloc);
     var stream = scratch.vtStream();
     stream.handler.restoring = true;
@@ -515,20 +516,38 @@ pub fn historyScratch(io_impl: std.Io, alloc: Allocator, cols: size.CellCountInt
     return scratch;
 }
 
-pub fn parseImageFill(self: *Terminal, alloc: Allocator, bytes: []const u8, limit: usize) !void {
+pub fn prepareImageFill(self: *Terminal, alloc: Allocator, alternate: bool, limit: usize, limits: kitty.graphics.LoadingImage.Limits) !void {
     const fill = self.image_fill orelse fill: {
         const state = try alloc.create(ImageFill);
         errdefer alloc.destroy(state);
-        state.* = .{ .terminal = try init(self.io(), alloc, .{ .cols = 1, .rows = 1, .kitty_image_storage_limit = limit }), .stream = undefined };
+        state.* = .{ .terminal = try init(self.io(), alloc, .{
+            .cols = 1,
+            .rows = 1,
+            .kitty_image_loading_limits = limits,
+        }), .stream = undefined };
         state.stream = state.terminal.vtStream();
         self.image_fill = state;
         break :fill state;
     };
-    if (fill.terminal.screens.active.kitty_images.total_limit != limit) fill.terminal.setKittyGraphicsSizeLimit(alloc, limit);
+    if (!fill.initialized) {
+        fill.terminal.setKittyGraphicsSizeLimit(alloc, limit);
+        const screen = self.screens.get(if (alternate) .alternate else .primary) orelse return;
+        var images = screen.kitty_images.images.valueIterator();
+        while (images.next()) |image| {
+            if (image.data.isPending()) try fill.pending.put(alloc, image.id, .{ .id = image.id, .transmission = image.transmission });
+        }
+        fill.initialized = true;
+    }
+    fill.stream.handler.image_fill_ids = &fill.pending;
+    fill.stream.handler.restoring = true;
+}
+
+pub fn parseImageFill(self: *Terminal, bytes: []const u8) void {
+    const fill = self.image_fill orelse return;
     fill.stream.nextSlice(bytes);
 }
 
-pub fn completeImageFill(self: *Terminal, alloc: Allocator, alternate: bool) !void {
+pub fn completeImageFill(self: *Terminal, alloc: Allocator, alternate: bool, final: bool) !void {
     const screen = self.screens.get(if (alternate) .alternate else .primary) orelse return;
     const storage = &screen.kitty_images;
     if (!storage.enabled()) return;
@@ -536,46 +555,42 @@ pub fn completeImageFill(self: *Terminal, alloc: Allocator, alternate: bool) !vo
     const scratch = &fill.terminal.screens.active.kitty_images;
     var images = scratch.images.iterator();
     while (images.next()) |entry| {
-        defer entry.value_ptr.deinit(alloc);
-        const held = storage.imageById(entry.key_ptr.*) orelse continue;
-        if (!held.data.isPending() or entry.value_ptr.data.isPending()) continue;
-        const token: kitty.graphics.ImageStorage.PendingImage = if (fill.pending) |pending|
-            (if (pending.id == held.id) pending else .{ .id = held.id, .transmission = held.transmission })
-        else
-            .{ .id = held.id, .transmission = held.transmission };
-        if (token.completeImage(storage, self.io(), alloc, screen, entry.value_ptr.*) catch false) {
-            entry.value_ptr.data = .{ .complete = "" };
-            entry.value_ptr.animation = null;
+        const id = entry.key_ptr.*;
+        if (!final and fill.stream.handler.image_fill_root == id) continue;
+        if (entry.value_ptr.data.isPending()) continue;
+        if (entry.value_ptr.animation) |anim| {
+            if (anim.hasPendingFrames()) continue;
+        }
+        var image = scratch.takeImage(id).?;
+        defer image.deinit(alloc);
+        const token = fill.pending.get(id) orelse continue;
+        if (token.completeImage(storage, self.io(), alloc, screen, image) catch false) {
+            image.data = .{ .complete = "" };
+            image.animation = null;
         }
     }
-    scratch.images.clearRetainingCapacity();
-    scratch.total_bytes = 0;
-    if (scratch.loading) |loading| {
-        if (fill.pending == null or fill.pending.?.id != loading.image.id) {
-            const held = storage.imageById(loading.image.id);
-            fill.pending = if (held) |img| .{ .id = img.id, .transmission = img.transmission } else null;
-        }
-    } else fill.pending = null;
 }
 
 pub fn fillImagesForTest(self: *Terminal, alloc: Allocator, bytes: []const u8, alternate: bool) !void {
     const screen = self.screens.get(if (alternate) .alternate else .primary) orelse return;
     if (!screen.kitty_images.enabled()) return;
-    try self.parseImageFill(alloc, bytes, screen.kitty_images.total_limit);
-    try self.completeImageFill(alloc, alternate);
+    try self.prepareImageFill(alloc, alternate, screen.kitty_images.total_limit, screen.kitty_images.image_limits);
+    self.parseImageFill(bytes);
+    try self.completeImageFill(alloc, alternate, true);
 }
 
 pub fn resetImageFill(self: *Terminal) void {
     const fill = self.image_fill orelse return;
     fill.stream.deinit();
     fill.terminal.fullReset();
-    fill.pending = null;
+    fill.pending.clearRetainingCapacity();
+    fill.initialized = false;
     fill.stream = fill.terminal.vtStream();
 }
 
 pub fn prependHistory(self: *Terminal, alloc: Allocator, bytes: []const u8) !usize {
     if (self.screens.active_key != .primary or bytes.len == 0) return 0;
-    var scratch = try historyScratch(self.io(), alloc, self.cols, bytes);
+    var scratch = try historyScratch(self.io(), alloc, self.cols, self.screens.active.kitty_images.image_limits, bytes);
     defer scratch.deinit(alloc);
     return kitty.graphics.ImageStorage.prepend(self.io(), alloc, self.screens.active, scratch.screens.active);
 }
@@ -583,6 +598,7 @@ pub fn prependHistory(self: *Terminal, alloc: Allocator, bytes: []const u8) !usi
 pub fn deinit(self: *Terminal, alloc: Allocator) void {
     if (self.image_fill) |fill| {
         fill.stream.deinit();
+        fill.pending.deinit(alloc);
         fill.terminal.deinit(alloc);
         alloc.destroy(fill);
     }
@@ -16640,6 +16656,36 @@ test "Terminal: fullReset status display" {
     t.status_display = .status_line;
     t.fullReset();
     try testing.expect(t.status_display == .main);
+}
+
+test "Terminal: kitty media policy reaches image fill" {
+    const alloc = testing.allocator;
+    for ([_]bool{ false, true }) |shared_memory| {
+        var t = try init(testing.io, alloc, .{
+            .cols = 2,
+            .rows = 2,
+            .kitty_image_loading_limits = .{ .file = false, .temporary_file = .disabled, .shared_memory = shared_memory },
+        });
+        defer t.deinit(alloc);
+        try t.fillImagesForTest(alloc, "", false);
+        const limits = t.image_fill.?.terminal.screens.active.kitty_images.image_limits;
+        var history = try historyScratch(testing.io, alloc, 2, limits, "");
+        defer history.deinit(alloc);
+        try testing.expectEqualDeep(limits, history.screens.active.kitty_images.image_limits);
+        try testing.expect(!limits.file);
+        try testing.expect(limits.temporary_file == .disabled);
+        try testing.expectEqual(shared_memory, limits.shared_memory);
+        for ([_][]const u8{ "a=t,i=1,f=32,s=1,v=1,t=f;L3RtcC9pbWFnZQ==", "a=t,i=1,f=32,s=1,v=1,t=t;L3RtcC9pbWFnZQ==" }) |input| {
+            const cmd = try kitty.graphics.CommandParser.parseString(alloc, input);
+            defer cmd.deinit(alloc);
+            try testing.expectError(error.UnsupportedMedium, kitty.graphics.LoadingImage.init(testing.io, alloc, &cmd, limits));
+        }
+        if (!shared_memory) {
+            const cmd = try kitty.graphics.CommandParser.parseString(alloc, "a=t,i=1,f=32,s=1,v=1,t=s;L2ltYWdl");
+            defer cmd.deinit(alloc);
+            try testing.expectError(error.UnsupportedMedium, kitty.graphics.LoadingImage.init(testing.io, alloc, &cmd, limits));
+        }
+    }
 }
 
 test "Terminal: fullReset preserves kitty graphics limits" {
