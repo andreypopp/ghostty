@@ -8,6 +8,7 @@ const objc = @import("objc");
 
 const mtl = @import("api.zig");
 const Metal = @import("../Metal.zig");
+const Mapping = @import("../../terminal/main.zig").kitty.graphics.Image.Mapping;
 
 const log = std.log.scoped(.metal);
 
@@ -22,6 +23,7 @@ pub const Options = struct {
 
 /// The underlying MTLTexture Object.
 texture: objc.Object,
+buffer: ?objc.Object = null,
 
 /// The width of this texture.
 width: usize,
@@ -43,21 +45,8 @@ pub fn init(
     height: usize,
     data: ?[]const u8,
 ) Error!Self {
-    // Create our descriptor
-    const desc = init: {
-        const Class = objc.getClass("MTLTextureDescriptor").?;
-        const id_alloc = Class.msgSend(objc.Object, objc.sel("alloc"), .{});
-        const id_init = id_alloc.msgSend(objc.Object, objc.sel("init"), .{});
-        break :init id_init;
-    };
+    const desc = descriptor(opts, width, height, opts.resource_options);
     defer desc.release();
-
-    // Set our properties
-    desc.setProperty("pixelFormat", @backingInt(opts.pixel_format));
-    desc.setProperty("width", @as(c_ulong, width));
-    desc.setProperty("height", @as(c_ulong, height));
-    desc.setProperty("resourceOptions", opts.resource_options);
-    desc.setProperty("usage", opts.usage);
 
     // Initialize
     const id = opts.device.msgSend(
@@ -82,8 +71,55 @@ pub fn init(
     return self;
 }
 
+fn descriptor(opts: Options, width: usize, height: usize, resources: mtl.MTLResourceOptions) objc.Object {
+    const class = objc.getClass("MTLTextureDescriptor").?;
+    const desc = class.msgSend(objc.Object, objc.sel("new"), .{});
+    desc.setProperty("pixelFormat", @backingInt(opts.pixel_format));
+    desc.setProperty("width", @as(c_ulong, width));
+    desc.setProperty("height", @as(c_ulong, height));
+    desc.setProperty("resourceOptions", resources);
+    desc.setProperty("usage", opts.usage);
+    return desc;
+}
+
+pub fn initMapped(opts: Options, width: usize, height: usize, mapping: *Mapping) Error!?Self {
+    if (opts.resource_options.storage_mode != .shared or
+        mapping.memory.len > opts.device.getProperty(c_ulong, "maxBufferLength")) return null;
+    const alignment = opts.device.msgSend(usize, objc.sel("minimumLinearTextureAlignmentForPixelFormat:"), .{@backingInt(opts.pixel_format)});
+    const bytes_per_row = width * bppOf(opts.pixel_format);
+    if (alignment == 0 or mapping.start % alignment != 0 or bytes_per_row % alignment != 0) return null;
+    const options: mtl.MTLResourceOptions = .{ .storage_mode = .shared };
+    const block = MappingDeallocator.init(.{ .mapping = mapping.retain() }, &releaseMapping);
+    const raw_buffer = opts.device.msgSend(?*anyopaque, objc.sel("newBufferWithBytesNoCopy:length:options:deallocator:"), .{
+        @as(*anyopaque, mapping.memory.ptr),
+        @as(c_ulong, mapping.memory.len),
+        options,
+        &block,
+    }) orelse {
+        mapping.release();
+        return error.MetalFailed;
+    };
+    const buffer = objc.Object.fromId(raw_buffer);
+    errdefer buffer.release();
+    const desc = descriptor(opts, width, height, options);
+    defer desc.release();
+    const texture = buffer.msgSend(?*anyopaque, objc.sel("newTextureWithDescriptor:offset:bytesPerRow:"), .{
+        desc, @as(c_ulong, mapping.start), @as(c_ulong, bytes_per_row),
+    }) orelse return error.MetalFailed;
+    return .{ .texture = objc.Object.fromId(texture), .buffer = buffer, .width = width, .height = height, .bpp = bppOf(opts.pixel_format) };
+}
+
+const MappingDeallocator = objc.Block(struct {
+    mapping: *Mapping,
+}, .{ ?*anyopaque, c_ulong }, void);
+
+fn releaseMapping(block: *const MappingDeallocator.Context, _: ?*anyopaque, _: c_ulong) callconv(.c) void {
+    block.mapping.release();
+}
+
 pub fn deinit(self: Self) void {
     self.texture.release();
+    if (self.buffer) |buffer| buffer.release();
 }
 
 /// Replace a region of the texture with the provided data.

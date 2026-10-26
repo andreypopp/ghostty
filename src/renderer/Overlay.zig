@@ -113,7 +113,7 @@ pub fn pendingImage(self: *const Overlay) Image.Pending {
         .width = @intCast(self.surface.getWidth()),
         .height = @intCast(self.surface.getHeight()),
         .pixel_format = .rgba,
-        .data = @ptrCast(self.surface.image_surface_rgba.buf.ptr),
+        .data = .{ .owned = @ptrCast(self.surface.image_surface_rgba.buf.ptr) },
     };
 }
 

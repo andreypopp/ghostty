@@ -228,7 +228,7 @@ pub const ImageStorage = struct {
         ) bool {
             const img = self.image(storage) orelse return false;
             const expected_len = switch (img.data) {
-                .complete => return false,
+                .complete, .mapped => return false,
                 .pending => |len| len,
             };
             if (data.len != expected_len) return false;
@@ -474,6 +474,17 @@ pub const ImageStorage = struct {
         gop.value_ptr.transmission = self.generation;
     }
 
+    pub fn holdImage(self: *ImageStorage, io: std.Io, alloc: Allocator, id: u32) bool {
+        const image = self.images.getPtr(id) orelse return false;
+        const reserved = image.storageSize();
+        image.deinit(alloc);
+        image.data = .{ .pending = reserved };
+        self.markMutated(io);
+        image.generation = self.generation;
+        image.transmission = self.generation;
+        return true;
+    }
+
     /// Add an image whose pixels have not arrived yet. `img.data` must be
     /// `.pending` with the length of the decoded pixels. Returns the
     /// ticket to attach those pixels later. See `PendingImage`.
@@ -484,7 +495,7 @@ pub const ImageStorage = struct {
         s: *terminal.Screen,
         img: Image,
     ) Allocator.Error!PendingImage {
-        assert(img.data == .pending);
+        assert(img.data.isPending());
         try self.addImage(io, alloc, s, img);
         const stored = self.images.get(img.id).?;
         return .{ .id = stored.id, .transmission = stored.transmission };
@@ -2335,29 +2346,33 @@ fn stars() []u8 {
     return result;
 }
 
-test "kittygfx restore pending snapshot retransmit releases frames" {
+test "storage: shared memory mapped references survive replace and eviction" {
     const testing = std.testing;
     const alloc = testing.allocator;
-    var t = try terminal.Terminal.init(testing.io, alloc, .{ .cols = 3, .rows = 3 });
-    defer t.deinit(alloc);
-    const storage = &t.screens.active.kitty_images;
-    _ = try storage.addPendingImage(testing.io, alloc, t.screens.active, .{
-        .id = 1,
-        .width = 1,
-        .height = 1,
-        .format = .rgba,
-        .data = .{ .pending = 4 },
-    });
-    const anim = try alloc.create(animation.Animation);
-    anim.* = .{};
-    storage.images.getPtr(1).?.animation = anim;
-    try anim.frames.append(alloc, .{ .data = try alloc.dupe(u8, "old!"), .gap_ms = 10 });
-    try storage.reserveAnimationBytes(testing.io, alloc, t.screens.active, 1, 4);
-    const cmd = try terminal.kitty.graphics.CommandParser.parseString(alloc, "a=t,i=1,f=32,s=1,v=1;/wAA/w==");
-    defer cmd.deinit(alloc);
-    try testing.expect(terminal.kitty.graphics.execute(testing.io, alloc, &t, &cmd).?.ok());
-    try testing.expectEqual(@as(usize, 4), storage.total_bytes);
-    try testing.expect(storage.imageById(1).?.animation == null);
+    const io = testing.io;
+    for ([_]enum { replace, evict }{ .replace, .evict }) |action| {
+        var t = try terminal.Terminal.init(io, alloc, .{ .cols = 2, .rows = 2 });
+        defer t.deinit(alloc);
+        const storage = &t.screens.active.kitty_images;
+        storage.total_limit = 4;
+        const memory = try std.posix.mmap(null, std.heap.pageSize(), .{ .READ = true, .WRITE = true }, .{ .TYPE = .PRIVATE, .ANONYMOUS = true }, -1, 0);
+        @memcpy(memory[0..4], &[_]u8{ 255, 0, 0, 255 });
+        const mapping = try Image.Mapping.init(alloc, memory, 0, 4);
+        try storage.addImage(io, alloc, t.screens.active, .{ .id = 1, .width = 1, .height = 1, .format = .rgba, .data = .{ .mapped = mapping } });
+        const renderer_ref = mapping.retain();
+        defer renderer_ref.release();
+        try testing.expectEqual(@as(usize, 2), mapping.refs.load(.acquire));
+        try storage.addImage(io, alloc, t.screens.active, .{
+            .id = if (action == .replace) 1 else 2,
+            .width = 1,
+            .height = 1,
+            .format = .rgba,
+            .data = .{ .complete = try alloc.dupe(u8, &.{ 0, 0, 255, 255 }) },
+        });
+        try testing.expectEqual(@as(usize, 1), mapping.refs.load(.acquire));
+        try testing.expectEqualSlices(u8, &.{ 255, 0, 0, 255 }, renderer_ref.bytes());
+        try testing.expectEqual(@as(usize, 4), storage.total_bytes);
+    }
 }
 
 test "storage: add placement with zero placement id" {
@@ -3878,6 +3893,55 @@ test "storage: eviction releases placement pins" {
         .placement_id = .{ .tag = .external, .id = 1 },
     }));
     try testing.expectEqual(tracked + 1, t.screens.active.pages.countTrackedPins());
+}
+
+test "kittygfx restore pending snapshot retransmit releases frames" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var t = try terminal.Terminal.init(testing.io, alloc, .{ .cols = 3, .rows = 3 });
+    defer t.deinit(alloc);
+    const storage = &t.screens.active.kitty_images;
+    _ = try storage.addPendingImage(testing.io, alloc, t.screens.active, .{
+        .id = 1,
+        .width = 1,
+        .height = 1,
+        .format = .rgba,
+        .data = .{ .pending = 4 },
+    });
+    const anim = try alloc.create(animation.Animation);
+    anim.* = .{};
+    storage.images.getPtr(1).?.animation = anim;
+    try anim.frames.append(alloc, .{ .data = try alloc.dupe(u8, "old!"), .gap_ms = 10 });
+    try storage.reserveAnimationBytes(testing.io, alloc, t.screens.active, 1, 4);
+    const cmd = try terminal.kitty.graphics.CommandParser.parseString(alloc, "a=t,i=1,f=32,s=1,v=1;/wAA/w==");
+    defer cmd.deinit(alloc);
+    try testing.expect(terminal.kitty.graphics.execute(testing.io, alloc, &t, &cmd).?.ok());
+    try testing.expectEqual(@as(usize, 4), storage.total_bytes);
+    try testing.expect(storage.imageById(1).?.animation == null);
+}
+
+test "kittygfx restore pending root promotion remains removable" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var t = try terminal.Terminal.init(testing.io, alloc, .{ .cols = 3, .rows = 3 });
+    defer t.deinit(alloc);
+    const storage = &t.screens.active.kitty_images;
+    try storage.addImage(testing.io, alloc, t.screens.active, .{
+        .id = 1,
+        .width = 1,
+        .height = 1,
+        .format = .rgba,
+        .data = .{ .complete = try alloc.dupe(u8, "root") },
+    });
+    const anim = try alloc.create(animation.Animation);
+    anim.* = .{};
+    storage.images.getPtr(1).?.animation = anim;
+    try anim.frames.append(alloc, .{ .data = &.{}, .gap_ms = 10, .pending_len = 4 });
+    try storage.reserveAnimationBytes(testing.io, alloc, t.screens.active, 1, 4);
+    storage.delete(testing.io, alloc, &t, .{ .animation_frames = .{ .image_id = 1, .frame = 1 } });
+    try testing.expect(storage.imageById(1).?.data.isPending());
+    storage.delete(testing.io, alloc, &t, .{ .id = .{ .image_id = 1, .delete = true } });
+    try testing.expectEqual(@as(usize, 0), storage.total_bytes);
 }
 
 test "storage: pending image completes once and preserves age" {

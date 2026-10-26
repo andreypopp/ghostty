@@ -530,6 +530,12 @@ typedef enum {
   GHOSTTY_SURFACE_IO_MANUAL_MIRROR = 2,
 } ghostty_surface_io_mode_e;
 
+typedef enum {
+  GHOSTTY_IMAGE_MEDIA_ALL,
+  GHOSTTY_IMAGE_MEDIA_DIRECT,
+  GHOSTTY_IMAGE_MEDIA_LOCAL,
+} ghostty_image_media_e;
+
 // The callback borrows bytes for the duration of the call. Its userdata must
 // remain valid until surface destruction; output callers must first quiesce.
 typedef void (*ghostty_io_write_cb)(void*, const char*, uintptr_t);
@@ -553,6 +559,7 @@ typedef struct {
   // A MANUAL_MIRROR surface still answers the Kitty clipboard protocol
   // (OSC 5522) through the clipboard callbacks.
   bool kitty_clipboard;
+  ghostty_image_media_e kitty_image_media;
 } ghostty_surface_config_s;
 
 typedef struct {

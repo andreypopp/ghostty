@@ -2244,7 +2244,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         .width = image_data.width,
                         .height = image_data.height,
                         .pixel_format = .rgba,
-                        .data = image_data.data.ptr,
+                        .data = .{ .owned = image_data.data.ptr },
                     },
                 };
 

@@ -98,6 +98,13 @@ pub fn executeRestoring(
                 }
             }
 
+            if (!storage.image_limits.allows(cmd.transmission().?.medium)) break :resp .{
+                .id = identifiers.image_id,
+                .image_number = identifiers.image_number,
+                .placement_id = identifiers.placement_id,
+                .message = "ENOTSUP: unsupported medium",
+            };
+
             // If we're transmitting, then our `q` setting value is complicated.
             // The `q` setting inherits the value from the starting command
             // unless `q` is set >= 1 on this command. If it is, then we save
@@ -242,6 +249,19 @@ fn transmit(
 
     const load = loadAndAddImage(io, alloc, terminal, cmd) catch |err| {
         encodeError(&result, err);
+        if (err == error.MediumUnavailable) {
+            const id = if (t.image_id != 0) t.image_id else storage.nextImageId(if (t.image_number != 0) .explicit else .implicit);
+            if (!storage.holdImage(io, alloc, id)) {
+                var held: Image = .{ .id = id, .number = t.image_number, .width = t.width, .height = t.height, .format = t.format, .data = .{ .pending = 0 } };
+                held.metadata.implicit_id = t.image_id == 0 and t.image_number == 0;
+                _ = storage.addPendingImage(io, alloc, terminal.screens.active, held) catch return result;
+            }
+            if (cmd.display()) |placement| {
+                var d = placement;
+                d.image_id = id;
+                _ = display(io, alloc, terminal, &.{ .control = .{ .display = d }, .quiet = cmd.quiet });
+            }
+        }
         return result;
     };
     errdefer load.image.deinit(alloc);
@@ -544,6 +564,9 @@ fn transmitAnimationFrame(
         storage.image_limits,
     ) catch |err| {
         encodeError(&result, err);
+        if (err == error.MediumUnavailable) {
+            _ = storage.holdImage(io, alloc, img.id);
+        }
         return result;
     };
     loading.frame = .{
@@ -551,7 +574,6 @@ fn transmitAnimationFrame(
         .image_generation = img.generation,
     };
     loading.response.id = img.id;
-
     // Chunked: store the loading state and wait for the rest. The
     // frame parameters above are saved with it; continuation chunks
     // contribute only payload bytes.
@@ -573,6 +595,10 @@ fn transmitAnimationFrame(
         terminal,
         &loading,
     );
+}
+
+fn frameGap(gap_ms: i32) u32 {
+    return if (gap_ms > 0) @intCast(gap_ms) else if (gap_ms < 0) 0 else animation.default_gap_ms;
 }
 
 /// Complete a fully loaded animation frame: validate it against its
@@ -662,12 +688,7 @@ fn completeAnimationFrame(
     if (number == count + 1) {
         // Creating a new frame. The gap defaults to 40ms when omitted
         // and a negative gap creates a gapless (never shown) frame.
-        const gap: u32 = if (f.gap_ms > 0)
-            @intCast(f.gap_ms)
-        else if (f.gap_ms < 0)
-            0
-        else
-            animation.default_gap_ms;
+        const gap = frameGap(f.gap_ms);
 
         // The base canvas frame must exist before we reserve space.
         if (f.create_frame > 0 and img.frameData(f.create_frame) == null) {
@@ -743,6 +764,10 @@ fn completeAnimationFrame(
         //
         // The frame data is owned by this storage, so the const cast
         // is safe (same reasoning as the renderer's image uploads).
+        if (number == 1) img.data.makeOwned(alloc) catch {
+            result.message = "ENOMEM: out of memory";
+            return result;
+        };
         const dst = @constCast(img.frameData(number) orelse {
             result.message = "EINVAL: frame data incomplete";
             return result;
@@ -951,6 +976,10 @@ fn composeAnimation(
     // The frame data is owned by this storage, so the const cast is
     // safe. The rectangles were validated disjoint above, so in-place
     // composition within one frame is well-defined.
+    if (c.dest_frame == 1) img.data.makeOwned(alloc) catch {
+        result.message = "ENOMEM: out of memory";
+        return result;
+    };
     const src = img.frameData(c.source_frame).?;
     const dst = @constCast(img.frameData(c.dest_frame).?);
     pixel.composeCanvasRect(
@@ -1120,6 +1149,7 @@ fn encodeError(r: *Response, err: EncodeableError) void {
         error.TemporaryFileNotNamedCorrectly => r.message = "EINVAL: temporary file not named correctly",
         error.UnsupportedFormat => r.message = "EINVAL: unsupported format",
         error.UnsupportedMedium => r.message = "EINVAL: unsupported medium",
+        error.MediumUnavailable => r.message = "EBADF: image data unavailable",
         error.UnsupportedDepth => r.message = "EINVAL: unsupported pixel depth",
         error.DimensionsRequired => r.message = "EINVAL: dimensions required",
         error.DimensionsTooLarge => r.message = "EINVAL: dimensions too large",
