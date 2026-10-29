@@ -161,16 +161,19 @@ pub fn isRunning(self: *DisplayLink) bool {
 /// The change is applied shortly after on the main thread. Until then
 /// `isRunning` keeps reporting the old state. Calling this repeatedly
 /// with the same value is cheap, and calling it with alternating values
-/// in quick succession results in at most one real change.
+/// in quick succession coalesces changes that have not started yet.
+/// A changed request also queues a sync when the actual state matches,
+/// since an in-flight sync may still be applying the previous request.
 ///
 /// This and `setDisplay` must be called from a single thread, which
 /// for the renderer is the render thread. That thread is the only
 /// writer of the requested state, so no compare-and-swap is needed.
 pub fn setRunning(self: *DisplayLink, running: bool) void {
     var requested = self.requested.load(.seq_cst);
+    const changed = requested.running != running;
     requested.running = running;
     self.requested.store(requested, .seq_cst);
-    if (running != self.link.isRunning()) self.queueSync();
+    if (changed or running != self.link.isRunning()) self.queueSync();
 }
 
 /// Request that the link be bound to the given CGDirectDisplayID, so
