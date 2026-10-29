@@ -1138,20 +1138,14 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// at draw_interval_ms while active, and a running Kitty
         /// graphics animation wants an update wake when its next
         /// frame is due. The renderer thread drives its animation
-        /// timer off this, re-querying after every wake.
+        /// timer off this, re-querying after every wake. Only custom
+        /// shader animation needs continuous redraws between updates.
         ///
         /// Must be called on the render thread.
         pub fn animationWake(self: *const Self) ?AnimationWake {
             // Custom shaders animate by redrawing on a fixed cadence,
             // gated by configuration and focus.
-            const shader_delay: ?u64 = shader: {
-                if (!self.has_custom_shaders) break :shader null;
-                break :shader switch (self.config.custom_shader_animation) {
-                    .false => null,
-                    .always => draw_interval_ms,
-                    .true => if (self.focused) draw_interval_ms else null,
-                };
-            };
+            const shader_delay: ?u64 = if (self.hasShaderAnimation()) draw_interval_ms else null;
 
             // Kitty animations tick during updateFrame; between
             // updates the deadline is absolute on the animation
@@ -1180,6 +1174,24 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             if (shader_delay) |s| return .{ .delay_ms = s, .kind = .draw };
 
             return null;
+        }
+
+        fn hasShaderAnimation(self: *const Self) bool {
+            return self.has_custom_shaders and switch (self.config.custom_shader_animation) {
+                .false => false,
+                .always => true,
+                .true => self.focused,
+            };
+        }
+
+        test "Kitty animation wake alone needs no shader redraw" {
+            const testing = std.testing;
+            var r: Self = undefined;
+            r.has_custom_shaders = false;
+            r.kitty_animation_next_ms = 250;
+            r.kitty_animation_clock = .now(global.io(), .awake);
+            try testing.expectEqual(.update, r.animationWake().?.kind);
+            try testing.expect(!r.hasShaderAnimation());
         }
 
         /// Returns true if the display link is running, meaning frames
@@ -1267,7 +1279,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// Create the display link if needed, then ask it to match the
         /// current surface state: bound to `display_id` if one is given,
         /// and running only while the surface is visible and has
-        /// something to draw (rebuilt cells or a running animation).
+        /// something to draw (rebuilt cells or images, or an animated shader).
         ///
         /// `draw_now` is required the first time this is called, since
         /// creating the link needs the handle its callback will notify.
@@ -1312,10 +1324,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             const should_run =
                 // Non-visible windows never vsync
                 self.visible and
-                // Only vsync if we have cell or image changes or animation
+                // Only vsync for cell or image changes or animated shaders
                 (self.cells_rebuilt or
                     self.images_rebuilt or
-                    self.animationWake() != null);
+                    self.hasShaderAnimation());
 
             display_link.setRunning(should_run);
         }
@@ -1814,14 +1826,14 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // Conditions under which we need to draw the frame, otherwise we
             // don't need to since the previous frame should be identical.
             //
-            // While any animation is in progress (a pending animation wake)
-            // every draw must actually render.
+            // Animated shaders redraw continuously. Kitty frame updates
+            // rebuild images only when a frame is due.
             const needs_redraw =
                 size_changed or
                 swap_chain_rebuilt or
                 self.cells_rebuilt or
                 self.images_rebuilt or
-                self.animationWake() != null or
+                self.hasShaderAnimation() or
                 sync or presentation != null;
 
             if (!needs_redraw) {
