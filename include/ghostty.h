@@ -1314,6 +1314,14 @@ GHOSTTY_API void ghostty_surface_fill_images(ghostty_surface_t, const char*, siz
 GHOSTTY_API size_t ghostty_surface_prepend_history(ghostty_surface_t, const char*, size_t);
 GHOSTTY_API void ghostty_surface_raise_scrollback_limit(ghostty_surface_t);
 GHOSTTY_API void ghostty_surface_restore_output(ghostty_surface_t, const char*, size_t);
+typedef bool (*ghostty_snapshot_read_fn)(void*, uint8_t*, size_t, size_t*);
+typedef enum {
+  GHOSTTY_SNAPSHOT_RESTORE_OK = 0,
+  GHOSTTY_SNAPSHOT_RESTORE_REJECTED = 1,
+  GHOSTTY_SNAPSHOT_RESTORE_SIZE_MISMATCH = 2,
+  GHOSTTY_SNAPSHOT_RESTORE_HISTORY_INCOMPLETE = 3,
+} ghostty_snapshot_restore_result_e;
+GHOSTTY_API ghostty_snapshot_restore_result_e ghostty_surface_restore_snapshot(ghostty_surface_t, ghostty_snapshot_read_fn, void*, bool history, size_t max_continuation_bytes);
 GHOSTTY_API size_t ghostty_surface_viewport_anchor(ghostty_surface_t, ghostty_text_s*);
 GHOSTTY_API uint64_t ghostty_surface_search_generation(ghostty_surface_t);
 GHOSTTY_API bool ghostty_surface_is_alternate_screen(ghostty_surface_t);

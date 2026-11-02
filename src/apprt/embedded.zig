@@ -16,6 +16,7 @@ const input = @import("../input.zig");
 const internal_os = @import("../os/main.zig");
 const renderer = @import("../renderer.zig");
 const terminal = @import("../terminal/main.zig");
+const snapshot_io = @import("../terminal/c/io.zig");
 const termio = @import("../termio.zig");
 const CoreApp = @import("../App.zig");
 const CoreInspector = @import("../inspector/main.zig").Inspector;
@@ -2405,6 +2406,17 @@ pub const CAPI = struct {
 
     export fn ghostty_surface_restore_output(surface: *Surface, ptr: [*]const u8, len: usize) void {
         surface.core_surface.io.restoreOutput(ptr[0..len]);
+    }
+
+    export fn ghostty_surface_restore_snapshot(
+        surface: *Surface,
+        read: ?snapshot_io.ReaderFn,
+        userdata: ?*anyopaque,
+        history: bool,
+        max_continuation_bytes: usize,
+    ) termio.Termio.RestoreResult {
+        var adapter = snapshot_io.ReaderAdapter.init(.{ .read = read, .userdata = userdata });
+        return surface.core_surface.io.restoreSnapshot(adapter.reader(), history, max_continuation_bytes);
     }
 
     export fn ghostty_surface_viewport_anchor(surface: *Surface, text: *Text) usize {
