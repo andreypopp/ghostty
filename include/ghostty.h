@@ -1327,6 +1327,13 @@ GHOSTTY_API bool ghostty_surface_set_grid_size(ghostty_surface_t,
                                                uint16_t columns,
                                                uint16_t rows,
                                                ghostty_surface_size_s* GHOSTTY_NULLABLE resolved);
+typedef bool (*ghostty_snapshot_read_fn)(void* GHOSTTY_NULLABLE, uint8_t* GHOSTTY_NULLABLE, size_t, size_t* GHOSTTY_NULLABLE);
+typedef enum {
+  GHOSTTY_SNAPSHOT_RESTORE_OK = 0,
+  GHOSTTY_SNAPSHOT_RESTORE_REJECTED = 1,
+  GHOSTTY_SNAPSHOT_RESTORE_HISTORY_INCOMPLETE = 2,
+} ghostty_snapshot_restore_result_e;
+GHOSTTY_API ghostty_snapshot_restore_result_e ghostty_surface_restore_snapshot(ghostty_surface_t, ghostty_snapshot_read_fn GHOSTTY_NULLABLE, void* GHOSTTY_NULLABLE, bool history, size_t max_continuation_bytes);
 GHOSTTY_API uint64_t ghostty_surface_search_generation(ghostty_surface_t);
 GHOSTTY_API bool ghostty_surface_is_alternate_screen(ghostty_surface_t);
 GHOSTTY_API ghostty_string_s ghostty_config_serialize(ghostty_config_t);
