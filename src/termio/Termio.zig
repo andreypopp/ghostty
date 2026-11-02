@@ -307,8 +307,7 @@ pub fn init(self: *Termio, alloc: Allocator, opts: termio.Options) !void {
     try term.colors.palette.changeDefault(alloc, opts.config.palette);
 
     // Setup our terminal size in pixels for certain requests.
-    term.width_px = term.cols * opts.size.cell.width;
-    term.height_px = term.rows * opts.size.cell.height;
+    setPixelSize(&term, opts.size);
 
     // Setup our backend.
     var backend = opts.backend;
@@ -566,6 +565,27 @@ pub inline fn queueWrite(
     try self.backend.queueWrite(self.alloc, td, data, linefeed);
 }
 
+/// Make the colours of `term` follow `config`, keeping the ones that programs set.
+/// A config change must not fail here, so if we can't allocate the copy of the
+/// configured palette we fall back to the built-in default, which never allocates.
+fn applyColors(self: *Termio, term: *terminalpkg.Terminal, config: *const DerivedConfig) void {
+    term.colors.palette.changeDefault(
+        self.alloc,
+        config.palette,
+    ) catch |err| {
+        log.warn("error changing default palette, using built-in default err={}", .{err});
+        term.colors.palette.resetDefault(self.alloc);
+    };
+    term.flags.dirty.palette = true;
+
+    term.colors.background.default = config.background.toTerminalRGB();
+    term.colors.foreground.default = config.foreground.toTerminalRGB();
+    term.colors.cursor.default = cursor: {
+        const color = config.cursor_color orelse break :cursor null;
+        break :cursor color.toTerminalRGB() orelse break :cursor null;
+    };
+}
+
 /// Update the configuration.
 pub fn changeConfig(self: *Termio, td: *ThreadData, config: *DerivedConfig) !void {
     // The remainder of this function is modifying terminal state or
@@ -591,25 +611,7 @@ pub fn changeConfig(self: *Termio, td: *ThreadData, config: *DerivedConfig) !voi
     //   - command, working-directory: we never restart the underlying
     //   process so we don't care or need to know about these.
 
-    // Update the default palette. A config change must not fail here, so
-    // if we can't allocate the copy of the configured palette we fall back
-    // to the built-in default, which never allocates.
-    self.terminal.colors.palette.changeDefault(
-        self.alloc,
-        config.palette,
-    ) catch |err| {
-        log.warn("error changing default palette, using built-in default err={}", .{err});
-        self.terminal.colors.palette.resetDefault(self.alloc);
-    };
-    self.terminal.flags.dirty.palette = true;
-
-    // Update all our other colors
-    self.terminal.colors.background.default = config.background.toTerminalRGB();
-    self.terminal.colors.foreground.default = config.foreground.toTerminalRGB();
-    self.terminal.colors.cursor.default = cursor: {
-        const color = config.cursor_color orelse break :cursor null;
-        break :cursor color.toTerminalRGB() orelse break :cursor null;
-    };
+    self.applyColors(&self.terminal, config);
 
     // Set the image limits
     self.terminal.setKittyGraphicsSizeLimit(self.alloc, config.image_storage_limit);
@@ -714,6 +716,110 @@ pub fn clearScreen(self: *Termio, td: *ThreadData, history: bool) !void {
         break :at_prompt self.terminal.clearScreen(history);
     };
     if (at_prompt) try self.queueWrite(td, &[_]u8{0x0C}, false);
+}
+
+pub const RestoreResult = enum(c_int) {
+    ok = 0,
+    rejected = 1,
+    history_incomplete = 2,
+};
+
+/// Gives the surface the grid of a restored snapshot. `mutex` guards the
+/// surface's size: it is held from before the swap to the end of `adopt`, so
+/// no other resize reaches the new terminal while the surface still has the
+/// old grid. `adopt` runs under it and off the renderer lock.
+pub const GridAdopter = struct {
+    mutex: *std.Io.Mutex,
+    context: *anyopaque,
+    adopt: *const fn (*anyopaque, cols: u16, rows: u16) void,
+};
+
+/// Wake the renderer during history at most this often.
+const restore_wake_ns = 16 * std.time.ns_per_ms;
+
+/// Replace the terminal with the one a snapshot stream describes. The stream
+/// is read to READY off the lock. The decoded terminal is swapped in under the
+/// renderer lock, then `grid` gives the surface the snapshot's size, so the
+/// resize finds a terminal of that size and reflows nothing. History pages follow, each applied under the lock after its
+/// records were read off it, so a slow `source` never holds the renderer.
+/// Output the caller feeds after this returns applies to the new terminal.
+/// `rejected` (the stream did not decode) leaves the old terminal in place;
+/// `history_incomplete` leaves the new one with its history incomplete.
+/// Without `history` the stream ends at READY, as a screen snapshot does.
+pub fn restoreSnapshot(
+    self: *Termio,
+    source: *std.Io.Reader,
+    history: bool,
+    max_continuation_bytes: usize,
+    grid: GridAdopter,
+) RestoreResult {
+    const alloc = self.alloc;
+    const io = global.io();
+    var decoder: terminalpkg.snapshot.Decoder = .init(source);
+    var decoded = decoder.ready(alloc, io, .{
+        .max_continuation_bytes = max_continuation_bytes,
+        .compress_history = true,
+        .kitty_image_storage_limit = self.config.image_storage_limit,
+    }) catch return .rejected;
+    defer decoded.deinit(alloc);
+
+    const cols = decoded.terminal.?.cols;
+    const rows = decoded.terminal.?.rows;
+    // The decoded terminal moves in and the old one out, to be freed off the lock.
+    var old: terminalpkg.Terminal = undefined;
+    {
+        grid.mutex.lockUncancelable(io);
+        defer grid.mutex.unlock(io);
+        {
+            self.renderer_state.mutex.lockUncancelable(io);
+            defer self.renderer_state.mutex.unlock(io);
+            var next = decoded.toOwned();
+            self.applyColors(&next, &self.config);
+            const limits = &self.terminal.screens.get(.primary).?.pages.limits;
+            const pages = &next.screens.get(.primary).?.pages;
+            pages.setMaxBytes(limits.max(.bytes));
+            pages.setMaxLines(limits.max(.lines));
+            setPixelSize(&next, self.size);
+            old = self.terminal;
+            self.terminal = next;
+            self.terminal.flags.dirty = .{ .clear = true };
+            self.restoreOutputLocked(switch (decoded.continuation) {
+                .ground => "",
+                .bytes => |bytes| bytes,
+            });
+        }
+        self.renderer_wakeup.notify() catch {};
+        grid.adopt(grid.context, cols, rows);
+    }
+    old.deinit(alloc);
+    if (!history) return .ok;
+
+    var ahead: terminalpkg.snapshot.ReadAhead = .init(alloc, source);
+    defer ahead.deinit();
+    decoder.source = &ahead.reader;
+    var woken = std.Io.Timestamp.now(io, .awake);
+    while (true) {
+        ahead.fill() catch return .history_incomplete;
+        self.renderer_state.mutex.lockUncancelable(io);
+        defer self.renderer_state.mutex.unlock(io);
+        const locked = std.Io.Timestamp.now(io, .awake);
+        const progress = decoder.next(alloc, &self.terminal) catch return .history_incomplete;
+        if (progress == null) {
+            self.terminal.flags.dirty = .{ .clear = true };
+            self.renderer_wakeup.notify() catch {};
+            return .ok;
+        }
+        if (woken.durationTo(locked).toNanoseconds() >= restore_wake_ns) {
+            woken = locked;
+            self.terminal.flags.dirty = .{ .clear = true };
+            self.renderer_wakeup.notify() catch {};
+        }
+    }
+}
+
+fn setPixelSize(term: *terminalpkg.Terminal, size: renderer.Size) void {
+    term.width_px = term.cols * size.cell.width;
+    term.height_px = term.rows * size.cell.height;
 }
 
 /// Scroll the viewport
@@ -1020,6 +1126,35 @@ test "manual process_output parses split UTF-8 and resizes inline" {
     const live_reply = io.mailbox.spsc.queue.pop(testing.io).?;
     defer live_reply.deinit();
     try testing.expectEqual(std.meta.Tag(termio.Message).write_small, std.meta.activeTag(live_reply));
+    var source = try terminalpkg.Terminal.init(testing.io, testing.allocator, .{ .cols = 7, .rows = 3 });
+    defer source.deinit(testing.allocator);
+    var source_stream = source.vtStream();
+    defer source_stream.deinit();
+    source_stream.nextSlice("fits");
+    var encoded: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer encoded.deinit();
+    try terminalpkg.snapshot.encode(testing.allocator, &encoded.writer, &source, .{ .continuation = .ground });
+    const Adopt = struct {
+        io: *Termio,
+        fn adopt(context: *anyopaque, cols: u16, rows: u16) void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            var next = self.io.size;
+            next.screen = next.screenForGrid(.{ .columns = cols, .rows = rows }).?;
+            self.io.queueMessage(.{ .resize = next }, .unlocked);
+        }
+    };
+    var garbage: std.Io.Reader = .fixed("not a snapshot");
+    var adopter: Adopt = .{ .io = &io };
+    var size_mutex: std.Io.Mutex = .init;
+    try testing.expectEqual(RestoreResult.rejected, io.restoreSnapshot(&garbage, false, 1 << 20, .{ .mutex = &size_mutex, .context = &adopter, .adopt = Adopt.adopt }));
+    try testing.expectEqual(@as(u16, 20), io.terminal.cols);
+    var adopted: std.Io.Reader = .fixed(encoded.written());
+    try testing.expectEqual(RestoreResult.ok, io.restoreSnapshot(&adopted, false, 1 << 20, .{ .mutex = &size_mutex, .context = &adopter, .adopt = Adopt.adopt }));
+    try testing.expectEqual(@as(u16, 7), io.terminal.cols);
+    try testing.expectEqual(@as(u16, 3), io.terminal.rows);
+    const fitted = try io.terminal.plainString(testing.allocator);
+    defer testing.allocator.free(fitted);
+    try testing.expectEqualStrings("fits", fitted);
     while (io.mailbox.spsc.queue.pop(testing.io)) |message| message.deinit();
 }
 

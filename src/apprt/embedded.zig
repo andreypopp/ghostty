@@ -16,6 +16,7 @@ const input = @import("../input.zig");
 const internal_os = @import("../os/main.zig");
 const renderer = @import("../renderer.zig");
 const terminal = @import("../terminal/main.zig");
+const snapshot_io = @import("../terminal/c/io.zig");
 const termio = @import("../termio.zig");
 const CoreApp = @import("../App.zig");
 const CoreInspector = @import("../inspector/main.zig").Inspector;
@@ -2384,6 +2385,23 @@ pub const CAPI = struct {
         len: usize,
     ) void {
         surface.preeditCallback(if (len == 0) null else ptr[0..len]);
+    }
+
+    fn adoptGrid(context: *anyopaque, columns: u16, rows: u16) void {
+        const surface: *Surface = @ptrCast(@alignCast(context));
+        if (!surface.updateGridSizeLocked(columns, rows)) log.warn("restored snapshot size {}x{} did not fit the surface", .{ columns, rows });
+    }
+
+    export fn ghostty_surface_restore_snapshot(
+        surface: *Surface,
+        read: ?snapshot_io.ReaderFn,
+        userdata: ?*anyopaque,
+        history: bool,
+        max_continuation_bytes: usize,
+    ) termio.Termio.RestoreResult {
+        var adapter = snapshot_io.ReaderAdapter.init(.{ .read = read, .userdata = userdata });
+        const grid: termio.Termio.GridAdopter = .{ .mutex = &surface.core_surface.size_mutex, .context = surface, .adopt = adoptGrid };
+        return surface.core_surface.io.restoreSnapshot(adapter.reader(), history, max_continuation_bytes, grid);
     }
 
     /// Process output bytes as if they were read from the PTY.

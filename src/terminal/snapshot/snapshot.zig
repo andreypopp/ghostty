@@ -12,6 +12,7 @@ const history = @import("history.zig");
 const kitty = @import("kitty.zig");
 const page = @import("page.zig");
 const record = @import("record.zig");
+const ReadAhead = @import("readahead.zig").ReadAhead;
 const screen = @import("screen.zig");
 const size = @import("../size.zig");
 const terminal = @import("terminal.zig");
@@ -391,6 +392,11 @@ pub const Decoder = struct {
         /// order, so a single drop discards the remainder of the sequence.
         apply: bool,
     };
+
+    /// The known records that one `next` call can read: a HISTORY manifest, a
+    /// PAGE, and the header look-ahead after it, which is a complete record when
+    /// it is that page's placements. Unknown records between them are skipped.
+    pub const known_records_per_next = 3;
 
     /// The decoder begins reading only when `ready` is called.
     pub fn init(source: *std.Io.Reader) Decoder {
@@ -2220,6 +2226,72 @@ test "incremental next reports invalid decoder states" {
         error.DecoderNotReady,
         decoder.next(testing.allocator, &terminal_value),
     );
+}
+
+test "read-ahead lets every next call run without touching the source" {
+    const testing = std.testing;
+
+    var t = try testHistoryTerminal(6);
+    defer t.deinit(testing.allocator);
+    var encoded: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer encoded.deinit();
+    try encode(testing.allocator, &encoded.writer, &t, test_encode_options);
+
+    // Between every pair of records, one to three unknown records of varying
+    // size, and some bytes after FINISH that are not part of the snapshot.
+    var framed: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer framed.deinit();
+    {
+        const bytes = encoded.written();
+        try framed.writer.writeAll(bytes[0..envelope.encoded_len]);
+        var offset: usize = envelope.encoded_len;
+        var i: usize = 0;
+        while (offset < bytes.len) : (i += 1) {
+            const len = std.mem.readInt(u32, bytes[offset + 2 ..][0..4], .little);
+            const end = offset + record.Header.len + len;
+            for (0..1 + i % 3) |j| {
+                const payload: [300]u8 = @splat(@intCast(i + j));
+                try record.testWriteRaw(&framed.writer, @intCast(0x4000 + j), payload[0 .. (i * 97 + j * 31) % payload.len]);
+            }
+            try framed.writer.writeAll(bytes[offset..end]);
+            offset = end;
+        }
+    }
+    const snapshot_len = framed.written().len;
+    try framed.writer.writeAll("trailing");
+
+    var source: std.Io.Reader = .fixed(framed.written());
+    var decoder: Decoder = .init(&source);
+    var decoded = try decoder.ready(testing.allocator, testing.io, test_decode_options);
+    defer decoded.deinit(testing.allocator);
+    var restored = decoded.toOwned();
+    defer restored.deinit(testing.allocator);
+
+    var ahead: ReadAhead = .init(testing.allocator, &source);
+    defer ahead.deinit();
+    decoder.source = &ahead.reader;
+    var blocked: std.Io.Reader = .{
+        .vtable = &.{ .stream = struct {
+            fn stream(_: *std.Io.Reader, _: *std.Io.Writer, _: std.Io.Limit) std.Io.Reader.StreamError!usize {
+                return error.ReadFailed;
+            }
+        }.stream },
+        .buffer = &.{},
+        .seek = 0,
+        .end = 0,
+    };
+    var pages: usize = 0;
+    while (true) {
+        ahead.source = &source;
+        try ahead.fill();
+        // `next` reads only what `fill` buffered: this source would block.
+        ahead.source = &blocked;
+        if (try decoder.next(testing.allocator, &restored) == null) break;
+        pages += 1;
+    }
+    try testing.expectEqual(6, pages);
+    try ahead.fill();
+    try testing.expectEqual(snapshot_len, source.seek);
 }
 
 test "incremental decode applies history below live PTY output" {

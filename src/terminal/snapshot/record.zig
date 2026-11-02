@@ -85,6 +85,11 @@ const io = @import("io.zig");
 /// CRC32C instructions where the target has them.
 pub const Crc32c = @import("../../crc32c.zig").Crc32c;
 
+/// The largest payload that a reader which buffers whole records accepts. A
+/// record header carries any `u32`, and a streaming decoder never allocates
+/// by it.
+pub const max_payload_len: u32 = 1 << 30;
+
 /// Identifies the layout and meaning of a record payload.
 ///
 /// A `Tag` can hold any 16-bit value, not just the ones named here, because
