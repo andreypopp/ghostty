@@ -119,6 +119,16 @@ typedef enum GHOSTTY_ENUM_TYPED {
 typedef struct GhosttyTerminalImpl* GhosttyTerminal;
 
 /**
+ * Opaque handle to a clipboard read whose answer is still to come.
+ *
+ * Obtained from ghostty_clipboard_read_defer() and consumed by
+ * ghostty_clipboard_read_complete().
+ *
+ * @ingroup terminal
+ */
+typedef struct GhosttyClipboardReadHandleImpl* GhosttyClipboardReadHandle;
+
+/**
  * Opaque handle to an incremental terminal snapshot decoder.
  *
  * @ingroup snapshot
