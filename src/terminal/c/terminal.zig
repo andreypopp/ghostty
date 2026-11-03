@@ -149,8 +149,9 @@ pub const ClipboardReadReply = extern struct {
     remember: bool,
 };
 
-/// A synchronous request to read clipboard contents. The embedder answers
-/// by calling `reply` with the request before the callback returns.
+/// A request to read clipboard contents. The embedder answers by calling
+/// `reply` with the request before the callback returns, or takes the
+/// answer out of the callback with `ghostty_clipboard_read_defer`.
 ///
 /// C: GhosttyClipboardRead
 pub const ClipboardRead = extern struct {
@@ -165,12 +166,18 @@ pub const ClipboardRead = extern struct {
     /// Terminal-owned reply state; opaque to the embedder.
     ctx: *const anyopaque,
     reply: ClipboardReadReplyFn,
+    protocol: clipboard.Read.Protocol,
 };
 
 /// C function pointer type for replying to a clipboard read.
 ///
 /// C: GhosttyClipboardReadReplyFn
 pub const ClipboardReadReplyFn = *const fn (*const ClipboardRead, *const ClipboardReadReply) callconv(lib.calling_conv) void;
+
+/// A clipboard read whose answer is still to come.
+///
+/// C: GhosttyClipboardReadHandle
+pub const ClipboardReadHandle = ?*clipboard.Read.Deferred;
 
 /// A request to show a desktop notification.
 ///
@@ -574,6 +581,7 @@ const Effects = struct {
             .can_remember = read.can_remember,
             .ctx = &ctx,
             .reply = &clipboardReadReplyTrampoline,
+            .protocol = read.protocol,
         };
         func(@ptrCast(wrapper), wrapper.effects.userdata, &request);
     }
@@ -583,13 +591,24 @@ const Effects = struct {
         reply: *const ClipboardReadReply,
     ) callconv(lib.calling_conv) void {
         const ctx: *const ClipboardReadCtx = @ptrCast(@alignCast(request.ctx));
-        const read = ctx.read;
+        // On OOM we don't reply and the handler answers with an empty
+        // clipboard.
+        replyRead(ctx.wrapper.terminal.gpa(), reply, ctx.read, clipboard.Read.reply) catch {};
+    }
+
+    /// Convert a C reply and hand it to `target` through `func`.
+    fn replyRead(
+        gpa: std.mem.Allocator,
+        reply: *const ClipboardReadReply,
+        target: anytype,
+        comptime func: anytype,
+    ) error{OutOfMemory}!void {
         switch (reply.result) {
             .success => {},
-            .denied => return read.reply(.denied),
-            .busy => return read.reply(.busy),
-            .io_error => return read.reply(.io_error),
-            .unsupported, _ => return read.reply(.unsupported),
+            .denied => return func(target, .denied),
+            .busy => return func(target, .busy),
+            .io_error => return func(target, .io_error),
+            .unsupported, _ => return func(target, .unsupported),
         }
 
         const c_contents: []const ClipboardContent = if (reply.contents) |ptr|
@@ -603,14 +622,12 @@ const Effects = struct {
 
         // Most replies carry one representation, so keep that path
         // allocation-free while supporting arbitrary multi-MIME replies.
-        // On OOM we don't reply and the handler answers with an empty
-        // clipboard.
         var sfa_buf: [256]u8 = undefined;
-        var sfa: std.heap.BufferFirstAllocator = .init(&sfa_buf, ctx.wrapper.terminal.gpa());
+        var sfa: std.heap.BufferFirstAllocator = .init(&sfa_buf, gpa);
         const alloc = sfa.allocator();
         const contents = alloc.alloc(clipboard.Content, c_contents.len) catch {
             log.warn("out of memory converting clipboard read reply", .{});
-            return;
+            return error.OutOfMemory;
         };
         defer alloc.free(contents);
         for (contents, c_contents) |*content, c_content| {
@@ -621,14 +638,14 @@ const Effects = struct {
         }
         const available = alloc.alloc([]const u8, c_available.len) catch {
             log.warn("out of memory converting clipboard read reply", .{});
-            return;
+            return error.OutOfMemory;
         };
         defer alloc.free(available);
         for (available, c_available) |*mime, c_mime| {
             mime.* = c_mime.ptr[0..c_mime.len];
         }
 
-        read.reply(.{ .success = .{
+        func(target, .{ .success = .{
             .contents = contents,
             .available = available,
             .remember = reply.remember,
@@ -659,7 +676,14 @@ const Effects = struct {
 
     fn deviceAttributesTrampoline(handler: *Handler) device_attributes.Attributes {
         const wrapper = TerminalWrapper.fromHandler(handler);
-        const func = wrapper.effects.device_attributes_cb orelse return .{};
+        const func = wrapper.effects.device_attributes_cb orelse return .{
+            .primary = .{
+                .features = if (wrapper.effects.clipboard_write != null)
+                    &.{ .ansi_color, .clipboard }
+                else
+                    &.{.ansi_color},
+            },
+        };
 
         // Get our attributes from the callback.
         var c_attrs: CDeviceAttributes = undefined;
@@ -2240,6 +2264,24 @@ pub fn point_from_grid_ref(
         return .no_value;
     if (out) |o| o.* = pt.coord();
     return .success;
+}
+
+pub fn clipboard_read_defer(
+    request_: ?*const ClipboardRead,
+) callconv(lib.calling_conv) ClipboardReadHandle {
+    const request = request_ orelse return null;
+    const ctx: *const Effects.ClipboardReadCtx = @ptrCast(@alignCast(request.ctx));
+    return ctx.read.deferReply();
+}
+
+pub fn clipboard_read_complete(
+    handle: ClipboardReadHandle,
+    reply_: ?*const ClipboardReadReply,
+) callconv(lib.calling_conv) void {
+    const deferred = handle orelse return;
+    const reply = reply_ orelse return deferred.complete(.denied);
+    Effects.replyRead(lib.alloc.default(null), reply, deferred, clipboard.Read.Deferred.complete) catch
+        deferred.complete(.io_error);
 }
 
 pub fn free(terminal_: Terminal) callconv(lib.calling_conv) void {
@@ -6747,6 +6789,101 @@ test "set clipboard_read callback" {
     // Clearing the callback uninstalls the handler effect.
     try testing.expectEqual(Result.success, set(t, .clipboard_read, null));
     try testing.expect(t.?.stream.handler.effects.clipboard_read == null);
+}
+
+test "clipboard_read deferred through the C handle" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        80,
+        24,
+    ));
+
+    const S = struct {
+        var written: std.ArrayList(u8) = .empty;
+        var protocol: clipboard.Read.Protocol = .osc52;
+        var list: bool = false;
+        var handles: [2]ClipboardReadHandle = .{ null, null };
+        var count: usize = 0;
+        var defer_twice_is_null: bool = false;
+
+        fn writePty(_: Terminal, _: ?*anyopaque, ptr: [*]const u8, len: usize) callconv(lib.calling_conv) void {
+            written.appendSlice(testing.allocator, ptr[0..len]) catch @panic("OOM");
+        }
+
+        fn clipboardRead(
+            _: Terminal,
+            _: ?*anyopaque,
+            request: *const ClipboardRead,
+        ) callconv(lib.calling_conv) void {
+            protocol = request.protocol;
+            list = request.list;
+            handles[count] = clipboard_read_defer(request);
+            defer_twice_is_null = clipboard_read_defer(request) == null;
+            count += 1;
+        }
+    };
+    defer S.written.deinit(testing.allocator);
+
+    try testing.expectEqual(Result.success, set(t, .write_pty, @ptrCast(&S.writePty)));
+    try testing.expectEqual(Result.success, set(t, .clipboard_read, @ptrCast(&S.clipboardRead)));
+
+    const text = [_]ClipboardContent{
+        .{ .mime = .init(@as([]const u8, "text/plain")), .data = .init(@as([]const u8, "hello")) },
+    };
+    const reply: ClipboardReadReply = .{
+        .size = @sizeOf(ClipboardReadReply),
+        .result = .success,
+        .contents = &text,
+        .contents_len = text.len,
+        .available = null,
+        .available_len = 0,
+        .remember = false,
+    };
+
+    // OSC 52 with ST.
+    const osc52 = "\x1B]52;c;?\x1B\\";
+    vt_write(t, osc52, osc52.len);
+    try testing.expectEqual(clipboard.Read.Protocol.osc52, S.protocol);
+    try testing.expect(S.defer_twice_is_null);
+    try testing.expectEqualStrings("", S.written.items);
+    clipboard_read_complete(S.handles[0], &reply);
+    try testing.expectEqualStrings("\x1B]52;c;aGVsbG8=\x1B\\", S.written.items);
+
+    // OSC 5522 with a refusal (a null reply), and a listing read.
+    S.written.clearRetainingCapacity();
+    S.count = 0;
+    const deny = "\x1B]5522;type=read:id=a;dGV4dC9wbGFpbg==\x07";
+    vt_write(t, deny, deny.len);
+    try testing.expectEqual(clipboard.Read.Protocol.kitty, S.protocol);
+    clipboard_read_complete(S.handles[0], null);
+    try testing.expectEqualStrings("\x1B]5522;type=read:status=EPERM:id=a\x07", S.written.items);
+
+    S.written.clearRetainingCapacity();
+    S.count = 0;
+    const listing = "\x1B]5522;type=read:id=b;Lg==\x1B\\";
+    vt_write(t, listing, listing.len);
+    try testing.expect(S.list);
+    const available = [_]lib.String{.init(@as([]const u8, "text/plain"))};
+    var listed = reply;
+    listed.available = &available;
+    listed.available_len = available.len;
+    clipboard_read_complete(S.handles[0], &listed);
+    try testing.expectEqualStrings(
+        "\x1B]5522;type=read:status=OK:id=b\x1B\\" ++
+            "\x1B]5522;type=read:status=DATA:id=b:mime=Lg==;dGV4dC9wbGFpbgo=\x1B\\" ++
+            "\x1B]5522;type=read:status=DONE:id=b\x1B\\",
+        S.written.items,
+    );
+
+    // A handle that outlives the terminal only releases itself.
+    S.written.clearRetainingCapacity();
+    S.count = 0;
+    vt_write(t, osc52, osc52.len);
+    free(t);
+    clipboard_read_complete(S.handles[0], &reply);
+    try testing.expectEqualStrings("", S.written.items);
 }
 
 test "pwd_changed without callback is silent" {

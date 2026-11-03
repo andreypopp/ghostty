@@ -101,6 +101,10 @@ pub const Handler = struct {
     /// remember the user's decision.
     kitty_clipboard_grants: kitty_clipboard.Grants = .{},
 
+    /// Clipboard reads whose answer an effect took with `deferReply`
+    /// and has not completed yet.
+    deferred_reads: std.ArrayList(*?*Handler) = .empty,
+
     /// Maximum total decoded bytes accumulated by one Kitty clipboard
     /// protocol (OSC 5522) write transaction, captured when the
     /// transaction begins. Data beyond the limit fails the transaction
@@ -279,12 +283,14 @@ pub const Handler = struct {
         /// read). Answering one lets the program read the user's
         /// clipboard, so the embedder is expected to mediate consent.
         ///
-        /// Reads are synchronous: the callback must answer through
-        /// `read.reply` before it returns, so an embedder that needs to
-        /// ask the user must block (e.g. run a modal prompt) while the
-        /// stream waits. Returning without a reply, or replying with any
-        /// failure, answers the program with an empty clipboard (OSC 52)
-        /// or the matching protocol status (OSC 5522) so it doesn't hang.
+        /// The callback answers through `read.reply` before it returns,
+        /// so an embedder that needs to ask the user must block (e.g.
+        /// run a modal prompt) while the stream waits. Or it calls
+        /// `read.deferReply` and completes the result later, without
+        /// blocking the stream. Returning without a reply and without
+        /// deferring, or replying with any failure, answers the program
+        /// with an empty clipboard (OSC 52) or the matching protocol
+        /// status (OSC 5522) so it doesn't hang.
         /// If this is null, OSC 52 reads are ignored and OSC 5522 reads
         /// are refused with EPERM.
         ///
@@ -511,6 +517,8 @@ pub const Handler = struct {
     pub fn deinit(self: *Handler) void {
         self.kittyClipboardAbort();
         self.kitty_clipboard_grants.deinit(self.terminal.gpa());
+        for (self.deferred_reads.items) |handler| handler.* = null;
+        self.deferred_reads.deinit(self.terminal.gpa());
         self.apc_handler.deinit();
         self.dcs_handler.deinit();
     }
@@ -1089,6 +1097,7 @@ pub const Handler = struct {
             .terminator = terminator,
         };
         func(self, .{
+            .protocol = .osc52,
             .location = location,
             .mimes = &.{"text/plain"},
             .list = false,
@@ -1096,28 +1105,74 @@ pub const Handler = struct {
             .granted = false,
             .can_remember = false,
             .reply_ctx = &state,
-            .reply_fn = &ClipboardReadState.reply,
+            .reply_fn = &ClipboardReadState.Reply.reply,
+            .defer_fn = &ClipboardReadState.Reply.deferReply,
         });
 
-        // The program is waiting on us, so a callback that returned
-        // without a (successful) reply gets an empty clipboard rather
-        // than silence.
-        if (!state.replied) state.respond("") catch |err| {
-            log.warn("error replying to clipboard read err={}", .{err});
+        ReadReply(ClipboardReadState).finish(&state);
+    }
+
+    /// Where a clipboard read stands: unanswered, answered by the
+    /// callback, or taken out of the callback to be completed later.
+    const ReadPhase = enum { pending, replied, deferred };
+
+    /// The `reply_fn`, `defer_fn` and post-callback check that the read
+    /// state types share. `State` has `handler`, `phase`, `apply`,
+    /// `refuse` and `own`.
+    fn ReadReply(comptime State: type) type {
+        return struct {
+            fn reply(ctx: *anyopaque, result: clipboard.Read.Result) void {
+                const state: *State = @ptrCast(@alignCast(ctx));
+                if (state.phase == .deferred) {
+                    log.warn("clipboard read replied after deferring, ignoring", .{});
+                    return;
+                }
+                state.apply(result);
+            }
+
+            fn deferReply(ctx: *anyopaque) ?*clipboard.Read.Deferred {
+                const state: *State = @ptrCast(@alignCast(ctx));
+                if (state.phase != .pending) return null;
+                const read = DeferredRead(State).create(state) catch |err| {
+                    log.warn("error deferring clipboard read err={}", .{err});
+                    return null;
+                };
+                state.phase = .deferred;
+                return &read.deferred;
+            }
+
+            /// The program is waiting on us, so a callback that returned
+            /// without a reply, and without taking the reply with it, gets
+            /// a refusal rather than silence.
+            fn finish(state: *State) void {
+                if (state.phase == .pending) state.refuse();
+            }
         };
     }
 
-    /// Reply state for one synchronous clipboard read. This lives on the
-    /// clipboardRead stack frame, so it is only valid during the callback.
+    /// Reply state for one clipboard read. This lives on the
+    /// clipboardRead stack frame, so it is only valid during the callback;
+    /// a deferred read keeps a copy in a `DeferredRead`.
     const ClipboardReadState = struct {
         handler: *Handler,
         location: clipboard.Location,
         terminator: osc.Terminator,
-        replied: bool = false,
+        phase: ReadPhase = .pending,
 
-        fn reply(ctx: *anyopaque, result: clipboard.Read.Result) void {
-            const self: *ClipboardReadState = @ptrCast(@alignCast(ctx));
-            if (self.replied) {
+        const Reply = ReadReply(ClipboardReadState);
+
+        fn own(self: ClipboardReadState, _: std.mem.Allocator) error{OutOfMemory}!ClipboardReadState {
+            return self;
+        }
+
+        fn refuse(self: *ClipboardReadState) void {
+            self.respond("") catch |err| {
+                log.warn("error replying to clipboard read err={}", .{err});
+            };
+        }
+
+        fn apply(self: *ClipboardReadState, result: clipboard.Read.Result) void {
+            if (self.phase == .replied) {
                 log.warn("clipboard read replied more than once, ignoring", .{});
                 return;
             }
@@ -1131,12 +1186,12 @@ pub const Handler = struct {
             };
 
             self.respond(data) catch |err| {
-                // Leave replied unset so clipboardRead falls back to the
-                // empty reply.
+                // Leave the phase pending so clipboardRead falls back to
+                // the empty reply.
                 log.warn("error replying to clipboard read err={}", .{err});
                 return;
             };
-            self.replied = true;
+            self.phase = .replied;
         }
 
         fn respond(
@@ -1164,6 +1219,55 @@ pub const Handler = struct {
             handler.writePty(written);
         }
     };
+
+    /// A clipboard read whose answer the embedder completes after the
+    /// effect callback returned. It owns copies of everything the read
+    /// borrowed from the stream, and it outlives the handler: the
+    /// handler forgets it on deinit, and a later completion only frees it.
+    fn DeferredRead(comptime State: type) type {
+        return struct {
+            const Self = @This();
+
+            deferred: clipboard.Read.Deferred,
+            handler: ?*Handler,
+            alloc: std.mem.Allocator,
+            arena: std.heap.ArenaAllocator,
+            state: State,
+
+            fn create(state: *const State) error{OutOfMemory}!*Self {
+                const handler = state.handler;
+                const alloc = handler.terminal.gpa();
+                const self = try alloc.create(Self);
+                errdefer alloc.destroy(self);
+                self.* = .{
+                    .deferred = .{ .complete_fn = &complete },
+                    .handler = handler,
+                    .alloc = alloc,
+                    .arena = .init(alloc),
+                    .state = undefined,
+                };
+                errdefer self.arena.deinit();
+                self.state = try state.own(self.arena.allocator());
+                try handler.deferred_reads.append(alloc, &self.handler);
+                return self;
+            }
+
+            fn complete(deferred: *clipboard.Read.Deferred, result: clipboard.Read.Result) void {
+                const self: *Self = @fieldParentPtr("deferred", deferred);
+                const alloc = self.alloc;
+                defer {
+                    self.arena.deinit();
+                    alloc.destroy(self);
+                }
+
+                const handler = self.handler orelse return;
+                if (std.mem.indexOfScalar(*?*Handler, handler.deferred_reads.items, &self.handler)) |i| {
+                    _ = handler.deferred_reads.swapRemove(i);
+                }
+                self.state.apply(result);
+            }
+        };
+    }
 
     /// Handle one Kitty clipboard protocol (OSC 5522) packet.
     fn kittyClipboard(
@@ -1273,6 +1377,7 @@ pub const Handler = struct {
             .terminator = terminator,
         };
         func(self, .{
+            .protocol = .kitty,
             .location = meta.loc,
             .mimes = mimes,
             .list = list,
@@ -1280,17 +1385,16 @@ pub const Handler = struct {
             .granted = granted,
             .can_remember = pw.len > 0,
             .reply_ctx = &state,
-            .reply_fn = &KittyClipboardReadState.reply,
+            .reply_fn = &KittyClipboardReadState.Reply.reply,
+            .defer_fn = &KittyClipboardReadState.Reply.deferReply,
         });
 
-        // The program is waiting on us, so a callback that returned
-        // without a reply is answered as a denial rather than silence.
-        if (!state.replied) state.respondStatus(.EPERM);
+        ReadReply(KittyClipboardReadState).finish(&state);
     }
 
-    /// Reply state for one synchronous Kitty clipboard read. This lives
-    /// on the kittyClipboardRead stack frame, so it is only valid during
-    /// the callback.
+    /// Reply state for one Kitty clipboard read. This lives on the
+    /// kittyClipboardRead stack frame, so it is only valid during the
+    /// callback; a deferred read keeps a copy in a `DeferredRead`.
     const KittyClipboardReadState = struct {
         handler: *Handler,
         primary: bool,
@@ -1303,15 +1407,31 @@ pub const Handler = struct {
         mimes: []const []const u8,
         list: bool,
         terminator: osc.Terminator,
-        replied: bool = false,
+        phase: ReadPhase = .pending,
 
-        fn reply(ctx: *anyopaque, result: clipboard.Read.Result) void {
-            const self: *KittyClipboardReadState = @ptrCast(@alignCast(ctx));
-            if (self.replied) {
+        const Reply = ReadReply(KittyClipboardReadState);
+
+        /// A copy whose strings live in `arena`.
+        fn own(self: KittyClipboardReadState, arena: std.mem.Allocator) error{OutOfMemory}!KittyClipboardReadState {
+            var owned = self;
+            owned.id = try arena.dupe(u8, self.id);
+            owned.pw = try arena.dupe(u8, self.pw);
+            const mimes = try arena.alloc([]const u8, self.mimes.len);
+            for (mimes, self.mimes) |*mime, from| mime.* = try arena.dupe(u8, from);
+            owned.mimes = mimes;
+            return owned;
+        }
+
+        fn refuse(self: *KittyClipboardReadState) void {
+            self.respondStatus(.EPERM);
+        }
+
+        fn apply(self: *KittyClipboardReadState, result: clipboard.Read.Result) void {
+            if (self.phase == .replied) {
                 log.warn("clipboard read replied more than once, ignoring", .{});
                 return;
             }
-            self.replied = true;
+            self.phase = .replied;
 
             const success = switch (result) {
                 .denied => return self.respondStatus(.EPERM),
@@ -5063,6 +5183,115 @@ test "kitty clipboard read password grants" {
 
     // Grants are freed with the stream (the testing allocator catches
     // the leak otherwise).
+}
+
+test "clipboard read is answered after the callback returns" {
+    var t: Terminal = try .init(testing.io, testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer t.deinit(testing.allocator);
+
+    const S = struct {
+        var written: std.ArrayList(u8) = .empty;
+        var protocol: clipboard.Read.Protocol = .osc52;
+        var pending: ?*clipboard.Read.Deferred = null;
+        var defer_twice_is_null: bool = false;
+
+        fn writePty(_: *Handler, data: []const u8) void {
+            written.appendSlice(testing.allocator, data) catch @panic("OOM");
+        }
+
+        fn clipboardRead(_: *Handler, read: clipboard.Read) void {
+            protocol = read.protocol;
+            pending = read.deferReply();
+            defer_twice_is_null = read.deferReply() == null;
+            // A reply after deferring is ignored.
+            read.reply(.{ .success = .{ .contents = &.{.{
+                .mime = "text/plain",
+                .data = "ignored",
+            }} } });
+        }
+    };
+    defer S.written.deinit(testing.allocator);
+
+    var handler: Handler = .init(&t);
+    handler.effects.write_pty = &S.writePty;
+    handler.effects.clipboard_read = &S.clipboardRead;
+    var s: Stream = .init(.{ .allocator = testing.allocator, .handler = handler });
+    defer s.deinit();
+
+    // OSC 52: nothing is written until the completion, and then the
+    // answer ends with the request's terminator.
+    s.nextSlice("\x1B]52;p;?\x07");
+    try testing.expectEqual(clipboard.Read.Protocol.osc52, S.protocol);
+    try testing.expect(S.defer_twice_is_null);
+    try testing.expectEqualStrings("", S.written.items);
+    S.pending.?.complete(.{ .success = .{ .contents = &.{.{
+        .mime = "text/plain",
+        .data = "hello",
+    }} } });
+    try testing.expectEqualStrings("\x1B]52;p;aGVsbG8=\x07", S.written.items);
+    try testing.expectEqual(0, s.handler.deferred_reads.items.len);
+
+    // OSC 5522: the request's strings are copied, so the completion can
+    // follow other input.
+    S.written.clearRetainingCapacity();
+    s.nextSlice("\x1B]5522;type=read:id=r1;LiB0ZXh0L3BsYWluIHRleHQvaHRtbA==\x1B\\");
+    try testing.expectEqual(clipboard.Read.Protocol.kitty, S.protocol);
+    const first = S.pending.?;
+    s.nextSlice("\x1B]5522;type=read:id=other;aW1hZ2UvcG5n\x1B\\");
+    const second = S.pending.?;
+    try testing.expectEqual(2, s.handler.deferred_reads.items.len);
+    try testing.expectEqualStrings("", S.written.items);
+    second.complete(.denied);
+    first.complete(.{ .success = .{
+        .contents = &.{
+            .{ .mime = "text/html", .data = "<b>hi</b>" },
+            .{ .mime = "text/plain", .data = "Ghostty" },
+        },
+        .available = &.{ "text/plain", "text/html" },
+    } });
+    try testing.expectEqualStrings(
+        "\x1B]5522;type=read:status=EPERM:id=other\x1B\\" ++
+            "\x1B]5522;type=read:status=OK:id=r1\x1B\\" ++
+            "\x1B]5522;type=read:status=DATA:id=r1:mime=Lg==;dGV4dC9wbGFpbiB0ZXh0L2h0bWwK\x1B\\" ++
+            "\x1B]5522;type=read:status=DATA:id=r1:mime=dGV4dC9wbGFpbg==;R2hvc3R0eQ==\x1B\\" ++
+            "\x1B]5522;type=read:status=DATA:id=r1:mime=dGV4dC9odG1s;PGI+aGk8L2I+\x1B\\" ++
+            "\x1B]5522;type=read:status=DONE:id=r1\x1B\\",
+        S.written.items,
+    );
+    try testing.expectEqual(0, s.handler.deferred_reads.items.len);
+}
+
+test "deferred clipboard read completed after the handler is gone writes nothing" {
+    var t: Terminal = try .init(testing.io, testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer t.deinit(testing.allocator);
+
+    const S = struct {
+        var written: usize = 0;
+        var pending: ?*clipboard.Read.Deferred = null;
+
+        fn writePty(_: *Handler, _: []const u8) void {
+            written += 1;
+        }
+
+        fn clipboardRead(_: *Handler, read: clipboard.Read) void {
+            pending = read.deferReply();
+        }
+    };
+
+    var handler: Handler = .init(&t);
+    handler.effects.write_pty = &S.writePty;
+    handler.effects.clipboard_read = &S.clipboardRead;
+    {
+        var s: Stream = .init(.{ .allocator = testing.allocator, .handler = handler });
+        s.nextSlice("\x1B]5522;type=read:id=r1;dGV4dC9wbGFpbg==\x1B\\");
+        s.deinit();
+    }
+    try testing.expect(S.pending != null);
+    S.pending.?.complete(.{ .success = .{ .contents = &.{.{
+        .mime = "text/plain",
+        .data = "late",
+    }} } });
+    try testing.expectEqual(0, S.written);
 }
 
 test "kitty clipboard read targets-only never consumes a one-time grant" {

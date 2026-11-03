@@ -263,6 +263,7 @@ const type_decls = [_]TypeDecl{
     .initEnum("GhosttyCellSemanticContent", cell.SemanticContent, "GHOSTTY_CELL_SEMANTIC_"),
     .initEnum("GhosttyCellWide", cell.Wide, "GHOSTTY_CELL_WIDE_"),
     .initEnum("GhosttyClipboardLocation", clipboard.Location, "GHOSTTY_CLIPBOARD_LOCATION_"),
+    .initEnum("GhosttyClipboardReadProtocol", clipboard.Read.Protocol, "GHOSTTY_CLIPBOARD_READ_PROTOCOL_"),
     .initEnum("GhosttyClipboardReadResult", clipboard.Read.Status, "GHOSTTY_CLIPBOARD_READ_RESULT_"),
     .initEnum("GhosttyClipboardWriteResult", clipboard.Write.Status, "GHOSTTY_CLIPBOARD_WRITE_RESULT_"),
     .initEnum("GhosttyColorScheme", device_status.ColorScheme, "GHOSTTY_COLOR_SCHEME_"),
@@ -357,6 +358,7 @@ const type_decls = [_]TypeDecl{
     .initAlias("GhosttyRow", u64, "u64"),
     .initAlias("GhosttyStyleId", u16, "u16"),
 
+    .initOpaque("GhosttyClipboardReadHandle"),
     .initOpaque("GhosttyFormatter"),
     .initOpaque("GhosttyKeyEncoder"),
     .initOpaque("GhosttyKeyEvent"),
