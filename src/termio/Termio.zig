@@ -876,20 +876,25 @@ pub fn prependHistory(self: *Termio, bytes: []const u8) !usize {
 pub const RestoreResult = enum(c_int) {
     ok = 0,
     rejected = 1,
-    size_mismatch = 2,
-    history_incomplete = 3,
+    history_incomplete = 2,
+};
+
+/// Gives the surface the grid of a snapshot. It runs off the renderer lock.
+pub const GridAdopter = struct {
+    context: *anyopaque,
+    adopt: *const fn (*anyopaque, cols: u16, rows: u16) bool,
 };
 
 /// Wake the renderer during history at most this often.
 const restore_wake_ns = 16 * std.time.ns_per_ms;
 
 /// Replace the terminal with the one a snapshot stream describes. The stream
-/// is read to READY off the lock. A snapshot of another size than the surface
-/// is rejected there. Otherwise the decoded terminal is swapped in under the
-/// renderer lock. History pages follow, each applied under the lock after its
+/// is read to READY off the lock. A snapshot of another size than the terminal
+/// first gets its grid from `grid`. Then the decoded terminal is swapped in
+/// under the renderer lock. History pages follow, each applied under the lock after its
 /// records were read off it, so a slow `source` never holds the renderer.
 /// Output the caller feeds after this returns applies to the new terminal.
-/// `rejected` and `size_mismatch` leave the old terminal in place;
+/// `rejected` leaves the old terminal in place;
 /// `history_incomplete` leaves the new one with its history incomplete.
 /// Without `history` the stream ends at READY, as a screen snapshot does.
 pub fn restoreSnapshot(
@@ -897,6 +902,7 @@ pub fn restoreSnapshot(
     source: *std.Io.Reader,
     history: bool,
     max_continuation_bytes: usize,
+    grid: GridAdopter,
 ) RestoreResult {
     const alloc = self.alloc;
     const io = global.io();
@@ -908,12 +914,21 @@ pub fn restoreSnapshot(
     }) catch return .rejected;
     defer decoded.deinit(alloc);
 
+    const cols = decoded.terminal.?.cols;
+    const rows = decoded.terminal.?.rows;
+    const differs = differs: {
+        self.renderer_state.mutex.lockUncancelable(io);
+        defer self.renderer_state.mutex.unlock(io);
+        break :differs cols != self.terminal.cols or rows != self.terminal.rows;
+    };
+    if (differs and !grid.adopt(grid.context, cols, rows)) return .rejected;
+
     // The decoded terminal moves in and the old one out, to be freed off the lock.
     var old: terminalpkg.Terminal = undefined;
     {
         self.renderer_state.mutex.lockUncancelable(io);
         defer self.renderer_state.mutex.unlock(io);
-        if (decoded.terminal.?.cols != self.terminal.cols or decoded.terminal.?.rows != self.terminal.rows) return .size_mismatch;
+        if (cols != self.terminal.cols or rows != self.terminal.rows) return .rejected;
         var next = decoded.toOwned();
         self.applyColors(&next, &self.config);
         const limits = &self.terminal.screens.get(.primary).?.pages.limits;
@@ -1291,6 +1306,38 @@ test "manual process_output parses split UTF-8 and resizes inline" {
     io.raiseScrollbackLimit();
     try testing.expectEqual(std.math.maxInt(usize), pages.limits.max(.bytes));
     try testing.expectEqual(std.math.maxInt(usize), pages.limits.max(.lines));
+    var source = try terminalpkg.Terminal.init(testing.io, testing.allocator, .{ .cols = 7, .rows = 3 });
+    defer source.deinit(testing.allocator);
+    var source_stream = source.vtStream();
+    defer source_stream.deinit();
+    source_stream.nextSlice("fits");
+    var encoded: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer encoded.deinit();
+    try terminalpkg.snapshot.encode(testing.allocator, &encoded.writer, &source, .{ .continuation = .ground });
+    const Adopt = struct {
+        io: *Termio,
+        accept: bool,
+        fn adopt(context: *anyopaque, cols: u16, rows: u16) bool {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            if (!self.accept) return false;
+            var next = self.io.size;
+            next.screen = .{ .width = @as(u32, cols) * next.cell.width, .height = @as(u32, rows) * next.cell.height };
+            self.io.queueMessage(.{ .resize = next }, .unlocked);
+            return true;
+        }
+    };
+    var refuse: Adopt = .{ .io = &io, .accept = false };
+    var refused: std.Io.Reader = .fixed(encoded.written());
+    try testing.expectEqual(RestoreResult.rejected, io.restoreSnapshot(&refused, false, 1 << 20, .{ .context = &refuse, .adopt = Adopt.adopt }));
+    try testing.expectEqual(@as(u16, 20), io.terminal.cols);
+    var accept: Adopt = .{ .io = &io, .accept = true };
+    var adopted: std.Io.Reader = .fixed(encoded.written());
+    try testing.expectEqual(RestoreResult.ok, io.restoreSnapshot(&adopted, false, 1 << 20, .{ .context = &accept, .adopt = Adopt.adopt }));
+    try testing.expectEqual(@as(u16, 7), io.terminal.cols);
+    try testing.expectEqual(@as(u16, 3), io.terminal.rows);
+    const fitted = try io.terminal.plainString(testing.allocator);
+    defer testing.allocator.free(fitted);
+    try testing.expectEqualStrings("fits", fitted);
     while (io.mailbox.spsc.queue.pop(testing.io)) |message| message.deinit();
 }
 
