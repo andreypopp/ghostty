@@ -1979,6 +1979,7 @@ pub const TerminalData = enum(c_int) {
     clipboard_write_max_bytes = 40,
     mouse_shape = 41,
     memory_usage = 42,
+    kitty_pending_generation = 43,
 
     _,
 
@@ -2026,6 +2027,7 @@ pub const TerminalData = enum(c_int) {
             .selection => selection_c.CSelection,
             .mode => ModeConfig,
             .memory_usage => TerminalMemoryUsage,
+            .kitty_pending_generation => u64,
             _ => void,
         };
     }
@@ -2138,6 +2140,7 @@ fn getTyped(
             if (comptime !lib.feature(.kitty_graphics)) return .unsupported;
             out.* = &t.screens.active.kitty_images;
         },
+        .kitty_pending_generation => out.* = t.kittyPendingGeneration(),
         .selection => out.* = selection_c.CSelection.fromZig(
             t.screens.active.selection orelse return .no_value,
         ),

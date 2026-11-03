@@ -484,6 +484,8 @@ pub const type_decls = [_]TypeDecl{
     .initEnum("GhosttyKeyEncoderOption", key_encode.Option, "GHOSTTY_KEY_ENCODER_OPT_"),
     .initEnum("GhosttyKittyGraphicsData", kitty_graphics.Data, "GHOSTTY_KITTY_GRAPHICS_DATA_"),
     .initEnum("GhosttyKittyGraphicsImageData", kitty_graphics.ImageData, "GHOSTTY_KITTY_GRAPHICS_IMAGE_DATA_"),
+    .initEnum("GhosttyKittyAnimationState", kitty_graphics.AnimationState, "GHOSTTY_KITTY_ANIMATION_STATE_"),
+    .initEnum("GhosttyKittyGraphicsFrameData", kitty_graphics.FrameData, "GHOSTTY_KITTY_FRAME_DATA_"),
     .initEnum("GhosttyKittyGraphicsPlacementData", kitty_graphics.PlacementData, "GHOSTTY_KITTY_GRAPHICS_PLACEMENT_DATA_"),
     .initEnum("GhosttyKittyGraphicsPlacementIteratorOption", kitty_graphics.PlacementIteratorOption, "GHOSTTY_KITTY_GRAPHICS_PLACEMENT_ITERATOR_OPT_"),
     .initEnum("GhosttyKittyImageCompression", kitty_graphics.ImageCompression, "GHOSTTY_KITTY_IMAGE_COMPRESSION_"),

@@ -460,15 +460,6 @@ fn imageFlags(img: *const Image) ImageFlags {
     };
 }
 
-/// The decoded byte length of an image, or null when its dimensions or
-/// format cannot describe stored pixels.
-fn imageLen(width: u32, height: u32, format: Format) ?usize {
-    if (width == 0 or height == 0) return null;
-    if (format == .png) return null;
-    const bpp = graphics_command.Transmission.formatBpp(format);
-    return std.math.mul(usize, @as(usize, width) * height, bpp) catch null;
-}
-
 // ---------------------------------------------------------------------------
 // Encoding
 
@@ -553,10 +544,13 @@ const PlannedPayload = struct {
 
     /// The pixels to encode.
     fn bytes(self: PlannedPayload) []const u8 {
-        return switch (self.frame) {
-            1 => self.image.data.bytes().?,
-            else => self.image.animation.?.frames.items[self.frame - 2].data,
-        };
+        return self.image.frameData(self.frame).?;
+    }
+
+    /// The serial of the command that set the pixels, which the decoder
+    /// compares with the frame's serial when the pixels arrive.
+    fn serial(self: PlannedPayload) u64 {
+        return self.image.frameSerial(self.frame).?;
     }
 
     /// The order payloads are written in: by stage, then newest history
@@ -657,7 +651,9 @@ pub const ScreenPlan = struct {
         key: TerminalScreenKey,
     ) Allocator.Error!?ScreenPlan {
         const storage = &screen.kitty_images;
-        if (storage.images.count() == 0 and storage.loading == null) {
+        if (storage.images.count() == 0 and storage.loading == null and
+            storage.command_serial == 0)
+        {
             return null;
         }
 
@@ -848,6 +844,7 @@ pub const ScreenPlan = struct {
         try encodeKey(writer, self.key);
         try io.writeInt(writer, u32, storage.next_image_id);
         try io.writeInt(writer, u32, storage.next_internal_placement_id);
+        try io.writeInt(writer, u64, storage.command_serial);
         try io.writeInt(writer, u32, @intCast(self.images.len));
         try io.writeInt(writer, u32, @intCast(self.resident.len));
         try writer.writeByte(@intFromBool(storage.loading != null));
@@ -941,11 +938,7 @@ pub const ScreenPlan = struct {
                 1;
             for (1..frame_count + 1) |number| {
                 const frame: u32 = @intCast(number);
-                const present = switch (frame) {
-                    1 => !img.data.isPending(),
-                    else => !img.animation.?.frames.items[frame - 2].isPending(),
-                };
-                if (!present) continue;
+                if (img.frameSlot(frame).?.isPending()) continue;
                 try result.append(alloc, .{
                     .image = img,
                     .frame = frame,
@@ -1032,6 +1025,7 @@ fn encodeImage(writer: *std.Io.Writer, img: *const Image) !void {
     try writer.writeByte(encodeFormat(img.format));
     try writer.writeByte(@bitCast(imageFlags(img)));
     try io.writeInt(writer, u64, img.data.len());
+    try io.writeInt(writer, u64, img.root_serial);
 
     const anim = img.animation orelse {
         try writer.writeByte(0);
@@ -1051,6 +1045,7 @@ fn encodeImage(writer: *std.Io.Writer, img: *const Image) !void {
     for (anim.frames.items) |frame| {
         try io.writeInt(writer, u32, frame.gap_ms);
         try io.writeInt(writer, u64, frame.storageSize());
+        try io.writeInt(writer, u64, frame.serial);
     }
 }
 
@@ -1205,7 +1200,7 @@ fn decodeCompression(raw: u8) ?Compression {
 }
 
 /// The number of KITTY_IMAGE_PAYLOAD bytes before the pixel bytes.
-const payload_header_len = 18;
+const payload_header_len = 26;
 
 /// Encode one KITTY_IMAGE_PAYLOAD record.
 fn encodePayload(
@@ -1219,6 +1214,7 @@ fn encodePayload(
     try encodeKey(writer, key);
     try io.writeInt(writer, u32, payload.image.id);
     try io.writeInt(writer, u32, payload.frame);
+    try io.writeInt(writer, u64, payload.serial());
     try io.writeInt(writer, u64, bytes.len);
     assert(writer.end == payload_header_len);
     try writer.writeAll(bytes);
@@ -1247,7 +1243,7 @@ pub const Counts = struct {
             if (img.data.isPending()) result.pending_bytes += img.data.len();
             const anim = img.animation orelse continue;
             for (anim.frames.items) |frame| {
-                if (frame.isPending()) result.pending_bytes += frame.pending_len;
+                if (frame.isPending()) result.pending_bytes += frame.data.len();
             }
         }
         return result;
@@ -1296,6 +1292,7 @@ pub fn decodeStorage(
 
     const next_image_id = try io.readInt(reader, u32);
     const next_internal_placement_id = try io.readInt(reader, u32);
+    const command_serial = try io.readInt(reader, u64);
     const image_count = try io.readInt(reader, u32);
     const placement_count = try io.readInt(reader, u32);
     const loading_present = try reader.takeByte();
@@ -1336,6 +1333,8 @@ pub fn decodeStorage(
 
     storage.next_image_id = next_image_id;
     storage.next_internal_placement_id = next_internal_placement_id;
+    storage.command_serial = command_serial;
+    if (storage.images.count() > 0) storage.markPending(io_);
 }
 
 /// One decoded image entry.
@@ -1360,11 +1359,12 @@ const DecodedImage = struct {
         const format = decodeFormat(try reader.takeByte());
         const flags: ImageFlags = @bitCast(try reader.takeByte());
         const data_len = try io.readInt(reader, u64);
+        const root_serial = try io.readInt(reader, u64);
 
         var valid = valid: {
             if (id == 0) break :valid false;
             const f = format orelse break :valid false;
-            const expected = imageLen(width, height, f) orelse
+            const expected = graphics_command.Transmission.rawLen(width, height, f) orelse
                 break :valid false;
             break :valid expected == data_len;
         };
@@ -1377,6 +1377,7 @@ const DecodedImage = struct {
                 .height = height,
                 .format = format orelse .rgba,
                 .data = .{ .pending = if (valid) @intCast(data_len) else 0 },
+                .root_serial = root_serial,
                 .metadata = .{
                     .transient = flags.transient,
                     .implicit_id = flags.implicit_id,
@@ -1418,15 +1419,16 @@ const DecodedImage = struct {
         for (0..frame_count) |_| {
             const gap_ms = try io.readInt(reader, u32);
             const len = try io.readInt(reader, u64);
+            const serial = try io.readInt(reader, u64);
             if (!valid) continue;
             if (frame_len == null or frame_len.? == 0 or len != frame_len.?) {
                 valid = false;
                 continue;
             }
             try anim.frames.append(alloc, .{
-                .data = &.{},
+                .data = .{ .pending = frame_len.? },
                 .gap_ms = gap_ms,
-                .pending_len = frame_len.?,
+                .serial = serial,
             });
         }
         anim.current_index = if (current_index <= anim.frames.items.len)
@@ -1770,12 +1772,12 @@ fn decodeLoading(
     errdefer loading.deinit(alloc);
 
     // A frame load completes only against the image it started on, which
-    // is identified by its generation. Stamps are process-local, so use
+    // is identified by its transmission. Stamps are process-local, so use
     // the restored image's fresh one.
     if (frame) |f| loading.frame = .{
         .cmd = f,
-        .image_generation = if (storage.imagePtrByIdOrNumber(id, number)) |img|
-            img.generation
+        .image_transmission = if (storage.imagePtrByIdOrNumber(id, number)) |img|
+            img.transmission
         else
             0,
     };
@@ -1875,6 +1877,7 @@ pub fn decodePayload(
     const key = try decodeKey(reader);
     const image_id = try io.readInt(reader, u32);
     const frame = try io.readInt(reader, u32);
+    const serial = try io.readInt(reader, u64);
     const decoded_len = try io.readInt(reader, u64);
     const target = targets.get(key);
 
@@ -1892,21 +1895,13 @@ pub fn decodePayload(
         const img = t.screen.kitty_images.images.getPtr(image_id) orelse
             break :ticket null;
         if (img.transmission > t.ready_generation) break :ticket null;
-        const expected: usize = switch (frame) {
-            0 => break :ticket null,
-            1 => switch (img.data) {
-                .pending => |len| len,
-                .complete, .mapped => break :ticket null,
-            },
-            else => expected: {
-                const anim = img.animation orelse break :ticket null;
-                if (frame - 2 >= anim.frames.items.len) break :ticket null;
-                const pending = anim.frames.items[frame - 2];
-                if (!pending.isPending()) break :ticket null;
-                break :expected pending.pending_len;
-            },
-        };
-        if (expected != decoded_len) break :ticket null;
+        const slot = img.frameSlot(frame) orelse break :ticket null;
+        if (!slot.isPending()) break :ticket null;
+
+        // A command after READY that took over the frame moved its serial.
+        // The pixels of the snapshot are not the pane's pixels any more.
+        if (img.frameSerial(frame).? != serial) break :ticket null;
+        if (slot.len() != decoded_len) break :ticket null;
         break :ticket .{ .id = image_id, .transmission = img.transmission };
     };
     const pending = ticket orelse {
@@ -1926,7 +1921,7 @@ pub fn decodePayload(
     const storage = &target.?.screen.kitty_images;
     const attached = switch (frame) {
         1 => pending.complete(storage, io_, data),
-        else => pending.completeFrame(storage, io_, frame, data),
+        else => pending.completeFrame(storage, io_, frame, .{ .complete = data }, serial),
     };
     if (attached) {
         owned = false;
@@ -2109,6 +2104,7 @@ fn expectStorageEqual(
         actual.next_internal_placement_id,
     );
     try testing.expectEqual(expected.total_bytes, actual.total_bytes);
+    try testing.expectEqual(expected.command_serial, actual.command_serial);
 
     try testing.expectEqual(expected.images.count(), actual.images.count());
     var image_it = expected.images.valueIterator();
@@ -2119,6 +2115,7 @@ fn expectStorageEqual(
         try testing.expectEqual(e.height, a.height);
         try testing.expectEqual(e.format, a.format);
         try testing.expectEqual(e.metadata, a.metadata);
+        try testing.expectEqual(e.root_serial, a.root_serial);
         try testing.expectEqual(e.data.len(), a.data.len());
         try testing.expectEqual(e.data.isPending(), a.data.isPending());
         if (e.data.bytes()) |bytes| {
@@ -2136,8 +2133,9 @@ fn expectStorageEqual(
         try testing.expectEqual(e_anim.frames.items.len, a_anim.frames.items.len);
         for (e_anim.frames.items, a_anim.frames.items) |ef, af| {
             try testing.expectEqual(ef.gap_ms, af.gap_ms);
-            try testing.expectEqual(ef.pending_len, af.pending_len);
-            try testing.expectEqualSlices(u8, ef.data, af.data);
+            try testing.expectEqual(ef.serial, af.serial);
+            try testing.expectEqual(ef.data.len(), af.data.len());
+            try testing.expectEqualSlices(u8, ef.data.bytes() orelse "", af.data.bytes() orelse "");
         }
     }
 
@@ -2546,7 +2544,9 @@ test "a terminal without images encodes no Kitty graphics records" {
     for (records) |r| try testing.expect(!testIsKittyTag(r.tag));
 
     // Transmitting and deleting an image changes storage counters that
-    // are not encoded when the storage is empty again.
+    // are not encoded when the storage is empty again. The serial is the
+    // exception: a mirror must continue the pane's count, so an empty
+    // storage with a serial encodes one record without images.
     if (comptime build_options.kitty_graphics) {
         try testCommand(&t, "a=t,f=32,s=1,v=1,i=1,q=2", &testPixels(4, .{ 1, 2, 3, 4 }));
         try testCommand(&t, "a=t,f=32,s=1,v=1,I=4,q=2", &testPixels(4, .{ 1, 2, 3, 4 }));
@@ -2555,10 +2555,23 @@ test "a terminal without images encodes no Kitty graphics records" {
         testFeed(&t, "\x1b_Ga=d,d=I,i=1,q=2\x1b\\\x1b_Ga=d,d=N,I=4,q=2\x1b\\");
         try testing.expect(t.screens.active.kitty_images.images.count() == 0);
         try testing.expect(t.screens.active.kitty_images.next_internal_placement_id != 0);
+        try testing.expectEqual(2, t.screens.active.kitty_images.command_serial);
     }
     const after = try testEncode(&t);
     defer testing.allocator.free(after);
-    try testing.expectEqualSlices(u8, before, after);
+    const after_records = try testRecords(after);
+    defer testing.allocator.free(after_records);
+    var kitty_records: usize = 0;
+    for (after_records) |r| {
+        if (testIsKittyTag(r.tag)) kitty_records += 1;
+    }
+    try testing.expectEqual(if (build_options.kitty_graphics) 1 else 0, kitty_records);
+    var restored = try testDecode(after, test_decode_options);
+    defer restored.deinit(testing.allocator);
+    if (comptime build_options.kitty_graphics) {
+        try testing.expectEqual(2, restored.screens.active.kitty_images.command_serial);
+        try testing.expectEqual(0, restored.screens.active.kitty_images.images.count());
+    }
 }
 
 test "Kitty graphics records are skipped without Kitty graphics support" {
@@ -3134,4 +3147,354 @@ test "history placements skip an image replaced after READY" {
     const storage = &restored.screens.active.kitty_images;
     try testing.expectEqualSlices(u8, &live, storage.imageById(4).?.data.bytes().?);
     try testing.expectEqual(0, storage.placements.count());
+}
+
+/// A pane and a mirror restored from its snapshot, as a client that fetches
+/// pixels apart from the snapshot sees them: the mirror holds every frame
+/// pending until a payload or an attach completes it.
+const TestMirror = struct {
+    encoded: []u8,
+    source: std.Io.Reader,
+    decoder: snapshot.Decoder,
+    decoded: snapshot.Decoded,
+    restored: Terminal,
+
+    fn init(self: *TestMirror, pane: *const Terminal) !void {
+        self.encoded = try testEncode(pane);
+        errdefer testing.allocator.free(self.encoded);
+        self.source = .fixed(self.encoded);
+        self.decoder = .init(&self.source);
+        self.decoded = try self.decoder.ready(testing.allocator, testing.io, test_decode_options);
+        self.restored = self.decoded.toOwned();
+    }
+
+    fn deinit(self: *TestMirror) void {
+        self.restored.deinit(testing.allocator);
+        self.decoded.deinit(testing.allocator);
+        testing.allocator.free(self.encoded);
+    }
+
+    fn storage(self: *TestMirror) *ImageStorage {
+        return &self.restored.screens.active.kitty_images;
+    }
+};
+
+/// Complete a frame the way the C API does: with a copy that the store frees
+/// when it refuses it.
+fn testStore(storage: *ImageStorage, id: u32, frame: u32, generation: u64, pixels: []const u8) !ImageStorage.FrameAttach {
+    const copy = try testing.allocator.dupe(u8, pixels);
+    const answer = storage.storeFrame(testing.io, id, frame, generation, .{ .complete = copy });
+    if (answer != .attached) testing.allocator.free(copy);
+    return answer;
+}
+
+fn testSerial(t: *const Terminal, id: u32, frame: u32) u64 {
+    return t.screens.active.kitty_images.imageById(id).?.frameSerial(frame).?;
+}
+
+test "a mirror restored from a snapshot has the pane's serials" {
+    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
+    var pane = try testAnimationTerminal();
+    defer pane.deinit(testing.allocator);
+    var mirror: TestMirror = undefined;
+    try mirror.init(&pane);
+    defer mirror.deinit();
+    while (try mirror.decoder.next(testing.allocator, &mirror.restored)) |_| {}
+    try expectStorageEqual(&pane, &mirror.restored, .primary);
+    try testing.expect(testSerial(&pane, 5, 1) < testSerial(&pane, 5, 2));
+    try testing.expect(testSerial(&pane, 5, 2) < testSerial(&pane, 5, 3));
+    try testing.expectEqual(pane.screens.active.kitty_images.command_serial, testSerial(&pane, 5, 3));
+}
+
+test "the serial moves for the commands that store pixels and for no other" {
+    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
+    var t = try testTerminal(4, 2);
+    defer t.deinit(testing.allocator);
+    const storage = &t.screens.active.kitty_images;
+
+    var expected: u64 = 0;
+    const Step = struct { keys: []const u8, payload: []const u8, moves: bool };
+    const px = testPixels(8, .{ 1, 2, 3, 255 });
+    const px1 = testPixels(4, .{ 4, 5, 6, 255 });
+    for ([_]Step{
+        .{ .keys = "a=T,f=32,s=2,v=1,i=5,C=1,q=2", .payload = &px, .moves = true },
+        .{ .keys = "a=f,i=5,f=32,s=1,v=1,q=2", .payload = &px1, .moves = true },
+        .{ .keys = "a=f,i=5,r=2,f=32,s=1,v=1,q=2", .payload = &px1, .moves = true },
+        .{ .keys = "a=c,i=5,r=1,c=2,w=1,h=1,q=2", .payload = "", .moves = true },
+        .{ .keys = "a=a,i=5,s=3,q=2", .payload = "", .moves = false },
+        .{ .keys = "a=a,i=5,c=2,q=2", .payload = "", .moves = false },
+        .{ .keys = "a=p,i=5,q=2", .payload = "", .moves = false },
+        .{ .keys = "a=q,i=77,f=32,s=1,v=1,q=2", .payload = &px1, .moves = false },
+        .{ .keys = "a=d,d=f,i=5,r=2,q=2", .payload = "", .moves = true },
+        .{ .keys = "a=d,d=i,i=5,q=2", .payload = "", .moves = false },
+    }) |step| {
+        try testCommand(&t, step.keys, step.payload);
+        if (step.moves) expected += 1;
+        try testing.expectEqual(expected, storage.command_serial);
+    }
+
+    // A tick and a resize move nothing either.
+    _ = storage.animationTick(testing.io, 5000);
+    try t.resize(testing.allocator, .{ .cols = 6, .rows = 3 });
+    try testing.expectEqual(expected, storage.command_serial);
+}
+
+test "a frame takes the serial of the command that set it" {
+    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
+    var t = try testAnimationTerminal();
+    defer t.deinit(testing.allocator);
+    const storage = &t.screens.active.kitty_images;
+    const untouched = testSerial(&t, 5, 2);
+    const root = testSerial(&t, 5, 1);
+
+    try testCommand(&t, "a=f,i=5,r=3,f=32,s=1,v=1,q=2", &testPixels(4, .{ 9, 9, 9, 255 }));
+    try testing.expectEqual(storage.command_serial, testSerial(&t, 5, 3));
+    try testing.expectEqual(untouched, testSerial(&t, 5, 2));
+    try testing.expectEqual(root, testSerial(&t, 5, 1));
+
+    // Deleting frame 2 renumbers frame 3, which takes the command's serial.
+    try testCommand(&t, "a=d,d=f,i=5,r=2,q=2", "");
+    try testing.expectEqual(storage.command_serial, testSerial(&t, 5, 2));
+    try testing.expectEqual(root, testSerial(&t, 5, 1));
+}
+
+test "the race of an edit and a pending frame ends with one composition" {
+    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
+    var pane = try testAnimationTerminal();
+    defer pane.deinit(testing.allocator);
+    var mirror: TestMirror = undefined;
+    try mirror.init(&pane);
+    defer mirror.deinit();
+    const storage = mirror.storage();
+    const before = testSerial(&pane, 5, 3);
+    try testing.expectEqual(before, testSerial(&mirror.restored, 5, 3));
+    const pending_before = storage.pending_generation;
+
+    // The pane edits frame 3. The bytes reach the mirror, where the frame
+    // is pending: the edit is refused, but the frame takes the serial and
+    // the pending generation moves.
+    const edit = testPixels(4, .{ 7, 7, 7, 255 });
+    try testCommand(&pane, "a=f,i=5,r=3,f=32,s=1,v=1,q=2", &edit);
+    const after = testSerial(&pane, 5, 3);
+    try testing.expect(after != before);
+    try testCommand(&mirror.restored, "a=f,i=5,r=3,f=32,s=1,v=1,q=2", &edit);
+    try testing.expectEqual(after, testSerial(&mirror.restored, 5, 3));
+    try testing.expect(storage.imageById(5).?.frameSlot(3).?.isPending());
+    try testing.expect(storage.pending_generation != pending_before);
+
+    // The payload of the snapshot is for the old serial. It arrives while
+    // the edited frame is still pending, and is dropped.
+    var dropped = false;
+    while (try mirror.decoder.next(testing.allocator, &mirror.restored)) |progress| {
+        if (progress.image.frame != 3) continue;
+        try testing.expectEqual(0, progress.image.bytes);
+        dropped = true;
+    }
+    try testing.expect(dropped);
+    try testing.expect(storage.imageById(5).?.frameSlot(3).?.isPending());
+
+    // A fetch answered before the edit carries the old serial: refused.
+    const pixels = pane.screens.active.kitty_images.imageById(5).?.frameData(3).?;
+    try testing.expectEqual(ImageStorage.FrameAttach.no_value, try testStore(storage, 5, 3, before, pixels));
+    try testing.expectEqual(ImageStorage.FrameAttach.invalid_value, try testStore(storage, 5, 3, after, pixels[1..]));
+    try testing.expectEqual(ImageStorage.FrameAttach.attached, try testStore(storage, 5, 3, after, pixels));
+    try testing.expectEqual(after, testSerial(&mirror.restored, 5, 3));
+    try testing.expectEqualSlices(u8, pixels, storage.imageById(5).?.frameData(3).?);
+    try expectStorageEqual(&pane, &mirror.restored, .primary);
+}
+
+test "an edit that follows the completed frame composes as in the pane" {
+    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
+    var pane = try testAnimationTerminal();
+    defer pane.deinit(testing.allocator);
+    var mirror: TestMirror = undefined;
+    try mirror.init(&pane);
+    defer mirror.deinit();
+    while (try mirror.decoder.next(testing.allocator, &mirror.restored)) |_| {}
+
+    const edit = testPixels(4, .{ 7, 7, 7, 255 });
+    try testCommand(&pane, "a=f,i=5,r=3,f=32,s=1,v=1,q=2", &edit);
+    try testCommand(&mirror.restored, "a=f,i=5,r=3,f=32,s=1,v=1,q=2", &edit);
+    try expectStorageEqual(&pane, &mirror.restored, .primary);
+}
+
+test "a composition from a frame that is pending on the mirror marks the target pending" {
+    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
+    var pane = try testAnimationTerminal();
+    defer pane.deinit(testing.allocator);
+    var mirror: TestMirror = undefined;
+    try mirror.init(&pane);
+    defer mirror.deinit();
+    const storage = mirror.storage();
+
+    // Only the displayed frame, 2, has arrived on the mirror.
+    const progress = (try mirror.decoder.next(testing.allocator, &mirror.restored)).?.image;
+    try testing.expectEqual(2, progress.frame);
+    try testing.expect(!storage.imageById(5).?.frameSlot(2).?.isPending());
+    try testing.expect(storage.imageById(5).?.frameSlot(1).?.isPending());
+
+    // The pane composes frame 1 onto frame 2. The mirror cannot: the
+    // target takes the same serial and becomes pending.
+    try testCommand(&pane, "a=c,i=5,r=1,c=2,w=1,h=1,q=2", "");
+    try testCommand(&mirror.restored, "a=c,i=5,r=1,c=2,w=1,h=1,q=2", "");
+    const serial = testSerial(&pane, 5, 2);
+    try testing.expectEqual(serial, testSerial(&mirror.restored, 5, 2));
+    try testing.expect(storage.imageById(5).?.frameSlot(2).?.isPending());
+
+    // A fetch at that serial gets the pane's composed pixels.
+    const pixels = pane.screens.active.kitty_images.imageById(5).?.frameData(2).?;
+    try testing.expectEqual(ImageStorage.FrameAttach.attached, try testStore(storage, 5, 2, serial, pixels));
+    try testing.expectEqualSlices(u8, pixels, storage.imageById(5).?.frameData(2).?);
+}
+
+test "an a=f on an image with a pending root keeps the pane's frames" {
+    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
+    var pane = try testAnimationTerminal();
+    defer pane.deinit(testing.allocator);
+    var mirror: TestMirror = undefined;
+    try mirror.init(&pane);
+    defer mirror.deinit();
+    const storage = mirror.storage();
+
+    // A new frame on a canvas of its own does not need the root.
+    const px = testPixels(4, .{ 7, 7, 7, 255 });
+    try testCommand(&pane, "a=f,i=5,f=32,s=1,v=1,q=2", &px);
+    try testCommand(&mirror.restored, "a=f,i=5,f=32,s=1,v=1,q=2", &px);
+    try testing.expectEqual(4, storage.imageById(5).?.animation.?.frameCount());
+    try testing.expectEqual(testSerial(&pane, 5, 4), testSerial(&mirror.restored, 5, 4));
+    try testing.expect(!storage.imageById(5).?.frameSlot(4).?.isPending());
+
+    // A new frame on the pending root as its base, and an edit of the root.
+    try testCommand(&pane, "a=f,i=5,c=1,f=32,s=1,v=1,q=2", &px);
+    try testCommand(&mirror.restored, "a=f,i=5,c=1,f=32,s=1,v=1,q=2", &px);
+    try testing.expectEqual(5, storage.imageById(5).?.animation.?.frameCount());
+    try testing.expect(storage.imageById(5).?.frameSlot(5).?.isPending());
+    try testing.expectEqual(testSerial(&pane, 5, 5), testSerial(&mirror.restored, 5, 5));
+    try testCommand(&pane, "a=f,i=5,r=1,f=32,s=1,v=1,q=2", &px);
+    try testCommand(&mirror.restored, "a=f,i=5,r=1,f=32,s=1,v=1,q=2", &px);
+    try testing.expectEqual(testSerial(&pane, 5, 1), testSerial(&mirror.restored, 5, 1));
+    try testing.expectEqual(pane.screens.active.kitty_images.command_serial, storage.command_serial);
+}
+
+test "a live transmission replaces a pending image with a new serial for all its frames" {
+    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
+    var pane = try testAnimationTerminal();
+    defer pane.deinit(testing.allocator);
+    var mirror: TestMirror = undefined;
+    try mirror.init(&pane);
+    defer mirror.deinit();
+    const storage = mirror.storage();
+    const old_root = testSerial(&mirror.restored, 5, 1);
+    const old_frame = testSerial(&mirror.restored, 5, 2);
+    const counter = storage.command_serial;
+
+    const live = testPixels(8, .{ 0, 0, 0, 255 });
+    try testCommand(&mirror.restored, "a=t,f=32,s=2,v=1,i=5,q=2", &live);
+    try testing.expectEqual(counter + 1, storage.command_serial);
+    const image = storage.imageById(5).?;
+    try testing.expectEqual(counter + 1, image.root_serial);
+    try testing.expect(image.animation == null);
+
+    // Pixels fetched for the old image are refused.
+    const stale = testPixels(8, .{ 1, 1, 1, 255 });
+    try testing.expectEqual(ImageStorage.FrameAttach.no_value, try testStore(storage, 5, 1, old_root, &stale));
+    try testing.expectEqual(ImageStorage.FrameAttach.no_value, try testStore(storage, 5, 2, old_frame, &stale));
+    while (try mirror.decoder.next(testing.allocator, &mirror.restored)) |_| {}
+    try testing.expectEqualSlices(u8, &live, storage.imageById(5).?.data.bytes().?);
+}
+
+test "an eviction in one terminal does not move its serials" {
+    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
+    var pane = try testTerminal(4, 2);
+    defer pane.deinit(testing.allocator);
+    var mirror = try testTerminal(4, 2);
+    defer mirror.deinit(testing.allocator);
+    const px = testPixels(4, .{ 1, 2, 3, 255 });
+    for ([_]*Terminal{ &pane, &mirror }) |t| {
+        try testCommand(t, "a=t,f=32,s=1,v=1,i=1,q=2", &px);
+        try testCommand(t, "a=t,f=32,s=1,v=1,i=2,q=2", &px);
+    }
+
+    // Only the mirror loses image 1. The edit finds nothing there, but it
+    // is still a command of the same bytes.
+    mirror.screens.active.kitty_images.delete(testing.io, testing.allocator, &mirror, .{ .id = .{ .image_id = 1, .delete = true } });
+    for ([_]*Terminal{ &pane, &mirror }) |t| {
+        try testCommand(t, "a=f,i=1,f=32,s=1,v=1,q=2", &px);
+        try testCommand(t, "a=t,f=32,s=1,v=1,i=3,q=2", &px);
+    }
+    try testing.expectEqual(4, testSerial(&pane, 3, 1));
+    try testing.expectEqual(testSerial(&pane, 3, 1), testSerial(&mirror, 3, 1));
+    try testing.expectEqual(
+        pane.screens.active.kitty_images.command_serial,
+        mirror.screens.active.kitty_images.command_serial,
+    );
+}
+
+test "a serial never comes back after a reset or when the alternate screen goes" {
+    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
+    var t = try testTerminal(4, 2);
+    defer t.deinit(testing.allocator);
+    const px = testPixels(4, .{ 1, 2, 3, 255 });
+    try testCommand(&t, "a=t,f=32,s=1,v=1,i=1,q=2", &px);
+    testFeed(&t, "\x1b[?1049h");
+    try testCommand(&t, "a=t,f=32,s=1,v=1,i=2,q=2", &px);
+    try testing.expectEqual(2, testSerial(&t, 2, 1));
+    const pending = t.kittyPendingGeneration();
+
+    // RIS removes the alternate screen and resets the primary one. A fetch
+    // that was in flight for (image 1, serial 1) must not match the new
+    // image 1.
+    testFeed(&t, "\x1bc");
+    try testing.expectEqual(0, t.screens.active.kitty_images.images.count());
+    try testCommand(&t, "a=t,f=32,s=1,v=1,i=1,q=2", &px);
+    try testing.expectEqual(3, testSerial(&t, 1, 1));
+    try testing.expect(t.kittyPendingGeneration() >= pending);
+}
+
+test "root attached between the chunks of a frame does not drop the frame" {
+    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
+    var pane = try testAnimationTerminal();
+    defer pane.deinit(testing.allocator);
+    var mirror: TestMirror = undefined;
+    try mirror.init(&pane);
+    defer mirror.deinit();
+    const storage = mirror.storage();
+
+    // The root is the frame that is shown, so an attach of it moves the
+    // image's generation.
+    for ([_]*Terminal{ &pane, &mirror.restored }) |t| testFeed(t, "\x1b_Ga=a,i=5,c=1,q=2\x1b\\");
+    const chunk1 = "\x1b_Ga=f,i=5,r=3,f=32,s=2,v=1,m=1,q=2;BwcH/wcH\x1b\\";
+    const chunk2 = "\x1b_Gm=0,q=2;B/8=\x1b\\";
+    for ([_]*Terminal{ &pane, &mirror.restored }) |t| testFeed(t, chunk1);
+    const root = testPixels(8, .{ 5, 5, 5, 255 });
+    try testing.expectEqual(ImageStorage.FrameAttach.attached, try testStore(storage, 5, 1, testSerial(&mirror.restored, 5, 1), &root));
+    for ([_]*Terminal{ &pane, &mirror.restored }) |t| testFeed(t, chunk2);
+
+    try testing.expectEqual(testSerial(&pane, 5, 3), testSerial(&mirror.restored, 5, 3));
+    try testing.expect(storage.imageById(5).?.frameSlot(3).?.isPending());
+}
+
+test "an independent frame converts a pending RGB root and stamps it" {
+    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
+    var pane = try testTerminal(4, 2);
+    defer pane.deinit(testing.allocator);
+    try testCommand(&pane, "a=T,f=24,s=2,v=1,i=6,C=1,q=2", &[_]u8{ 1, 2, 3, 4, 5, 6 });
+    var mirror: TestMirror = undefined;
+    try mirror.init(&pane);
+    defer mirror.deinit();
+    const storage = mirror.storage();
+    const old = testSerial(&mirror.restored, 6, 1);
+    const pending = storage.pending_generation;
+    try testing.expectEqual(6, storage.imageById(6).?.data.len());
+
+    const frame = testPixels(4, .{ 7, 7, 7, 255 });
+    for ([_]*Terminal{ &pane, &mirror.restored }) |t| try testCommand(t, "a=f,i=6,f=32,s=1,v=1,q=2", &frame);
+    try testing.expectEqual(8, storage.imageById(6).?.data.len());
+    try testing.expect(testSerial(&mirror.restored, 6, 1) != old);
+    try testing.expectEqual(testSerial(&pane, 6, 1), testSerial(&mirror.restored, 6, 1));
+    try testing.expect(storage.pending_generation != pending);
+
+    // The response for the RGB bytes has the old serial and length.
+    const rgb = [_]u8{ 1, 2, 3, 4, 5, 6 };
+    try testing.expectEqual(ImageStorage.FrameAttach.no_value, try testStore(storage, 6, 1, old, &rgb));
 }

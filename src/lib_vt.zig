@@ -395,6 +395,9 @@ comptime {
         @export(&c.tracked_grid_ref_point, .{ .name = "ghostty_tracked_grid_ref_point" });
         @export(&c.tracked_grid_ref_set, .{ .name = "ghostty_tracked_grid_ref_set" });
         @export(&c.tracked_grid_ref_snapshot, .{ .name = "ghostty_tracked_grid_ref_snapshot" });
+        @export(&c.kitty_graphics_screen_image, .{ .name = "ghostty_kitty_graphics_screen_image" });
+        @export(&c.kitty_graphics_frame_get_multi, .{ .name = "ghostty_kitty_graphics_frame_get_multi" });
+        @export(&c.kitty_graphics_frame_attach, .{ .name = "ghostty_kitty_graphics_frame_attach" });
         @export(&c.build_info, .{ .name = "ghostty_build_info" });
         @export(&c.version, .{ .name = "ghostty_version" });
         @export(&c.type_json, .{ .name = "ghostty_type_json" });

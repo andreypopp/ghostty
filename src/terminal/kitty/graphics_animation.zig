@@ -23,6 +23,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const Image = @import("graphics_image.zig").Image;
 
 /// The gap assigned to a newly created frame when the command doesn't
 /// specify one (z omitted or z=0). Taken from Kitty (DEFAULT_GAP).
@@ -73,52 +74,53 @@ pub const Animation = struct {
 
     /// One frame after the root frame.
     ///
-    /// A frame is normally complete: `data` holds its pixels. A frame can
-    /// also be pending, which means it exists and has its place in the
-    /// animation, but its pixels have not arrived yet. This happens when
-    /// a terminal is restored from a snapshot, where the frame list
-    /// arrives first and the pixels follow later. A pending frame keeps
-    /// its full size reserved against the storage limit, so the pixels
-    /// always fit when they arrive.
+    /// A frame is normally complete: `data` holds its pixels, owned or
+    /// mapped. A frame can also be pending, which means it exists and has
+    /// its place in the animation, but its pixels have not arrived yet.
+    /// This happens when a terminal is restored from a snapshot, where the
+    /// frame list arrives first and the pixels follow later, and when a
+    /// command refers to pixels this terminal cannot read or compose. A
+    /// pending frame keeps its full size reserved against the storage
+    /// limit, so the pixels always fit when they arrive.
     ///
     /// ```zig
     /// // A pending frame for a 2x2 image: 2 * 2 * 4 bytes of RGBA.
-    /// const frame: Frame = .{ .data = &.{}, .gap_ms = 40, .pending_len = 16 };
+    /// const frame: Frame = .{ .data = .{ .pending = 16 }, .gap_ms = 40 };
     /// frame.isPending(); // true
     /// frame.storageSize(); // 16
     /// ```
     ///
-    /// Use `ImageStorage.PendingImage.completeFrame` to attach the pixels
-    /// to a pending frame.
+    /// Use `ImageStorage.PendingImage.completeFrame` or
+    /// `ImageStorage.attachFrame` to attach the pixels to a pending frame.
     pub const Frame = struct {
         /// Fully composed pixel data, always image width * height * 4
-        /// bytes of RGBA. Empty while the frame is pending.
-        data: []u8,
+        /// bytes of RGBA once it has arrived.
+        data: Image.Data,
 
         /// Milliseconds this frame is displayed before advancing.
         /// Zero means gapless: skipped during playback.
         gap_ms: u32,
 
-        /// The byte length of the pixels this frame is waiting for, or
-        /// zero if the frame is complete. Always image width * height * 4
-        /// for a pending frame.
-        pending_len: usize = 0,
+        /// The `ImageStorage.command_serial` value of the graphics command
+        /// that last set this frame's pixels or its number. Zero for a
+        /// frame that no command of this terminal has stamped.
+        serial: u64 = 0,
 
         /// Returns true if this frame's pixels have not arrived yet.
         pub fn isPending(self: Frame) bool {
-            return self.pending_len > 0;
+            return self.data.isPending();
         }
 
         /// Bytes of pixel data this frame holds, or will hold once its
         /// pixels arrive. This is what the frame counts against the
         /// storage limit.
         pub fn storageSize(self: Frame) usize {
-            return if (self.isPending()) self.pending_len else self.data.len;
+            return self.data.len();
         }
     };
 
     pub fn deinit(self: *Animation, alloc: Allocator) void {
-        for (self.frames.items) |frame| alloc.free(frame.data);
+        for (self.frames.items) |*frame| frame.data.deinit(alloc);
         self.frames.deinit(alloc);
     }
 
@@ -178,7 +180,7 @@ test "animation gap helpers" {
     var anim: Animation = .{};
     defer anim.deinit(alloc);
     try anim.frames.append(alloc, .{
-        .data = try alloc.alloc(u8, 4),
+        .data = .{ .complete = try alloc.alloc(u8, 4) },
         .gap_ms = 100,
     });
 
