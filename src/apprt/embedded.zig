@@ -2504,6 +2504,11 @@ pub const CAPI = struct {
         surface.core_surface.io.restoreOutput(ptr[0..len]);
     }
 
+    fn adoptGrid(context: *anyopaque, columns: u16, rows: u16) void {
+        const surface: *Surface = @ptrCast(@alignCast(context));
+        if (!surface.updateGridSize(columns, rows)) log.warn("restored snapshot size {}x{} did not fit the surface", .{ columns, rows });
+    }
+
     export fn ghostty_surface_restore_snapshot(
         surface: *Surface,
         read: ?snapshot_io.ReaderFn,
@@ -2512,7 +2517,8 @@ pub const CAPI = struct {
         max_continuation_bytes: usize,
     ) termio.Termio.RestoreResult {
         var adapter = snapshot_io.ReaderAdapter.init(.{ .read = read, .userdata = userdata });
-        return surface.core_surface.io.restoreSnapshot(adapter.reader(), history, max_continuation_bytes);
+        const grid: termio.Termio.GridAdopter = .{ .context = surface, .adopt = adoptGrid };
+        return surface.core_surface.io.restoreSnapshot(adapter.reader(), history, max_continuation_bytes, grid);
     }
 
     export fn ghostty_surface_viewport_anchor(surface: *Surface, text: *Text) usize {

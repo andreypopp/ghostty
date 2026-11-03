@@ -1323,8 +1323,7 @@ typedef bool (*ghostty_snapshot_read_fn)(void*, uint8_t*, size_t, size_t*);
 typedef enum {
   GHOSTTY_SNAPSHOT_RESTORE_OK = 0,
   GHOSTTY_SNAPSHOT_RESTORE_REJECTED = 1,
-  GHOSTTY_SNAPSHOT_RESTORE_SIZE_MISMATCH = 2,
-  GHOSTTY_SNAPSHOT_RESTORE_HISTORY_INCOMPLETE = 3,
+  GHOSTTY_SNAPSHOT_RESTORE_HISTORY_INCOMPLETE = 2,
 } ghostty_snapshot_restore_result_e;
 GHOSTTY_API ghostty_snapshot_restore_result_e ghostty_surface_restore_snapshot(ghostty_surface_t, ghostty_snapshot_read_fn, void*, bool history, size_t max_continuation_bytes);
 GHOSTTY_API size_t ghostty_surface_viewport_anchor(ghostty_surface_t, ghostty_text_s*);
