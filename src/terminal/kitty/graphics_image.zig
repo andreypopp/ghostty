@@ -69,11 +69,12 @@ pub const LoadingImage = struct {
         /// protocol's requirement that chunks repeat a=f.
         cmd: command.AnimationFrameLoading,
 
-        /// The generation of the target image when the load began.
-        /// A different generation at completion means the image was
+        /// The transmission of the target image when the load began.
+        /// A different transmission at completion means the image was
         /// replaced or evicted mid-transmission and the frame must be
-        /// discarded rather than composed onto the wrong image.
-        image_generation: u64,
+        /// discarded rather than composed onto the wrong image. It does
+        /// not move when pixels arrive or the shown frame changes.
+        image_transmission: u64,
     };
 
     /// The limits of the Kitty Graphics protocol we should allow.
@@ -808,6 +809,12 @@ pub const Image = struct {
     /// ```
     transmission: u64 = 0,
 
+    /// The `ImageStorage.command_serial` value of the graphics command
+    /// that last set the pixels or the number of frame 1. See
+    /// `animation.Animation.Frame.serial` for the other frames. Unlike
+    /// `generation`, it does not move when playback shows another frame.
+    root_serial: u64 = 0,
+
     /// Animation state, non-null once any animation command (a=f,
     /// a=a) has attached animation state to this image. Owned by the
     /// image; replaced/retransmitted images drop it, which implements
@@ -942,37 +949,77 @@ pub const Image = struct {
     pub fn renderData(self: *const Image) Data {
         if (self.animation) |anim| {
             if (anim.current_index > 0) {
-                const frame = anim.frames.items[anim.current_index - 1];
-                if (frame.isPending()) return .{ .pending = frame.pending_len };
-                return .{ .complete = frame.data };
+                return anim.frames.items[anim.current_index - 1].data;
             }
         }
 
         return self.data;
     }
 
+    /// The animation frame of the given 1-based frame number, 2 or more.
+    fn animationFrame(self: *const Image, number: u32) ?*animation.Animation.Frame {
+        const anim = self.animation orelse return null;
+        // Minus 2 because frame is 1-based and frame 1 is the image base
+        // data, so the animation frames start at frame 2.
+        if (number < 2 or number - 2 >= anim.frames.items.len) return null;
+        return &anim.frames.items[number - 2];
+    }
+
+    /// The storage of the given 1-based animation frame number, or null if
+    /// the frame doesn't exist. Frame 1 (the root frame) always exists,
+    /// even for images without animation state. The slot can be pending.
+    pub fn frameSlot(self: *const Image, number: u32) ?*Data {
+        if (number == 1) return @constCast(&self.data);
+        return &(self.animationFrame(number) orelse return null).data;
+    }
+
+    /// The serial of the command that last set the given frame, or null if
+    /// the frame doesn't exist.
+    pub fn frameSerialPtr(self: *const Image, number: u32) ?*u64 {
+        if (number == 1) return @constCast(&self.root_serial);
+        return &(self.animationFrame(number) orelse return null).serial;
+    }
+
+    pub fn frameSerial(self: *const Image, number: u32) ?u64 {
+        return (self.frameSerialPtr(number) orelse return null).*;
+    }
+
     /// The pixel data of the given 1-based animation frame number, or
     /// null if the frame doesn't exist or its pixels have not arrived
-    /// yet. Frame 1 (the root frame) always exists as long as the image
-    /// data is complete, even for images without animation state.
+    /// yet.
     ///
     /// The returned slice is owned by the image (or its animation)
     /// and remains valid until the image or frame is mutated.
     pub fn frameData(self: *const Image, number: u32) ?[]const u8 {
-        switch (number) {
-            0 => return null,
-            1 => return self.data.bytes(),
-            else => {
-                const anim = self.animation orelse return null;
-                // Minus 2 because frame is 1-based and frame 1 is the
-                // image base data, so the animation frames start at frame 2.
-                const idx = number - 2;
-                if (idx >= anim.frames.items.len) return null;
-                const frame = anim.frames.items[idx];
-                if (frame.isPending()) return null;
-                return frame.data;
-            },
-        }
+        return (self.frameSlot(number) orelse return null).bytes();
+    }
+
+    /// True if the image itself or a frame of its animation has not
+    /// received its pixels yet.
+    pub fn hasPendingFrames(self: *const Image) bool {
+        if (self.data.isPending()) return true;
+        const anim = self.animation orelse return false;
+        return anim.hasPendingFrames();
+    }
+
+    /// What the C API reports about one frame.
+    pub const FrameInfo = struct {
+        format: command.Transmission.Format,
+        bytes: ?[]const u8,
+        len: usize,
+        serial: u64,
+        gap_ms: u32,
+    };
+
+    pub fn frameInfo(self: *const Image, number: u32) ?FrameInfo {
+        const slot = self.frameSlot(number) orelse return null;
+        return .{
+            .format = if (number == 1) self.format else .rgba,
+            .bytes = slot.bytes(),
+            .len = slot.len(),
+            .serial = self.frameSerial(number).?,
+            .gap_ms = if (self.animation) |anim| anim.gapAt(number - 1) else 0,
+        };
     }
 
     /// Total bytes of pixel data reserved against the storage limit

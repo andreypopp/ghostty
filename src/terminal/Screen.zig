@@ -454,6 +454,8 @@ pub fn reset(self: *Screen) void {
         const image_limits = self.kitty_images.image_limits;
         const total_limit = self.kitty_images.total_limit;
         const dirty = self.kitty_images.dirty;
+        const pending_generation = self.kitty_images.pending_generation;
+        const command_serial = self.kitty_images.command_serial;
         self.kitty_images.deinit(self.alloc, self);
         self.kitty_images = .{
             // Carry the counter over instead of starting from zero.
@@ -461,6 +463,9 @@ pub fn reset(self: *Screen) void {
             // different one after the reset, and a fresh counter could
             // happen to match it.
             .dirty = dirty,
+            .pending_generation = pending_generation,
+            // A serial never comes back, also after a reset.
+            .command_serial = command_serial,
             .image_limits = image_limits,
             .total_limit = total_limit,
         };

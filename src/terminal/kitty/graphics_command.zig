@@ -551,6 +551,14 @@ pub const Transmission = struct {
         pub const default: Usage = .{};
     };
 
+    /// The byte length of width * height uncompressed pixels, or null if
+    /// the dimensions or the format cannot describe stored pixels.
+    pub fn rawLen(width: u32, height: u32, format: Format) ?usize {
+        if (width == 0 or height == 0) return null;
+        if (format == .png) return null;
+        return std.math.mul(usize, @as(usize, width) * height, formatBpp(format)) catch null;
+    }
+
     pub fn formatBpp(format: Format) u8 {
         return switch (format) {
             .gray => 1,

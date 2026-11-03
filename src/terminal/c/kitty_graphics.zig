@@ -5,7 +5,9 @@ const lib = @import("../lib.zig");
 const CAllocator = lib.alloc.Allocator;
 const kitty_storage = @import("../kitty/graphics_storage.zig");
 const kitty_cmd = @import("../kitty/graphics_command.zig");
-const Image = @import("../kitty/graphics_image.zig").Image;
+const kitty_image = @import("../kitty/graphics_image.zig");
+const Image = kitty_image.Image;
+const ScreenSet = @import("../ScreenSet.zig");
 const grid_ref = @import("grid_ref.zig");
 const selection_c = @import("selection.zig");
 const terminal_c = @import("terminal.zig");
@@ -183,11 +185,20 @@ pub const ImageData = enum(c_int) {
     data_ptr = 7,
     data_len = 8,
     generation = 9,
+    frame_count = 10,
+    animation_state = 11,
+    current_frame = 12,
+    max_loops = 13,
+    current_loop = 14,
+    pending_frames = 15,
 
     pub fn OutType(comptime self: ImageData) type {
         return switch (self) {
             .invalid => void,
             .id, .number, .width, .height => u32,
+            .frame_count, .current_frame, .max_loops, .current_loop => u32,
+            .animation_state => AnimationState,
+            .pending_frames => bool,
             .format => ImageFormat,
             .compression => ImageCompression,
             .data_ptr => [*]const u8,
@@ -196,6 +207,238 @@ pub const ImageData = enum(c_int) {
         };
     }
 };
+
+/// C: GhosttyKittyAnimationState
+pub const AnimationState = enum(c_int) {
+    none = 0,
+    stopped = 1,
+    loading = 2,
+    running = 3,
+};
+
+/// C: GhosttyKittyGraphicsFrameData
+pub const FrameData = enum(c_int) {
+    invalid = 0,
+    format = 1,
+    compression = 2,
+    data_ptr = 3,
+    data_len = 4,
+    generation = 5,
+    gap_ms = 6,
+
+    pub fn OutType(comptime self: FrameData) type {
+        return switch (self) {
+            .invalid => void,
+            .format => ImageFormat,
+            .compression => ImageCompression,
+            .data_ptr => [*]const u8,
+            .data_len => usize,
+            .generation => u64,
+            .gap_ms => u32,
+        };
+    }
+};
+
+fn screenStorage(t: *Terminal, screen: ScreenSet.Key) ?*kitty_storage.ImageStorage {
+    return &(t.screens.get(screen) orelse return null).kitty_images;
+}
+
+/// Write one data kind of a frame to the C value `out`. The `data_ptr`
+/// kind needs the pixels, so it is for callers that hold the terminal
+/// still while the pointer is used.
+pub fn writeFrameValue(info: kitty_image.Image.FrameInfo, data: FrameData, out: ?*anyopaque) Result {
+    return switch (data) {
+        .invalid => .invalid_value,
+        inline else => |comptime_data| writeFrameValueTyped(
+            info,
+            comptime_data,
+            @ptrCast(@alignCast(out orelse return .invalid_value)),
+        ),
+    };
+}
+
+fn writeFrameValueTyped(
+    info: kitty_image.Image.FrameInfo,
+    comptime data: FrameData,
+    out: *data.OutType(),
+) Result {
+    switch (data) {
+        .invalid => return .invalid_value,
+        .format => out.* = info.format,
+        .compression => out.* = .none,
+        .data_ptr => out.* = (info.bytes orelse return .no_value).ptr,
+        .data_len => out.* = info.len,
+        .generation => out.* = info.serial,
+        .gap_ms => out.* = info.gap_ms,
+    }
+    return .success;
+}
+
+/// The result code of a frame lookup that failed.
+pub fn frameLookupResult(err: kitty_storage.ImageStorage.FrameError) Result {
+    return switch (err) {
+        error.NoImage => .no_value,
+        error.NoFrame => .invalid_value,
+    };
+}
+
+pub fn frame_get(
+    terminal_: terminal_c.Terminal,
+    screen: ScreenSet.Key,
+    image_id: u32,
+    frame: u32,
+    data: FrameData,
+    out: ?*anyopaque,
+) callconv(lib.calling_conv) Result {
+    if (comptime !build_options.kitty_graphics) return .no_value;
+    const t = terminal_c.zigTerminal(terminal_) orelse return .invalid_value;
+    const storage = screenStorage(t, screen) orelse return .no_value;
+    const info = storage.frameInfo(image_id, frame) catch |err| return frameLookupResult(err);
+    return writeFrameValue(info, data, out);
+}
+
+pub fn frame_get_multi(
+    terminal_: terminal_c.Terminal,
+    screen: ScreenSet.Key,
+    image_id: u32,
+    frame: u32,
+    count: usize,
+    keys: ?[*]const FrameData,
+    values: ?[*]?*anyopaque,
+    out_written: ?*usize,
+) callconv(lib.calling_conv) Result {
+    if (comptime !build_options.kitty_graphics) return .no_value;
+
+    const k = keys orelse return .invalid_value;
+    const v = values orelse return .invalid_value;
+    const t = terminal_c.zigTerminal(terminal_) orelse return .invalid_value;
+    const storage = screenStorage(t, screen) orelse return .no_value;
+    const info = storage.frameInfo(image_id, frame) catch |err| return frameLookupResult(err);
+
+    for (0..count) |i| {
+        const result = writeFrameValue(info, k[i], v[i]);
+        if (result != .success) {
+            if (out_written) |w| w.* = i;
+            return result;
+        }
+    }
+    if (out_written) |w| w.* = count;
+    return .success;
+}
+
+/// Where the pixels of a frame come from.
+pub const FrameSource = union(enum) {
+    /// Pixels to copy.
+    copy: []const u8,
+
+    /// A read-only mapping that the terminal takes over on success.
+    mapping: struct {
+        base: ?*anyopaque,
+        map_len: usize,
+        offset: usize,
+        len: usize,
+    },
+};
+
+/// Make the frame data of a source. This allocates, so a caller that holds
+/// a lock around the terminal calls it before taking the lock. The data
+/// goes to `finishFrame` with the answer of `ImageStorage.storeFrame`.
+pub fn prepareFrame(alloc: std.mem.Allocator, source: FrameSource) error{ InvalidValue, OutOfMemory }!kitty_image.Image.Data {
+    switch (source) {
+        .copy => |pixels| return .{ .complete = try alloc.dupe(u8, pixels) },
+        .mapping => |m| {
+            const base = m.base orelse return error.InvalidValue;
+            if (@intFromPtr(base) % std.heap.pageSize() != 0) return error.InvalidValue;
+            const end = std.math.add(usize, m.offset, m.len) catch return error.InvalidValue;
+            if (end > m.map_len) return error.InvalidValue;
+            const memory: [*]align(std.heap.page_size_min) u8 = @ptrCast(@alignCast(base));
+            return .{ .mapped = try kitty_image.Image.Mapping.init(alloc, memory[0..m.map_len], m.offset, end) };
+        },
+    }
+}
+
+/// The result code of a failed `prepareFrame`. A mapping that cannot be
+/// taken stays with the caller.
+pub fn prepareResult(err: error{ InvalidValue, OutOfMemory }) Result {
+    return switch (err) {
+        error.InvalidValue => .invalid_value,
+        error.OutOfMemory => .out_of_memory,
+    };
+}
+
+/// The answer of a frame store as a result code. A copy is freed when the
+/// store refused it. A refused mapping stays the caller's: only its
+/// bookkeeping is freed.
+pub fn finishFrame(
+    alloc: std.mem.Allocator,
+    data: kitty_image.Image.Data,
+    answer: kitty_storage.ImageStorage.FrameAttach,
+) Result {
+    switch (answer) {
+        .attached => return .success,
+        .no_value, .invalid_value => {
+            switch (data) {
+                .mapped => |mapping| alloc.destroy(mapping),
+                else => {
+                    var owned = data;
+                    owned.deinit(alloc);
+                },
+            }
+            return if (answer == .no_value) .no_value else .invalid_value;
+        },
+    }
+}
+
+pub fn frame_attach(
+    terminal_: terminal_c.Terminal,
+    screen: ScreenSet.Key,
+    image_id: u32,
+    frame: u32,
+    generation: u64,
+    pixels: ?[*]const u8,
+    len: usize,
+) callconv(lib.calling_conv) Result {
+    if (comptime !build_options.kitty_graphics) return .no_value;
+    const p = pixels orelse return .invalid_value;
+    return frameStore(terminal_, screen, image_id, frame, generation, .{ .copy = p[0..len] });
+}
+
+pub fn frame_adopt(
+    terminal_: terminal_c.Terminal,
+    screen: ScreenSet.Key,
+    image_id: u32,
+    frame: u32,
+    generation: u64,
+    base: ?*anyopaque,
+    map_len: usize,
+    offset: usize,
+    len: usize,
+) callconv(lib.calling_conv) Result {
+    if (comptime !build_options.kitty_graphics) return .no_value;
+    return frameStore(terminal_, screen, image_id, frame, generation, .{ .mapping = .{
+        .base = base,
+        .map_len = map_len,
+        .offset = offset,
+        .len = len,
+    } });
+}
+
+fn frameStore(
+    terminal_: terminal_c.Terminal,
+    screen: ScreenSet.Key,
+    image_id: u32,
+    frame: u32,
+    generation: u64,
+    source: FrameSource,
+) Result {
+    const t = terminal_c.zigTerminal(terminal_) orelse return .invalid_value;
+    if (frame == 0) return .invalid_value;
+    // Serial 0 is a frame with no identity, which no fetch can complete.
+    if (generation == 0) return .no_value;
+    const s = t.screens.get(screen) orelse return .no_value;
+    const data = prepareFrame(s.alloc, source) catch |err| return prepareResult(err);
+    return finishFrame(s.alloc, data, s.kitty_images.storeFrame(t.io(), image_id, frame, generation, data));
+}
 
 pub fn animation_tick(
     graphics_: KittyGraphics,
@@ -228,6 +471,17 @@ pub fn image_get_handle(
     if (comptime !build_options.kitty_graphics) return null;
 
     const storage = graphics_;
+    return storage.images.getPtr(image_id);
+}
+
+pub fn screen_image(
+    terminal_: terminal_c.Terminal,
+    screen: ScreenSet.Key,
+    image_id: u32,
+) callconv(lib.calling_conv) ImageHandle {
+    if (comptime !build_options.kitty_graphics) return null;
+    const t = terminal_c.zigTerminal(terminal_) orelse return null;
+    const storage = screenStorage(t, screen) orelse return null;
     return storage.images.getPtr(image_id);
 }
 
@@ -292,6 +546,16 @@ fn imageGetTyped(
         .data_ptr => out.* = (image.renderData().bytes() orelse return .no_value).ptr,
         .data_len => out.* = image.renderData().len(),
         .generation => out.* = image.generation,
+        .frame_count => out.* = if (image.animation) |anim| anim.frameCount() else 1,
+        .animation_state => out.* = if (image.animation) |anim| switch (anim.state) {
+            .stopped => .stopped,
+            .loading => .loading,
+            .running => .running,
+        } else .none,
+        .current_frame => out.* = if (image.animation) |anim| anim.current_index + 1 else 1,
+        .max_loops => out.* = if (image.animation) |anim| anim.max_loops else 0,
+        .current_loop => out.* = if (image.animation) |anim| anim.current_loop else 0,
+        .pending_frames => out.* = image.hasPendingFrames(),
     }
 
     return .success;
@@ -2283,4 +2547,213 @@ test "animation_tick null out returns invalid_value" {
     var graphics: KittyGraphics = undefined;
     try testing.expectEqual(Result.success, terminal_c.get(t, .kitty_graphics, @ptrCast(&graphics)));
     try testing.expectEqual(Result.invalid_value, animation_tick(graphics, 0, null));
+}
+
+test "frame calls read, refuse and complete the frames of a two-frame upload" {
+    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
+
+    var t: terminal_c.Terminal = null;
+    try testing.expectEqual(Result.success, terminal_c.new(&lib.alloc.test_allocator, &t, 80, 24));
+    defer terminal_c.free(t);
+
+    // The third frame comes from a shared memory object this terminal
+    // cannot read, so it is pending.
+    var name_buffer: [32]u8 = undefined;
+    const name = try std.fmt.bufPrint(&name_buffer, "/kido-missing-{d}", .{std.c.getpid()});
+    var encoded_name: [64]u8 = undefined;
+    const name_b64 = std.base64.standard.Encoder.encode(&encoded_name, name);
+    var cmds: [512]u8 = undefined;
+    const input = try std.fmt.bufPrint(
+        &cmds,
+        "\x1b_Ga=T,f=32,i=1,s=1,v=1,c=1,r=1;/wAA/w==\x1b\\" ++
+            "\x1b_Ga=f,f=32,i=1,s=1,v=1,z=40;AAD//w==\x1b\\" ++
+            "\x1b_Ga=f,i=1,t=s,f=32,s=1,v=1,z=20;{s}\x1b\\",
+        .{name_b64},
+    );
+    terminal_c.vt_write(t, input.ptr, input.len);
+
+    var graphics: KittyGraphics = undefined;
+    try testing.expectEqual(Result.success, terminal_c.get(t, .kitty_graphics, @ptrCast(&graphics)));
+    const img = image_get_handle(graphics, 1);
+    var count: u32 = 0;
+    try testing.expectEqual(Result.success, image_get(img, .frame_count, @ptrCast(&count)));
+    try testing.expectEqual(@as(u32, 3), count);
+    var pending: bool = false;
+    try testing.expectEqual(Result.success, image_get(img, .pending_frames, @ptrCast(&pending)));
+    try testing.expect(pending);
+    var state: AnimationState = undefined;
+    try testing.expectEqual(Result.success, image_get(img, .animation_state, @ptrCast(&state)));
+    try testing.expectEqual(AnimationState.stopped, state);
+
+    // Frame 2: pixels, format and the serial of its command.
+    var ptr: [*]const u8 = undefined;
+    try testing.expectEqual(Result.success, frame_get(t, .primary, 1, 2, .data_ptr, @ptrCast(&ptr)));
+    try testing.expectEqualSlices(u8, &.{ 0, 0, 255, 255 }, ptr[0..4]);
+    var format: ImageFormat = undefined;
+    try testing.expectEqual(Result.success, frame_get(t, .primary, 1, 2, .format, @ptrCast(&format)));
+    try testing.expectEqual(ImageFormat.rgba, format);
+    var serial2: u64 = 0;
+    try testing.expectEqual(Result.success, frame_get(t, .primary, 1, 2, .generation, @ptrCast(&serial2)));
+    var gap: u32 = 0;
+    try testing.expectEqual(Result.success, frame_get(t, .primary, 1, 2, .gap_ms, @ptrCast(&gap)));
+    try testing.expectEqual(@as(u32, 40), gap);
+
+    // Frame 3 is pending: no pointer, its length, a newer serial.
+    var serial3: u64 = 0;
+    try testing.expectEqual(Result.no_value, frame_get(t, .primary, 1, 3, .data_ptr, @ptrCast(&ptr)));
+    try testing.expectEqual(Result.success, frame_get(t, .primary, 1, 3, .generation, @ptrCast(&serial3)));
+    try testing.expect(serial3 > serial2);
+    var len: usize = 0;
+    try testing.expectEqual(Result.success, frame_get(t, .primary, 1, 3, .data_len, @ptrCast(&len)));
+    try testing.expectEqual(@as(usize, 4), len);
+
+    // multi
+    const keys = [_]FrameData{ .data_len, .generation };
+    var out_len: usize = 0;
+    var out_gen: u64 = 0;
+    var values = [_]?*anyopaque{ @ptrCast(&out_len), @ptrCast(&out_gen) };
+    var written: usize = 0;
+    try testing.expectEqual(Result.success, frame_get_multi(t, .primary, 1, 3, 2, &keys, &values, &written));
+    try testing.expectEqual(@as(usize, 2), written);
+    try testing.expectEqual(serial3, out_gen);
+
+    // No such image, no such frame, frame 0, the other screen.
+    try testing.expectEqual(Result.no_value, frame_get(t, .primary, 9, 1, .data_len, @ptrCast(&len)));
+    try testing.expectEqual(Result.invalid_value, frame_get(t, .primary, 1, 4, .data_len, @ptrCast(&len)));
+    try testing.expectEqual(Result.invalid_value, frame_get(t, .primary, 1, 0, .data_len, @ptrCast(&len)));
+    try testing.expectEqual(Result.no_value, frame_get(t, .alternate, 1, 1, .data_len, @ptrCast(&len)));
+
+    // The pending generation names the pending frame.
+    var pending_generation: u64 = 0;
+    try testing.expectEqual(Result.success, terminal_c.get(t, .kitty_pending_generation, @ptrCast(&pending_generation)));
+    try testing.expect(pending_generation != 0);
+
+    // The animation does not play while a frame is pending.
+    const run = "\x1b_Ga=a,i=1,s=3\x1b\\";
+    terminal_c.vt_write(t, run.ptr, run.len);
+    var next: u64 = 0;
+    try testing.expectEqual(Result.no_value, animation_tick(graphics, 1000, &next));
+
+    // Attach: a serial that moved on, a wrong length, a frame that is not
+    // pending, and then the right one.
+    const pixels = [_]u8{ 1, 2, 3, 255 };
+    try testing.expectEqual(Result.no_value, frame_attach(t, .primary, 1, 3, serial3 - 1, &pixels, 4));
+    try testing.expectEqual(Result.invalid_value, frame_attach(t, .primary, 1, 3, serial3, &pixels, 3));
+    try testing.expectEqual(Result.invalid_value, frame_attach(t, .primary, 1, 3, serial3, null, 4));
+    try testing.expectEqual(Result.no_value, frame_attach(t, .primary, 1, 2, serial2, &pixels, 4));
+    try testing.expectEqual(Result.no_value, frame_attach(t, .primary, 1, 4, serial3, &pixels, 4));
+    try testing.expectEqual(Result.invalid_value, frame_attach(t, .primary, 1, 0, serial3, &pixels, 4));
+    try testing.expectEqual(Result.no_value, frame_get(t, .primary, 1, 3, .data_ptr, @ptrCast(&ptr)));
+    const playback = graphics.images.getPtr(1).?.animation.?;
+    playback.frame_shown_at_ms = 1;
+    try testing.expectEqual(Result.success, frame_attach(t, .primary, 1, 3, serial3, &pixels, 4));
+    try testing.expectEqual(@as(?u64, null), playback.frame_shown_at_ms);
+    try testing.expectEqual(Result.success, frame_get(t, .primary, 1, 3, .data_ptr, @ptrCast(&ptr)));
+    try testing.expectEqualSlices(u8, &pixels, ptr[0..4]);
+    try testing.expect(ptr != &pixels);
+    var serial_after: u64 = 0;
+    try testing.expectEqual(Result.success, frame_get(t, .primary, 1, 3, .generation, @ptrCast(&serial_after)));
+    try testing.expectEqual(serial3, serial_after);
+    try testing.expectEqual(Result.success, image_get(img, .pending_frames, @ptrCast(&pending)));
+    try testing.expect(!pending);
+
+    // The last frame arrived: playback resumes and the timer starts at the
+    // first tick after it.
+    try testing.expectEqual(Result.success, animation_tick(graphics, 5000, &next));
+    try testing.expect(next >= 5000 and next <= 5040);
+}
+
+test "frame_adopt maps pixels without a copy and refuses what it cannot take" {
+    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
+
+    var t: terminal_c.Terminal = null;
+    try testing.expectEqual(Result.success, terminal_c.new(&lib.alloc.test_allocator, &t, 80, 24));
+    defer terminal_c.free(t);
+
+    var name_buffer: [32]u8 = undefined;
+    const name = try std.fmt.bufPrint(&name_buffer, "/kido-missing-{d}", .{std.c.getpid()});
+    var encoded_name: [64]u8 = undefined;
+    const name_b64 = std.base64.standard.Encoder.encode(&encoded_name, name);
+    var cmds: [512]u8 = undefined;
+    const input = try std.fmt.bufPrint(
+        &cmds,
+        "\x1b_Ga=T,f=32,i=1,s=1,v=1,c=1,r=1;/wAA/w==\x1b\\" ++
+            "\x1b_Ga=f,i=1,t=s,f=32,s=1,v=1;{s}\x1b\\",
+        .{name_b64},
+    );
+    terminal_c.vt_write(t, input.ptr, input.len);
+    var serial: u64 = 0;
+    try testing.expectEqual(Result.success, frame_get(t, .primary, 1, 2, .generation, @ptrCast(&serial)));
+
+    const page = std.heap.pageSize();
+    const memory = try std.posix.mmap(null, page, .{ .READ = true, .WRITE = true }, .{ .TYPE = .PRIVATE, .ANONYMOUS = true }, -1, 0);
+    var owned = true;
+    defer if (owned) std.posix.munmap(memory);
+    @memcpy(memory[8..12], &[_]u8{ 9, 8, 7, 255 });
+
+    // Refused: stale serial, unaligned base, a range past the mapping, a
+    // wrong length. The caller still owns the mapping.
+    try testing.expectEqual(Result.no_value, frame_adopt(t, .primary, 1, 2, serial + 1, memory.ptr, page, 8, 4));
+    try testing.expectEqual(Result.invalid_value, frame_adopt(t, .primary, 1, 2, serial, memory.ptr + 1, page, 8, 4));
+    try testing.expectEqual(Result.invalid_value, frame_adopt(t, .primary, 1, 2, serial, memory.ptr, page, page - 2, 4));
+    try testing.expectEqual(Result.invalid_value, frame_adopt(t, .primary, 1, 2, serial, memory.ptr, page, 8, 5));
+    try testing.expectEqual(Result.invalid_value, frame_adopt(t, .primary, 1, 2, serial, null, page, 8, 4));
+
+    try testing.expectEqual(Result.success, frame_adopt(t, .primary, 1, 2, serial, memory.ptr, page, 8, 4));
+    owned = false;
+    var ptr: [*]const u8 = undefined;
+    try testing.expectEqual(Result.success, frame_get(t, .primary, 1, 2, .data_ptr, @ptrCast(&ptr)));
+    try testing.expectEqual(memory.ptr + 8, @constCast(ptr));
+
+    // An in-place edit copies the pixels first and releases the mapping.
+    const edit = "\x1b_Ga=f,i=1,r=2,f=32,s=1,v=1;AAAAAA==\x1b\\";
+    terminal_c.vt_write(t, edit.ptr, edit.len);
+    try testing.expectEqual(Result.success, frame_get(t, .primary, 1, 2, .data_ptr, @ptrCast(&ptr)));
+    try testing.expect(memory.ptr + 8 != @constCast(ptr));
+}
+
+test "screen_image reads an image of the screen that is not active" {
+    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
+
+    var t: terminal_c.Terminal = null;
+    try testing.expectEqual(Result.success, terminal_c.new(&lib.alloc.test_allocator, &t, 80, 24));
+    defer terminal_c.free(t);
+
+    const input = "\x1b_Ga=T,f=32,i=1,s=1,v=1,c=1,r=1;/wAA/w==\x1b\\" ++
+        "\x1b_Ga=f,f=32,i=1,s=1,v=1,z=40;AAD//w==\x1b\\" ++
+        "\x1b[?1049h";
+    terminal_c.vt_write(t, input.ptr, input.len);
+
+    const primary = screen_image(t, .primary, 1);
+    try testing.expect(primary != null);
+    var count: u32 = 0;
+    try testing.expectEqual(Result.success, image_get(primary, .frame_count, @ptrCast(&count)));
+    try testing.expectEqual(@as(u32, 2), count);
+    try testing.expect(screen_image(t, .alternate, 1) == null);
+    try testing.expect(screen_image(t, .primary, 2) == null);
+    try testing.expect(screen_image(null, .primary, 1) == null);
+
+    var len: usize = 0;
+    try testing.expectEqual(Result.success, frame_get(t, .primary, 1, 2, .data_len, @ptrCast(&len)));
+    try testing.expectEqual(Result.no_value, frame_get(t, .alternate, 1, 1, .data_len, @ptrCast(&len)));
+}
+
+test "frame_attach refuses generation 0" {
+    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
+
+    var t: terminal_c.Terminal = null;
+    try testing.expectEqual(Result.success, terminal_c.new(&lib.alloc.test_allocator, &t, 80, 24));
+    defer terminal_c.free(t);
+
+    // A frame that restore input made pending has no serial.
+    const zt = terminal_c.zigTerminal(t).?;
+    var stream = zt.vtStream();
+    defer stream.deinit();
+    stream.handler.restoring = true;
+    stream.nextSlice("\x1b_Ga=t,f=32,i=1,s=1,v=1;/wAA/w==\x1b\\\x1b_Ga=f,i=1,f=32,s=1,v=1,m=1;AAD/\x1b\\");
+    var serial: u64 = 99;
+    try testing.expectEqual(Result.success, frame_get(t, .primary, 1, 2, .generation, @ptrCast(&serial)));
+    try testing.expectEqual(@as(u64, 0), serial);
+    const pixels = [_]u8{ 1, 2, 3, 255 };
+    try testing.expectEqual(Result.no_value, frame_attach(t, .primary, 1, 2, 0, &pixels, 4));
 }

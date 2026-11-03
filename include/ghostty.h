@@ -1311,6 +1311,11 @@ GHOSTTY_API ghostty_image_recovery_e ghostty_surface_take_unread_images(ghostty_
 GHOSTTY_API void ghostty_surface_pending_image_rows(ghostty_surface_t, int64_t, bool, bool*, size_t);
 GHOSTTY_API uint64_t ghostty_surface_fill_images_reset(ghostty_surface_t);
 GHOSTTY_API void ghostty_surface_fill_images(ghostty_surface_t, const char*, size_t, bool, uint64_t, bool);
+typedef enum { GHOSTTY_KITTY_SCREEN_E_PRIMARY = 0, GHOSTTY_KITTY_SCREEN_E_ALTERNATE = 1 } ghostty_kitty_screen_e;
+GHOSTTY_API int ghostty_surface_kitty_frame_get_multi(ghostty_surface_t, ghostty_kitty_screen_e, uint32_t image_id, uint32_t frame, size_t count, const int* keys, void** values, size_t* out_written);
+GHOSTTY_API int ghostty_surface_kitty_frame_attach(ghostty_surface_t, ghostty_kitty_screen_e, uint32_t image_id, uint32_t frame, uint64_t generation, const uint8_t*, size_t len);
+GHOSTTY_API int ghostty_surface_kitty_frame_adopt(ghostty_surface_t, ghostty_kitty_screen_e, uint32_t image_id, uint32_t frame, uint64_t generation, void* base, size_t map_len, size_t offset, size_t len);
+GHOSTTY_API uint64_t ghostty_surface_kitty_pending_generation(ghostty_surface_t);
 GHOSTTY_API size_t ghostty_surface_prepend_history(ghostty_surface_t, const char*, size_t);
 GHOSTTY_API void ghostty_surface_raise_scrollback_limit(ghostty_surface_t);
 GHOSTTY_API void ghostty_surface_restore_output(ghostty_surface_t, const char*, size_t);

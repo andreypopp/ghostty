@@ -595,6 +595,31 @@ pub fn prependHistory(self: *Terminal, alloc: Allocator, bytes: []const u8) !usi
     return kitty.graphics.ImageStorage.prepend(self.io(), alloc, self.screens.active, scratch.screens.active);
 }
 
+/// Move the terminal's Kitty graphics serial by one and return it. The
+/// counter belongs to the terminal, not to a screen: it is the highest
+/// value of the screens, and the active screen keeps the new one. See
+/// `ImageStorage.command_serial`.
+pub fn nextKittySerial(self: *Terminal) u64 {
+    if (comptime !build_options.kitty_graphics) return 0;
+    var highest: u64 = 0;
+    var it = self.screens.all.iterator();
+    while (it.next()) |entry| highest = @max(highest, entry.value.*.kitty_images.command_serial);
+    const next = highest +% 1;
+    self.screens.active.kitty_images.command_serial = next;
+    return next;
+}
+
+/// A value that moves each time a Kitty graphics frame of either screen
+/// becomes pending or a pending frame gets a new serial. Zero if none ever
+/// did. See `ImageStorage.pending_generation`.
+pub fn kittyPendingGeneration(self: *Terminal) u64 {
+    if (comptime !build_options.kitty_graphics) return 0;
+    var result: u64 = 0;
+    var it = self.screens.all.iterator();
+    while (it.next()) |entry| result = @max(result, entry.value.*.kitty_images.pending_generation);
+    return result;
+}
+
 pub fn deinit(self: *Terminal, alloc: Allocator) void {
     if (self.image_fill) |fill| {
         fill.stream.deinit();
@@ -5237,6 +5262,13 @@ pub fn switchScreen(self: *Terminal, key: ScreenSet.Key) !?*Screen {
             new.kitty_images.dirty,
             old.kitty_images.dirty,
         ) +% 1;
+
+        // The pending generation of the terminal never goes back when a
+        // screen with a higher value goes away.
+        new.kitty_images.pending_generation = @max(
+            new.kitty_images.pending_generation,
+            old.kitty_images.pending_generation,
+        );
     }
 
     // Mark our terminal as dirty to redraw the grid.

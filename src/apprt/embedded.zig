@@ -17,6 +17,8 @@ const internal_os = @import("../os/main.zig");
 const renderer = @import("../renderer.zig");
 const terminal = @import("../terminal/main.zig");
 const snapshot_io = @import("../terminal/c/io.zig");
+const kitty_c = @import("../terminal/c/kitty_graphics.zig");
+const KittyResult = @import("../terminal/c/result.zig").Result;
 const termio = @import("../termio.zig");
 const CoreApp = @import("../App.zig");
 const CoreInspector = @import("../inspector/main.zig").Inspector;
@@ -2394,6 +2396,100 @@ pub const CAPI = struct {
 
     export fn ghostty_surface_fill_images(surface: *Surface, ptr: [*]const u8, len: usize, alternate: bool, generation: u64, final: bool) void {
         surface.core_surface.io.fillImages(ptr[0..len], alternate, generation, final);
+    }
+
+    /// C: ghostty_kitty_screen_e. libghostty's screen key is a Zig enum,
+    /// which a C parameter cannot be.
+    const KittyScreen = enum(c_int) {
+        primary = 0,
+        alternate = 1,
+
+        fn key(self: KittyScreen) terminal.ScreenSet.Key {
+            return switch (self) {
+                .primary => .primary,
+                .alternate => .alternate,
+            };
+        }
+    };
+
+    /// Frame calls for a mirror that plays animations from fetched frames.
+    /// The results are GhosttyResult values. DATA_PTR is refused here: the
+    /// pointer would outlive the renderer lock.
+    export fn ghostty_surface_kitty_frame_get_multi(
+        surface: *Surface,
+        screen: KittyScreen,
+        image_id: u32,
+        frame: u32,
+        count: usize,
+        keys: ?[*]const kitty_c.FrameData,
+        values: ?[*]?*anyopaque,
+        out_written: ?*usize,
+    ) c_int {
+        const k = keys orelse return @backingInt(KittyResult.invalid_value);
+        const v = values orelse return @backingInt(KittyResult.invalid_value);
+        const info = surface.core_surface.io.kittyFrameInfo(screen.key(), image_id, frame) catch |err|
+            return @backingInt(kitty_c.frameLookupResult(err));
+        for (0..count) |i| {
+            const result = if (k[i] == .data_ptr) KittyResult.invalid_value else kitty_c.writeFrameValue(info, k[i], v[i]);
+            if (result != .success) {
+                if (out_written) |w| w.* = i;
+                return @backingInt(result);
+            }
+        }
+        if (out_written) |w| w.* = count;
+        return @backingInt(KittyResult.success);
+    }
+
+    export fn ghostty_surface_kitty_frame_attach(
+        surface: *Surface,
+        screen: KittyScreen,
+        image_id: u32,
+        frame: u32,
+        generation: u64,
+        pixels: ?[*]const u8,
+        len: usize,
+    ) c_int {
+        const p = pixels orelse return @backingInt(KittyResult.invalid_value);
+        return kittyFrameStore(surface, screen, image_id, frame, generation, .{ .copy = p[0..len] });
+    }
+
+    export fn ghostty_surface_kitty_frame_adopt(
+        surface: *Surface,
+        screen: KittyScreen,
+        image_id: u32,
+        frame: u32,
+        generation: u64,
+        base: ?*anyopaque,
+        map_len: usize,
+        offset: usize,
+        len: usize,
+    ) c_int {
+        return kittyFrameStore(surface, screen, image_id, frame, generation, .{ .mapping = .{
+            .base = base,
+            .map_len = map_len,
+            .offset = offset,
+            .len = len,
+        } });
+    }
+
+    fn kittyFrameStore(
+        surface: *Surface,
+        screen: KittyScreen,
+        image_id: u32,
+        frame: u32,
+        generation: u64,
+        source: kitty_c.FrameSource,
+    ) c_int {
+        if (frame == 0) return @backingInt(KittyResult.invalid_value);
+        if (generation == 0) return @backingInt(KittyResult.no_value);
+        const io = &surface.core_surface.io;
+        const data = kitty_c.prepareFrame(io.alloc, source) catch |err|
+            return @backingInt(kitty_c.prepareResult(err));
+        return @backingInt(kitty_c.finishFrame(io.alloc, data, io.kittyFrameStore(screen.key(), image_id, frame, generation, data)));
+    }
+
+    export fn ghostty_surface_kitty_pending_generation(surface: *Surface) u64 {
+        return surface.core_surface.io.kittyPendingGeneration();
     }
 
     export fn ghostty_surface_prepend_history(surface: *Surface, ptr: [*]const u8, len: usize) usize {

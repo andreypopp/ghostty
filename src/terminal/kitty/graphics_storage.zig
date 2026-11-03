@@ -31,6 +31,11 @@ const log = std.log.scoped(.kitty_gfx);
 /// plain operations.
 var generation_counter: GenerationCounter = .{};
 
+/// Process-global counter behind `ImageStorage.pending_generation`. It is
+/// separate from `generation_counter` so that marking a frame pending does
+/// not consume image generations.
+var pending_counter: GenerationCounter = .{};
+
 /// Returns the next generation stamp. Stamps are unique and strictly
 /// monotonically increasing process-wide, starting at 1 (0 is reserved
 /// to mean "never stamped").
@@ -121,6 +126,29 @@ pub const ImageStorage = struct {
     ///
     /// This field must only be written via markMutated.
     generation: u64 = 0,
+
+    /// The serial of the last graphics command that stores pixels. It is
+    /// a function of the command bytes only. Each transmission (a=t, a=T,
+    /// a=f; a chunked one at its final chunk), each a=c and each a=d d=f
+    /// moves it by one before the command looks at the storage, and
+    /// stamps the frames it touches (`Image.root_serial`,
+    /// `animation.Animation.Frame.serial`), whatever the outcome. These do
+    /// not move it: a=a, a=p, queries, animation ticks, resizes,
+    /// eviction, and restore input.
+    ///
+    /// It counts commands, not time and not storage state, so every
+    /// terminal that reads the same bytes computes the same stamp for the
+    /// same frame. A serial never repeats in one terminal: the terminal's
+    /// counter is the highest value of both screens (`Terminal.nextKittySerial`),
+    /// a reset keeps it, and a removed screen hands it on
+    /// (`absorbCounters`). The snapshot carries it.
+    command_serial: u64 = 0,
+
+    /// Moves to a fresh process-wide value each time a frame of this
+    /// storage becomes pending, or a pending frame's serial moves.
+    /// Zero means it never happened. `Terminal.kittyPendingGeneration`
+    /// reads the maximum of both screens.
+    pending_generation: u64 = 0,
 
     /// The storage generation at the end of the last animationTick
     /// that found nothing to play. Null if the last tick found
@@ -228,10 +256,18 @@ pub const ImageStorage = struct {
                 try storage.reserveAnimationBytes(io, alloc, s, self.id, len - old_len);
             } else storage.releaseAnimationBytes(old_len - len);
             const img = storage.images.getPtr(self.id).?;
+            // The incoming frames come from restore input and have no
+            // serial of their own: each frame number keeps the serial it
+            // had here.
+            if (incoming.animation) |into| if (img.animation) |from| {
+                const shared = @min(into.frames.items.len, from.frames.items.len);
+                for (into.frames.items[0..shared], from.frames.items[0..shared]) |*to, was| to.serial = was.serial;
+            };
             img.deinit(alloc);
             img.* = incoming;
             img.generation = previous.generation;
             img.transmission = previous.transmission;
+            img.root_serial = previous.root_serial;
             img.metadata.placement_count = previous.metadata.placement_count;
             storage.markMutated(io);
             return true;
@@ -275,8 +311,9 @@ pub const ImageStorage = struct {
         /// This follows the same rules as `complete`: it returns true and
         /// takes ownership of `data` only if the image is still the one
         /// this ticket was issued for, the frame is still pending, and
-        /// `data` has exactly the frame's length. The storage keeps
-        /// `data` mutable because later frame edits draw into it.
+        /// `data` has exactly the frame's length. A `serial` that is not
+        /// null must also be the frame's serial. The storage keeps `data`
+        /// mutable because later frame edits draw into it.
         ///
         /// If the completed frame is the one on screen, the image gets a
         /// new `generation` so that renderers pick up the new pixels.
@@ -285,24 +322,13 @@ pub const ImageStorage = struct {
             storage: *ImageStorage,
             io: std.Io,
             number: u32,
-            data: []u8,
+            data: Image.Data,
+            serial: ?u64,
         ) bool {
             if (number < 2) return false;
             const img = self.image(storage) orelse return false;
-            const anim = img.animation orelse return false;
-            const index = number - 2;
-            if (index >= anim.frames.items.len) return false;
-            const frame = &anim.frames.items[index];
-            if (!frame.isPending()) return false;
-            if (data.len != frame.pending_len) return false;
-
-            frame.* = .{ .data = data, .gap_ms = frame.gap_ms };
-            if (anim.current_index == number - 1) {
-                storage.markImageContentChanged(io, img);
-            } else {
-                storage.markMutated(io);
-            }
-            return true;
+            const current = img.frameSerial(number) orelse return false;
+            return storage.storeFrame(io, self.id, number, serial orelse current, data) == .attached;
         }
 
         /// The image this ticket was issued for, or null if it is no
@@ -360,6 +386,67 @@ pub const ImageStorage = struct {
         self.dirty +%= 1;
     }
 
+    /// Keep the counters of a screen that goes away, so that no serial
+    /// and no pending generation of it comes back.
+    pub fn absorbCounters(self: *ImageStorage, other: *const ImageStorage) void {
+        self.command_serial = @max(self.command_serial, other.command_serial);
+        self.pending_generation = @max(self.pending_generation, other.pending_generation);
+    }
+
+    /// Record that a frame became pending or that a pending frame got a
+    /// new serial.
+    pub fn markPending(self: *ImageStorage, io: std.Io) void {
+        self.pending_generation = pending_counter.next(io);
+    }
+
+    pub const FrameAttach = enum { attached, no_value, invalid_value };
+
+    pub const FrameError = error{ NoImage, NoFrame };
+
+    /// What the C API reports about frame `number` of an image. `NoFrame`
+    /// is frame 0 or one above the frame count.
+    pub fn frameInfo(self: *const ImageStorage, image_id: u32, number: u32) FrameError!Image.FrameInfo {
+        const img = self.images.getPtr(image_id) orelse return error.NoImage;
+        return img.frameInfo(number) orelse error.NoFrame;
+    }
+
+    /// Complete a pending frame with `data`, which has the frame's length.
+    /// The storage owns `data` when this answers `attached`; for any other
+    /// answer nothing changed and the caller still owns it.
+    /// `no_value`: no such image or frame, the frame is not pending, or
+    /// `generation` is not its serial any more. `invalid_value`: the length
+    /// is not the frame's. The frame keeps its serial.
+    pub fn storeFrame(
+        self: *ImageStorage,
+        io: std.Io,
+        image_id: u32,
+        number: u32,
+        generation: u64,
+        data: Image.Data,
+    ) FrameAttach {
+        const img = self.images.getPtr(image_id) orelse return .no_value;
+        const slot = img.frameSlot(number) orelse return .no_value;
+        if (!slot.isPending()) return .no_value;
+        if (img.frameSerial(number).? != generation) return .no_value;
+        if (data.len() != slot.len()) return .invalid_value;
+        slot.* = data;
+        self.frameArrived(io, img, number);
+        return .attached;
+    }
+
+    /// A pending frame got its pixels. The image gets a new generation
+    /// if the frame is on screen. When no frame of the animation is
+    /// pending any more, its frame timer restarts, so playback resumes at
+    /// the next tick instead of jumping by the time the frame was away.
+    fn frameArrived(self: *ImageStorage, io: std.Io, img: *Image, number: u32) void {
+        var shown: u32 = 1;
+        if (img.animation) |anim| {
+            shown = anim.current_index + 1;
+            if (!img.hasPendingFrames()) anim.frame_shown_at_ms = null;
+        }
+        if (shown == number) self.markImageContentChanged(io, img) else self.markMutated(io);
+    }
+
     /// Sets the limit in bytes for the total amount of image data that
     /// can be loaded. If this limit is lower, this will do an eviction
     /// if necessary. If the value is zero, then Kitty image protocol will
@@ -374,8 +461,14 @@ pub const ImageStorage = struct {
         // Special case disabling by quickly deleting all
         if (limit == 0) {
             const image_limits = self.image_limits;
+            const command_serial = self.command_serial;
+            const pending_generation = self.pending_generation;
             self.deinit(alloc, s);
-            self.* = .{ .image_limits = image_limits };
+            self.* = .{
+                .image_limits = image_limits,
+                .command_serial = command_serial,
+                .pending_generation = pending_generation,
+            };
             self.markMutated(io);
         }
 
@@ -606,15 +699,29 @@ pub const ImageStorage = struct {
         return recovery;
     }
 
-    pub fn holdImage(self: *ImageStorage, io: std.Io, alloc: Allocator, id: u32) bool {
+    /// Replace the image by a pending one: its pixels are unreadable here.
+    /// `held` describes the transmission; a known length (`held.data`)
+    /// replaces the old image's size and shape.
+    /// `serial` stamps the image; null (restore input) keeps its serial.
+    pub fn holdImage(self: *ImageStorage, io: std.Io, alloc: Allocator, id: u32, held: Image, serial: ?u64) bool {
         const image = self.images.getPtr(id) orelse return false;
-        const reserved = image.storageSize();
+        const old = image.storageSize();
+        const known = held.data.len() > 0;
+        const reserved = if (known) held.data.len() else old;
         image.deinit(alloc);
+        if (known) {
+            image.width = held.width;
+            image.height = held.height;
+            image.format = held.format;
+        }
         image.data = .{ .unread = reserved };
+        self.total_bytes = self.total_bytes - old + reserved;
         self.has_unread = true;
         self.markMutated(io);
         image.generation = self.generation;
         image.transmission = self.generation;
+        if (serial) |value| image.root_serial = value;
+        self.markPending(io);
         return true;
     }
 
@@ -1305,14 +1412,33 @@ pub const ImageStorage = struct {
     /// this is called before the first composition into an image.
     ///
     /// The pixels are unchanged visually but the stored representation
-    /// changed, so the image is stamped with a fresh generation.
+    /// changed, so the image is stamped with a fresh generation, and its
+    /// root takes the `serial` of the command: pixels fetched for the old
+    /// format are refused. Pixels that are pending arrive converted from now
+    /// on. Restore input (a null `serial`) leaves pending pixels and the
+    /// serial alone.
     pub fn convertImageToRgba(
         self: *ImageStorage,
         io: std.Io,
         alloc: Allocator,
         img: *Image,
+        serial: ?u64,
     ) Allocator.Error!void {
         if (img.format == .rgba) return;
+        if (img.data.isPending()) {
+            const stamp = serial orelse return;
+            img.root_serial = stamp;
+            self.markPending(io);
+            const old_len = img.data.len();
+            const new_len = @as(usize, img.width) * img.height * 4;
+            switch (img.data) {
+                .pending, .unread => |*len| len.* = new_len,
+                else => unreachable,
+            }
+            self.total_bytes = self.total_bytes - old_len + new_len;
+            img.format = .rgba;
+            return;
+        }
         const old = img.data.bytes() orelse return;
 
         const rgba = try pixel.rgbaFromFormat(alloc, img.format, old);
@@ -1321,6 +1447,7 @@ pub const ImageStorage = struct {
         img.data.deinit(alloc);
         img.data = .{ .complete = rgba };
         img.format = .rgba;
+        if (serial) |stamp| img.root_serial = stamp;
         self.markImageContentChanged(io, img);
     }
 
@@ -1545,6 +1672,20 @@ pub const ImageStorage = struct {
         t: *terminal.Terminal,
         cmd: command.Delete.Action,
     ) void {
+        self.deleteStamped(io, alloc, t, cmd, null);
+    }
+
+    /// `delete` for a command that has a serial (`command_serial`): an
+    /// a=d d=f stamps the frames it renumbers with it. A null serial, as
+    /// for restore input, keeps their serials.
+    pub fn deleteStamped(
+        self: *ImageStorage,
+        io: std.Io,
+        alloc: Allocator,
+        t: *terminal.Terminal,
+        cmd: command.Delete.Action,
+        serial: ?u64,
+    ) void {
         // Deletes only ever remove placements/images, so comparing counts
         // before and after tells us whether anything actually changed.
         // Only then do we mark a mutation, so a delete that matches nothing
@@ -1735,6 +1876,7 @@ pub const ImageStorage = struct {
                 alloc,
                 t.screens.active,
                 v,
+                serial,
             ),
         }
 
@@ -1837,6 +1979,7 @@ pub const ImageStorage = struct {
         alloc: Allocator,
         s: *terminal.Screen,
         v: command.Delete.Action.AnimationFrames,
+        serial: ?u64,
     ) void {
         if (v.image_id == 0 and v.image_number == 0) {
             log.warn("delete animation frames requires image id or number", .{});
@@ -1875,7 +2018,6 @@ pub const ImageStorage = struct {
         const count: u32 = anim.frameCount();
         var number: u32 = @min(v.frame, count);
         if (number == 0) number = 1;
-
         if (number == 1) {
             // Deleting the root frame promotes frame 2 to root. The
             // promoted frame's bytes stay reserved and only the old root
@@ -1884,16 +2026,23 @@ pub const ImageStorage = struct {
             self.releaseAnimationBytes(img.data.len());
             img.data.deinit(alloc);
             const promoted = anim.frames.orderedRemove(0);
-            img.data = if (promoted.isPending())
-                .{ .pending = promoted.pending_len }
-            else
-                .{ .complete = promoted.data };
+            img.data = promoted.data;
             anim.root_gap_ms = promoted.gap_ms;
+            img.root_serial = serial orelse promoted.serial;
         } else {
-            const removed = anim.frames.orderedRemove(number - 2);
+            var removed = anim.frames.orderedRemove(number - 2);
             self.releaseAnimationBytes(removed.storageSize());
-            alloc.free(removed.data);
+            removed.data.deinit(alloc);
         }
+
+        // Every frame behind the removed one has a new number, and the
+        // number is part of what the serial names.
+        var pending = number == 1 and img.data.isPending();
+        for (anim.frames.items[if (number == 1) 0 else number - 2..]) |*frame| {
+            if (serial) |value| frame.serial = value;
+            pending = pending or frame.isPending();
+        }
+        if (pending and serial != null) self.markPending(io);
 
         // Fix up the current frame.
         const removed_idx: u32 = if (number == 1) 0 else number - 2;
@@ -4046,7 +4195,7 @@ test "kittygfx restore pending snapshot retransmit releases frames" {
     const anim = try alloc.create(animation.Animation);
     anim.* = .{};
     storage.images.getPtr(1).?.animation = anim;
-    try anim.frames.append(alloc, .{ .data = try alloc.dupe(u8, "old!"), .gap_ms = 10 });
+    try anim.frames.append(alloc, .{ .data = .{ .complete = try alloc.dupe(u8, "old!") }, .gap_ms = 10 });
     try storage.reserveAnimationBytes(testing.io, alloc, t.screens.active, 1, 4);
     const cmd = try terminal.kitty.graphics.CommandParser.parseString(alloc, "a=t,i=1,f=32,s=1,v=1;/wAA/w==");
     defer cmd.deinit(alloc);
@@ -4071,7 +4220,7 @@ test "kittygfx restore pending root promotion remains removable" {
     const anim = try alloc.create(animation.Animation);
     anim.* = .{};
     storage.images.getPtr(1).?.animation = anim;
-    try anim.frames.append(alloc, .{ .data = &.{}, .gap_ms = 10, .pending_len = 4 });
+    try anim.frames.append(alloc, .{ .data = .{ .pending = 4 }, .gap_ms = 10 });
     try storage.reserveAnimationBytes(testing.io, alloc, t.screens.active, 1, 4);
     storage.delete(testing.io, alloc, &t, .{ .animation_frames = .{ .image_id = 1, .frame = 1 } });
     try testing.expect(storage.imageById(1).?.data.isPending());
@@ -4094,7 +4243,7 @@ test "storage: unread recovery follows image ownership" {
         .data = .{ .pending = 4 },
     });
     try testing.expect(token.complete(storage, testing.io, try alloc.dupe(u8, &.{ 255, 0, 0, 255 })));
-    try testing.expect(storage.holdImage(testing.io, alloc, 1));
+    try testing.expect(storage.holdImage(testing.io, alloc, 1, .{ .id = 1, .data = .{ .unread = 0 } }, null));
     try testing.expect(storage.has_unread);
     try testing.expectEqual(ImageStorage.Recovery.none, storage.takeUnreadImages());
     try testing.expect(!storage.has_unread);
@@ -4330,9 +4479,8 @@ test "storage: pending animation frames" {
     const anim = try alloc.create(animation.Animation);
     anim.* = .{ .state = .running, .current_index = 2 };
     for (0..2) |_| try anim.frames.append(alloc, .{
-        .data = &.{},
+        .data = .{ .pending = 4 },
         .gap_ms = 10,
-        .pending_len = 4,
     });
     try s.reserveAnimationBytes(io, alloc, t.screens.active, 1, anim.frameBytes());
     s.images.getPtr(1).?.animation = anim;
@@ -4353,16 +4501,16 @@ test "storage: pending animation frames" {
     // image itself, completed with `complete`) are all refused.
     const wrong = try alloc.dupe(u8, "short");
     defer alloc.free(wrong);
-    try testing.expect(!pending.completeFrame(&s, io, 2, wrong));
+    try testing.expect(!pending.completeFrame(&s, io, 2, .{ .complete = wrong }, null));
     const missing = try alloc.dupe(u8, "none");
     defer alloc.free(missing);
-    try testing.expect(!pending.completeFrame(&s, io, 4, missing));
-    try testing.expect(!pending.completeFrame(&s, io, 1, missing));
+    try testing.expect(!pending.completeFrame(&s, io, 4, .{ .complete = missing }, null));
+    try testing.expect(!pending.completeFrame(&s, io, 1, .{ .complete = missing }, null));
 
     // Completing the current frame (frame 3) changes the displayed
     // content.
     const generation = img.generation;
-    try testing.expect(pending.completeFrame(&s, io, 3, try alloc.dupe(u8, "two!")));
+    try testing.expect(pending.completeFrame(&s, io, 3, .{ .complete = try alloc.dupe(u8, "two!") }, null));
     img = s.imageById(1).?;
     try testing.expect(img.generation != generation);
     try testing.expectEqualStrings("two!", img.renderData().bytes().?);
@@ -5095,7 +5243,7 @@ test "storage: animation tick advances and schedules" {
     anim.* = .{ .state = .running };
     img.animation = anim;
     try anim.frames.append(alloc, .{
-        .data = try alloc.dupe(u8, &.{ 0, 0, 255, 255 }),
+        .data = .{ .complete = try alloc.dupe(u8, &.{ 0, 0, 255, 255 }) },
         .gap_ms = 40,
     });
 
@@ -5154,7 +5302,7 @@ test "storage: animation tick loading state parks on last frame" {
     anim.* = .{ .state = .loading };
     s.images.getPtr(1).?.animation = anim;
     try anim.frames.append(alloc, .{
-        .data = try alloc.dupe(u8, &.{ 0, 0, 255, 255 }),
+        .data = .{ .complete = try alloc.dupe(u8, &.{ 0, 0, 255, 255 }) },
         .gap_ms = 40,
     });
     try s.addPlacement(io, alloc, t.screens.active, 1, 0, .{
@@ -5172,7 +5320,7 @@ test "storage: animation tick loading state parks on last frame" {
     // A new frame arriving resumes playback. The real frame command
     // calls markMutated, so we do the same by hand.
     try anim.frames.append(alloc, .{
-        .data = try alloc.dupe(u8, &.{ 0, 255, 0, 255 }),
+        .data = .{ .complete = try alloc.dupe(u8, &.{ 0, 255, 0, 255 }) },
         .gap_ms = 25,
     });
     s.markMutated(io);
@@ -5209,7 +5357,7 @@ test "storage: animation tick exhausts loop budget" {
     };
     s.images.getPtr(1).?.animation = anim;
     try anim.frames.append(alloc, .{
-        .data = try alloc.dupe(u8, &.{ 0, 0, 255, 255 }),
+        .data = .{ .complete = try alloc.dupe(u8, &.{ 0, 0, 255, 255 }) },
         .gap_ms = 40,
     });
     try s.addPlacement(io, alloc, t.screens.active, 1, 0, .{
@@ -5252,7 +5400,7 @@ test "storage: animation tick ignores ineligible animations" {
     anim.* = .{};
     s.images.getPtr(1).?.animation = anim;
     try anim.frames.append(alloc, .{
-        .data = try alloc.dupe(u8, &.{ 0, 0, 255, 255 }),
+        .data = .{ .complete = try alloc.dupe(u8, &.{ 0, 0, 255, 255 }) },
         .gap_ms = 40,
     });
     try s.addPlacement(io, alloc, t.screens.active, 1, 0, .{
@@ -5296,7 +5444,7 @@ test "storage: animation tick skips the walk while idle" {
     anim.* = .{};
     s.images.getPtr(1).?.animation = anim;
     try anim.frames.append(alloc, .{
-        .data = try alloc.dupe(u8, &.{ 0, 0, 255, 255 }),
+        .data = .{ .complete = try alloc.dupe(u8, &.{ 0, 0, 255, 255 }) },
         .gap_ms = 40,
     });
     try s.addPlacement(io, alloc, t.screens.active, 1, 0, .{
@@ -5350,7 +5498,7 @@ test "storage: animation tick re-anchors a restarted clock" {
     };
     s.images.getPtr(1).?.animation = anim;
     try anim.frames.append(alloc, .{
-        .data = try alloc.dupe(u8, &.{ 0, 0, 255, 255 }),
+        .data = .{ .complete = try alloc.dupe(u8, &.{ 0, 0, 255, 255 }) },
         .gap_ms = 40,
     });
     try s.addPlacement(io, alloc, t.screens.active, 1, 0, .{

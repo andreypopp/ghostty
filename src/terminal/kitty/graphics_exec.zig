@@ -38,6 +38,11 @@ pub fn executeRestoring(
     cmd: *const Command,
     restoring: bool,
 ) ?Response {
+    // The serial is a function of the command bytes: it moves here, before
+    // the command looks at the storage, also when the storage is disabled,
+    // and restore input never moves it.
+    const serial: ?u64 = if (!restoring and movesSerial(cmd)) terminal.nextKittySerial() else null;
+
     // If storage is disabled then we disable the full protocol. This means
     // we don't even respond to queries so the terminal completely acts as
     // if this feature is not supported.
@@ -79,7 +84,7 @@ pub fn executeRestoring(
     const resp_: ?Response = switch (cmd.control) {
         .query => query(io, alloc, terminal, cmd),
         .display => display(io, alloc, terminal, cmd, restoring),
-        .delete => delete(io, alloc, terminal, cmd),
+        .delete => delete(io, alloc, terminal, cmd, serial),
 
         .transmit, .transmit_and_display, .transmit_animation_frame => resp: {
             const storage = &terminal.screens.active.kitty_images;
@@ -96,7 +101,10 @@ pub fn executeRestoring(
                 }
             }
 
-            if (!storage.image_limits.allows(cmd.transmission().?.medium)) break :resp .{
+            // A refused t=s is held like an unreadable one, so this terminal
+            // keeps the image and frame numbering of the terminal that read it.
+            const medium = cmd.transmission().?.medium;
+            if (!storage.image_limits.allows(medium) and medium != .shared_memory) break :resp .{
                 .id = identifiers.image_id,
                 .image_number = identifiers.image_number,
                 .placement_id = identifiers.placement_id,
@@ -125,6 +133,7 @@ pub fn executeRestoring(
                     terminal,
                     cmd,
                     restoring,
+                    serial,
                 ),
                 else => transmit(
                     io,
@@ -132,6 +141,7 @@ pub fn executeRestoring(
                     terminal,
                     cmd,
                     restoring,
+                    serial,
                 ),
             };
         },
@@ -148,6 +158,7 @@ pub fn executeRestoring(
             alloc,
             terminal,
             cmd,
+            serial,
         ),
     };
 
@@ -165,6 +176,17 @@ pub fn executeRestoring(
     }
 
     return null;
+}
+
+/// True for the commands that stamp frames: a transmission at its final
+/// chunk, a=c, and a=d d=f.
+fn movesSerial(cmd: *const Command) bool {
+    return switch (cmd.control) {
+        .transmit, .transmit_and_display, .transmit_animation_frame => !cmd.transmission().?.more_chunks,
+        .compose_animation => true,
+        .delete => |d| d.action == .animation_frames,
+        .query, .display, .control_animation => false,
+    };
 }
 
 /// Execute a "query" command.
@@ -223,6 +245,7 @@ fn transmit(
     terminal: *Terminal,
     cmd: *const Command,
     restoring: bool,
+    serial: ?u64,
 ) Response {
     const t = cmd.transmission().?;
     const storage = &terminal.screens.active.kitty_images;
@@ -240,6 +263,7 @@ fn transmit(
             terminal,
             cmd,
             false,
+            serial,
         );
 
         break :loading loading.response;
@@ -249,14 +273,17 @@ fn transmit(
         .placement_id = t.placement_id,
     };
 
-    const load = loadAndAddImage(io, alloc, terminal, cmd, restoring) catch |err| {
+    const load = loadAndAddImage(io, alloc, terminal, cmd, restoring, serial) catch |err| {
         encodeError(&result, err);
-        if (err == error.MediumUnavailable) {
+        if (unreadable(err, t.medium)) {
+            if (err == error.UnsupportedMedium) result.message = "ENOTSUP: unsupported medium";
             const id = if (t.image_id != 0) t.image_id else storage.nextImageId(if (t.image_number != 0) .explicit else .implicit);
-            if (!storage.holdImage(io, alloc, id)) {
-                var held: Image = .{ .id = id, .number = t.image_number, .width = t.width, .height = t.height, .format = t.format, .data = .{ .unread = 0 } };
-                held.metadata.implicit_id = t.image_id == 0 and t.image_number == 0;
+            var held: Image = .{ .id = id, .number = t.image_number, .width = t.width, .height = t.height, .format = t.format, .data = .{ .unread = command.Transmission.rawLen(t.width, t.height, t.format) orelse 0 } };
+            held.metadata.implicit_id = t.image_id == 0 and t.image_number == 0;
+            if (!storage.holdImage(io, alloc, id, held, serial)) {
+                held.root_serial = serial orelse 0;
                 _ = storage.addPendingImage(io, alloc, terminal.screens.active, held) catch return result;
+                storage.markPending(io);
             }
             if (cmd.display()) |placement| {
                 var d = placement;
@@ -511,6 +538,7 @@ fn transmitAnimationFrame(
     terminal: *Terminal,
     cmd: *const Command,
     restoring: bool,
+    serial: ?u64,
 ) Response {
     const storage = &terminal.screens.active.kitty_images;
 
@@ -524,6 +552,7 @@ fn transmitAnimationFrame(
             terminal,
             cmd,
             restoring,
+            serial,
         );
 
         // Not the first frame, so continue loading similar to transmit
@@ -549,6 +578,7 @@ fn transmitAnimationFrame(
             alloc,
             terminal,
             &loading_copy,
+            serial,
         );
     }
 
@@ -585,14 +615,16 @@ fn transmitAnimationFrame(
         storage.image_limits,
     ) catch |err| {
         encodeError(&result, err);
-        if (err == error.MediumUnavailable) {
-            _ = storage.holdImage(io, alloc, img.id);
+        if (unreadable(err, t.medium)) {
+            if (err == error.UnsupportedMedium) result.message = "ENOTSUP: unsupported medium";
+            storage.convertImageToRgba(io, alloc, img, serial) catch return result;
+            _ = applyFrame(io, alloc, terminal, img, f, null, serial, .{});
         }
         return result;
     };
     loading.frame = .{
         .cmd = f,
-        .image_generation = img.generation,
+        .image_transmission = img.transmission,
     };
     loading.response.id = img.id;
     if (restoring and f.edit_frame == 0 and t.format == .rgba and
@@ -611,9 +643,9 @@ fn transmitAnimationFrame(
         };
         img = storage.imagePtrByIdOrNumber(result.id, 0).?;
         anim.frames.append(alloc, .{
-            .data = &.{},
+            .data = .{ .pending = frame_len },
             .gap_ms = frameGap(f.gap_ms),
-            .pending_len = frame_len,
+            .serial = serial orelse 0,
         }) catch |err| {
             storage.releaseAnimationBytes(frame_len);
             loading.deinit(alloc);
@@ -645,6 +677,7 @@ fn transmitAnimationFrame(
         alloc,
         terminal,
         &loading,
+        serial,
     );
 }
 
@@ -659,6 +692,7 @@ fn completeAnimationFrame(
     alloc: Allocator,
     terminal: *Terminal,
     loading: *LoadingImage,
+    serial: ?u64,
 ) Response {
     const storage = &terminal.screens.active.kitty_images;
     var result = loading.response;
@@ -666,20 +700,16 @@ fn completeAnimationFrame(
 
     // Re-resolve the image: it may have been deleted, evicted, or
     // replaced while the frame data was being transmitted. The saved
-    // generation pins the exact image the load started against.
-    var img = storage.imagePtrByIdOrNumber(
+    // transmission pins the exact image the load started against.
+    const img = storage.imagePtrByIdOrNumber(
         loading.image.id,
         loading.image.number,
     ) orelse {
         result.message = "ENOENT: image not found";
         return result;
     };
-    if (if (loading.pending_token) |ticket| img.transmission != ticket.transmission else img.generation != loading.frame.?.image_generation) {
+    if (if (loading.pending_token) |ticket| img.transmission != ticket.transmission else img.transmission != loading.frame.?.image_transmission) {
         result.message = "ENOENT: image not found";
-        return result;
-    }
-    if (img.data.bytes() == null) {
-        result.message = "EINVAL: image data incomplete";
         return result;
     }
 
@@ -713,7 +743,7 @@ fn completeAnimationFrame(
         frame_img.data = .{ .complete = rgba };
         frame_img.format = .rgba;
     }
-    storage.convertImageToRgba(io, alloc, img) catch |err| {
+    storage.convertImageToRgba(io, alloc, img, serial) catch |err| {
         encodeError(&result, err);
         return result;
     };
@@ -724,13 +754,44 @@ fn completeAnimationFrame(
             return result;
         };
         const number = f.edit_frame;
-        if (ticket.completeFrame(storage, io, number, @constCast(frame_img.data.bytes().?))) {
+        if (ticket.completeFrame(storage, io, number, frame_img.data, null)) {
             frame_img.data = .{ .complete = "" };
             result.frame = number;
         } else result.message = "EINVAL: incomplete animation frame";
         return result;
     }
 
+    return applyFrame(io, alloc, terminal, img, f, .{
+        .bytes = frame_img.data.bytes().?,
+        .width = frame_img.width,
+        .height = frame_img.height,
+    }, serial, result);
+}
+
+/// The transmitted pixels of an animation frame command, as RGBA.
+const FrameSource = struct {
+    bytes: []const u8,
+    width: u32,
+    height: u32,
+};
+
+/// Create or edit an animation frame. `source` is null when the pixels of
+/// the command cannot be read here. The frame is then pending, as is a
+/// frame that needs pixels that are pending: this terminal cannot compose
+/// them, so the terminal that can has the only copy. In all cases the
+/// frame gets the `serial` of the command.
+fn applyFrame(
+    io: std.Io,
+    alloc: Allocator,
+    terminal: *Terminal,
+    img: *Image,
+    f: command.AnimationFrameLoading,
+    source: ?FrameSource,
+    serial: ?u64,
+    response: Response,
+) Response {
+    const storage = &terminal.screens.active.kitty_images;
+    var result = response;
     const anim = ensureAnimation(alloc, img) catch |err| {
         encodeError(&result, err);
         return result;
@@ -748,14 +809,13 @@ fn completeAnimationFrame(
     };
     result.frame = number;
 
-    const src = frame_img.data.bytes().?;
     if (number == count + 1) {
         // Creating a new frame. The gap defaults to 40ms when omitted
         // and a negative gap creates a gapless (never shown) frame.
         const gap = frameGap(f.gap_ms);
 
         // The base canvas frame must exist before we reserve space.
-        if (f.create_frame > 0 and img.frameData(f.create_frame) == null) {
+        if (f.create_frame > 0 and img.frameSlot(f.create_frame) == null) {
             result.message = "EINVAL: base frame not found";
             return result;
         }
@@ -775,95 +835,114 @@ fn completeAnimationFrame(
             result.message = "ENOSPC: animation frame storage full";
             return result;
         };
-        img = storage.imagePtrByIdOrNumber(image_id, 0).?;
+        const img_now = storage.imagePtrByIdOrNumber(image_id, 0).?;
 
-        const canvas = alloc.alloc(u8, frame_len) catch {
-            storage.releaseAnimationBytes(frame_len);
-            result.message = "ENOMEM: out of memory";
-            return result;
+        const data: Image.Data = data: {
+            const src = source orelse break :data .{ .pending = frame_len };
+            if (f.create_frame > 0 and img_now.frameSlot(f.create_frame).?.isPending()) break :data .{ .pending = frame_len };
+            const canvas = alloc.alloc(u8, frame_len) catch {
+                storage.releaseAnimationBytes(frame_len);
+                result.message = "ENOMEM: out of memory";
+                return result;
+            };
+            if (f.create_frame > 0) {
+                @memcpy(canvas, img_now.frameData(f.create_frame).?);
+            } else {
+                pixel.fillBackground(canvas, f.background);
+            }
+            pixel.composeRect(
+                canvas,
+                img_now.width,
+                img_now.height,
+                src.bytes,
+                src.width,
+                src.height,
+                f.x,
+                f.y,
+                f.composition_mode,
+            );
+            break :data .{ .complete = canvas };
         };
-        if (f.create_frame > 0) {
-            @memcpy(canvas, img.frameData(f.create_frame).?);
-        } else {
-            pixel.fillBackground(canvas, f.background);
-        }
-        pixel.composeRect(
-            canvas,
-            img.width,
-            img.height,
-            src,
-            frame_img.width,
-            frame_img.height,
-            f.x,
-            f.y,
-            f.composition_mode,
-        );
 
         anim.frames.append(alloc, .{
-            .data = canvas,
+            .data = data,
             .gap_ms = gap,
+            .serial = serial orelse 0,
         }) catch {
-            alloc.free(canvas);
+            var owned = data;
+            owned.deinit(alloc);
             storage.releaseAnimationBytes(frame_len);
             result.message = "ENOMEM: out of memory";
             return result;
         };
+        if (data.isPending()) storage.markPending(io);
 
         // A new frame never changes the displayed frame (playback
         // reaches it later), but the storage content changed.
         storage.markMutated(io);
-    } else {
-        // Editing an existing frame. A nonzero gap also updates the
-        // frame's gap; the 40ms default doesn't apply to edits.
-        //
-        // Unlike frame creation there is no byte reservation here:
-        // frames are always stored at full image size, so the edit
-        // composes into the existing buffer in place and storage
-        // usage cannot change. Kitty likewise exempts frame edits
-        // from its quota check.
-        //
-        // A frame whose pixels have not arrived yet, such as one
-        // restored from a snapshot, has no buffer to draw into. The
-        // edit is refused before anything about the frame changes.
-        //
+        return result;
+    }
+
+    // Editing an existing frame. A nonzero gap also updates the
+    // frame's gap; the 40ms default doesn't apply to edits.
+    //
+    // Unlike frame creation there is no byte reservation here:
+    // frames are always stored at full image size, so the edit
+    // composes into the existing buffer in place and storage
+    // usage cannot change. Kitty likewise exempts frame edits
+    // from its quota check.
+    //
+    // A frame whose pixels have not arrived yet, such as one
+    // restored from a snapshot, has no buffer to draw into. The
+    // edit is not composed, but the frame takes the serial of the
+    // command, so pixels fetched for its older serial are refused.
+    const slot = img.frameSlot(number).?;
+    const compose = source != null and !slot.isPending();
+    if (compose) slot.makeOwned(alloc) catch {
+        result.message = "ENOMEM: out of memory";
+        return result;
+    };
+    if (f.gap_ms != 0) anim.setGapAt(
+        number - 1,
+        if (f.gap_ms > 0) @intCast(f.gap_ms) else 0,
+    );
+    if (serial) |value| img.frameSerialPtr(number).?.* = value;
+
+    if (compose) {
         // The frame data is owned by this storage, so the const cast
         // is safe (same reasoning as the renderer's image uploads).
-        if (number == 1) img.data.makeOwned(alloc) catch {
-            result.message = "ENOMEM: out of memory";
-            return result;
-        };
-        const dst = @constCast(img.frameData(number) orelse {
-            result.message = "EINVAL: frame data incomplete";
-            return result;
-        });
-        if (f.gap_ms != 0) anim.setGapAt(
-            number - 1,
-            if (f.gap_ms > 0) @intCast(f.gap_ms) else 0,
-        );
-
         pixel.composeRect(
-            dst,
+            @constCast(slot.bytes().?),
             img.width,
             img.height,
-            src,
-            frame_img.width,
-            frame_img.height,
+            source.?.bytes,
+            source.?.width,
+            source.?.height,
             f.x,
             f.y,
             f.composition_mode,
         );
-
-        if (number - 1 == anim.current_index) {
-            // The displayed pixels changed; restart the frame's gap
-            // timer like Kitty's re-upload does.
-            anim.frame_shown_at_ms = null;
-            storage.markImageContentChanged(io, img);
-        } else {
-            storage.markMutated(io);
-        }
+    } else {
+        makePending(alloc, slot);
+        storage.markPending(io);
     }
 
+    if (number - 1 == anim.current_index) {
+        // The displayed pixels changed; restart the frame's gap
+        // timer like Kitty's re-upload does.
+        anim.frame_shown_at_ms = null;
+        storage.markImageContentChanged(io, img);
+    } else {
+        storage.markMutated(io);
+    }
     return result;
+}
+
+/// Replace the pixels of a frame by a pending frame of the same length.
+fn makePending(alloc: Allocator, slot: *Image.Data) void {
+    const len = slot.len();
+    slot.deinit(alloc);
+    slot.* = .{ .pending = len };
 }
 
 /// Control animation playback (a=a).
@@ -960,6 +1039,7 @@ fn composeAnimation(
     alloc: Allocator,
     terminal: *Terminal,
     cmd: *const Command,
+    serial: ?u64,
 ) Response {
     const c = cmd.control.compose_animation;
     const storage = &terminal.screens.active.kitty_images;
@@ -981,22 +1061,18 @@ fn composeAnimation(
         return result;
     };
     result.id = img.id;
-    if (img.data.bytes() == null) {
-        result.message = "EINVAL: image data incomplete";
-        return result;
-    }
 
     // Both frames must exist. Note that r is the source frame and c
     // the destination; the spec's reference table describes these
     // backwards (see AnimationFrameComposition).
-    if (img.frameData(c.source_frame) == null) {
+    const source = img.frameSlot(c.source_frame) orelse {
         result.message = "ENOENT: source frame not found";
         return result;
-    }
-    if (img.frameData(c.dest_frame) == null) {
+    };
+    const dest = img.frameSlot(c.dest_frame) orelse {
         result.message = "ENOENT: destination frame not found";
         return result;
-    }
+    };
 
     // Rectangle validation is done in u64 so untrusted 32-bit values
     // can't overflow. Out-of-bounds rectangles are errors here,
@@ -1032,32 +1108,42 @@ fn composeAnimation(
         io,
         alloc,
         img,
+        serial,
     ) catch |err| {
         encodeError(&result, err);
         return result;
     };
 
-    // The frame data is owned by this storage, so the const cast is
-    // safe. The rectangles were validated disjoint above, so in-place
-    // composition within one frame is well-defined.
-    if (c.dest_frame == 1) img.data.makeOwned(alloc) catch {
-        result.message = "ENOMEM: out of memory";
-        return result;
-    };
-    const src = img.frameData(c.source_frame).?;
-    const dst = @constCast(img.frameData(c.dest_frame).?);
-    pixel.composeCanvasRect(
-        dst,
-        src,
-        img.width,
-        @intCast(width),
-        @intCast(height),
-        c.left_edge,
-        c.top_edge,
-        c.x,
-        c.y,
-        c.composition_mode,
-    );
+    // A destination that is pending has no buffer to draw into, and a
+    // source that is pending has nothing to draw from: this terminal
+    // cannot compose. The destination takes the serial of the command and
+    // is pending, so the terminal that can compose has the only copy.
+    if (source.isPending() or dest.isPending()) {
+        if (serial) |value| img.frameSerialPtr(c.dest_frame).?.* = value;
+        if (!dest.isPending()) makePending(alloc, dest);
+        storage.markPending(io);
+    } else {
+        // The frame data is owned by this storage, so the const cast is
+        // safe. The rectangles were validated disjoint above, so in-place
+        // composition within one frame is well-defined.
+        dest.makeOwned(alloc) catch {
+            result.message = "ENOMEM: out of memory";
+            return result;
+        };
+        if (serial) |value| img.frameSerialPtr(c.dest_frame).?.* = value;
+        pixel.composeCanvasRect(
+            @constCast(dest.bytes().?),
+            source.bytes().?,
+            img.width,
+            @intCast(width),
+            @intCast(height),
+            c.left_edge,
+            c.top_edge,
+            c.x,
+            c.y,
+            c.composition_mode,
+        );
+    }
 
     // If the destination is the displayed frame then the on-screen
     // content changed.
@@ -1089,6 +1175,7 @@ fn delete(
     alloc: Allocator,
     terminal: *Terminal,
     cmd: *const Command,
+    serial: ?u64,
 ) Response {
     const storage = &terminal.screens.active.kitty_images;
 
@@ -1099,11 +1186,12 @@ fn delete(
     }
 
     // Then perform the actual deletion request, too.
-    storage.delete(
+    storage.deleteStamped(
         io,
         alloc,
         terminal,
         cmd.control.delete.action,
+        serial,
     );
 
     // Delete never responds on success
@@ -1116,6 +1204,7 @@ fn loadAndAddImage(
     terminal: *Terminal,
     cmd: *const Command,
     restoring: bool,
+    serial: ?u64,
 ) !struct {
     image: Image,
     more: bool = false,
@@ -1199,6 +1288,7 @@ fn loadAndAddImage(
     if (loading.pending_token) |token| {
         if (!try token.completeImage(storage, io, alloc, terminal.screens.active, img)) img.deinit(alloc);
     } else {
+        img.root_serial = serial orelse 0;
         try storage.addImage(io, alloc, terminal.screens.active, img);
     }
 
@@ -1210,6 +1300,14 @@ fn loadAndAddImage(
     loading.deinit(alloc);
 
     return .{ .image = img, .display = display_ };
+}
+
+/// A transmission this terminal cannot read although the terminal that
+/// owns the application could: the medium is unreadable here, or t=s is
+/// refused by the image limits.
+fn unreadable(err: anyerror, medium: command.Transmission.Medium) bool {
+    return err == error.MediumUnavailable or
+        (err == error.UnsupportedMedium and medium == .shared_memory);
 }
 
 const EncodeableError = Image.Error || Allocator.Error;
@@ -2954,7 +3052,7 @@ test "kittygfx animation: new frame with default gap responds with frame number"
     try testing.expectEqual(@as(u32, 2), anim.frameCount());
     try testing.expectEqual(@as(u32, 0), anim.root_gap_ms);
     try testing.expectEqual(@as(u32, 40), anim.frames.items[0].gap_ms);
-    try testing.expectEqualSlices(u8, &.{ 0, 0, 255, 255 }, anim.frames.items[0].data);
+    try testing.expectEqualSlices(u8, &.{ 0, 0, 255, 255 }, anim.frames.items[0].data.bytes().?);
 
     // The displayed frame is still the root: renderData is the base.
     try testing.expectEqualSlices(u8, &.{ 255, 0, 0, 255 }, img.renderData().bytes().?);
@@ -3028,7 +3126,7 @@ test "kittygfx animation: background fill and offset composition" {
     try testing.expectEqualSlices(
         u8,
         &.{ 255, 0, 0, 255, 255, 255, 255, 255 },
-        anim.frames.items[0].data,
+        anim.frames.items[0].data.bytes().?,
     );
 }
 
@@ -3063,7 +3161,7 @@ test "kittygfx animation: create from base frame with overwrite" {
     }
 
     const anim = storage.imagePtrByIdOrNumber(1, 0).?.animation.?;
-    try testing.expectEqualSlices(u8, &.{ 0, 0, 255, 128 }, anim.frames.items[0].data);
+    try testing.expectEqualSlices(u8, &.{ 0, 0, 255, 128 }, anim.frames.items[0].data.bytes().?);
 }
 
 test "kittygfx animation: alpha blend composes over base frame" {
@@ -3106,8 +3204,8 @@ test "kittygfx animation: alpha blend composes over base frame" {
     }
 
     const anim = storage.imagePtrByIdOrNumber(1, 0).?.animation.?;
-    try testing.expectEqualSlices(u8, &.{ 0, 0, 255, 255 }, anim.frames.items[0].data);
-    try testing.expectEqualSlices(u8, &.{ 255, 0, 0, 255 }, anim.frames.items[1].data);
+    try testing.expectEqualSlices(u8, &.{ 0, 0, 255, 255 }, anim.frames.items[0].data.bytes().?);
+    try testing.expectEqualSlices(u8, &.{ 255, 0, 0, 255 }, anim.frames.items[1].data.bytes().?);
 }
 
 test "kittygfx animation: edit root frame bumps generation" {
@@ -3276,7 +3374,7 @@ test "kittygfx animation: excess frame data is truncated" {
     try testing.expect(execute(io, alloc, &t, &cmd).?.ok());
 
     const anim = storage.imagePtrByIdOrNumber(1, 0).?.animation.?;
-    try testing.expectEqualSlices(u8, &.{ 0, 0, 255, 255 }, anim.frames.items[0].data);
+    try testing.expectEqualSlices(u8, &.{ 0, 0, 255, 255 }, anim.frames.items[0].data.bytes().?);
 }
 
 test "kittygfx animation: chunked frame transmission" {
@@ -3325,7 +3423,7 @@ test "kittygfx animation: chunked frame transmission" {
     try testing.expectEqualSlices(
         u8,
         &.{ 255, 0, 0, 255, 0, 0, 255, 255 },
-        anim.frames.items[0].data,
+        anim.frames.items[0].data.bytes().?,
     );
 }
 
@@ -3432,7 +3530,7 @@ test "kittygfx animation: non-direct transmission abandons chunked frame load" {
     try testing.expectEqualSlices(
         u8,
         &.{ 0, 255, 0, 255, 0, 255, 0, 255 },
-        anim.frames.items[0].data,
+        anim.frames.items[0].data.bytes().?,
     );
 }
 
@@ -3578,7 +3676,7 @@ test "kittygfx animation: compose frames" {
     try testing.expectEqualSlices(
         u8,
         &.{ 0, 0, 255, 255, 0, 0, 0, 0 },
-        anim.frames.items[0].data,
+        anim.frames.items[0].data.bytes().?,
     );
 }
 
@@ -3888,7 +3986,7 @@ test "kitty unread media holds only allowed transmissions without cursor movemen
         .{ .medium = 's', .shared_memory = true, .held = false, .width = 0 },
         .{ .medium = 's', .shared_memory = true, .held = false, .width = 10001 },
         .{ .medium = 's', .shared_memory = true, .held = true, .id = 0 },
-        .{ .medium = 's', .shared_memory = false, .held = false },
+        .{ .medium = 's', .shared_memory = false, .held = true },
         .{ .medium = 'f', .shared_memory = true, .held = false },
         .{ .medium = 't', .shared_memory = true, .held = false },
     }) |case| {
@@ -3922,11 +4020,23 @@ test "kitty unread media holds only allowed transmissions without cursor movemen
             const direct = try command.Parser.parseString(alloc, "a=T,i=7,f=32,s=1,v=1,c=1,r=1,C=1;AAD//w==");
             defer direct.deinit(alloc);
             _ = execute(io, alloc, &t, &direct);
-            const generation = storage.imageById(7).?.generation;
-            _ = execute(io, alloc, &t, &cmd);
-            try testing.expectEqual(generation, storage.imageById(7).?.generation);
-            try testing.expect(!storage.imageById(7).?.data.isPending());
+            const before = storage.imageById(7).?;
+            const generation = before.generation;
+            const serial = before.root_serial;
+            const response = execute(io, alloc, &t, &cmd).?;
+            try testing.expectEqualStrings("ENOTSUP: unsupported medium", response.message);
+            const after = storage.imageById(7).?;
             try testing.expectEqual(@as(u32, 1), storage.placements.count());
+            if (case.medium == 's') {
+                // A refused t=s is held like an unreadable one.
+                try testing.expect(after.generation != generation);
+                try testing.expect(after.root_serial > serial);
+                try testing.expect(after.data.isPending());
+                try testing.expectEqual(ImageStorage.Recovery.fetch, storage.takeUnreadImages());
+            } else {
+                try testing.expectEqual(generation, after.generation);
+                try testing.expect(!after.data.isPending());
+            }
         }
         const restored = try command.Parser.parseString(alloc, "a=p,i=8,c=1,r=1,C=1");
         defer restored.deinit(alloc);
@@ -4204,7 +4314,7 @@ test "kittygfx restore animation fill is atomic across pages and reset" {
     try testing.expectEqual(@as(u32, 3), restored_animation.frameCount());
     try testing.expectEqual(@as(u32, 2), restored_animation.current_index);
     try testing.expectEqual(.stopped, restored_animation.state);
-    try testing.expectEqualSlices(u8, &.{ 0, 0, 255, 255 }, restored_animation.frames.items[1].data);
+    try testing.expectEqualSlices(u8, &.{ 0, 0, 255, 255 }, restored_animation.frames.items[1].data.bytes().?);
     t.resetImageFill();
     try t.fillImagesForTest(alloc, root ++ green ++ partial ++ end ++ parked, false);
     try testing.expectEqual(@as(u32, 3), storage.imageById(7).?.animation.?.frameCount());
@@ -4273,4 +4383,172 @@ test "kittygfx restore fill pages and reset" {
     try t.fillImagesForTest(alloc, "\x1b_Gm=0;\x1b\\", false);
     try testing.expect(t.screens.active.kitty_images.imageById(8).?.data.isPending());
     try testing.expectEqual(@as(u32, 2), t.screens.active.kitty_images.placements.count());
+}
+
+test "kittygfx a t=s that the limits refuse makes a pending frame and moves the serial" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var t = try Terminal.init(io, alloc, .{
+        .rows = 5,
+        .cols = 5,
+        .kitty_image_loading_limits = .direct,
+    });
+    defer t.deinit(alloc);
+    const storage = &t.screens.active.kitty_images;
+
+    for ([_][]const u8{
+        "a=t,f=24,s=1,v=1,i=1;/wAA",
+        "a=f,i=1,f=24,s=1,v=1;AAD/",
+    }) |input| {
+        const cmd = try command.Parser.parseString(alloc, input);
+        defer cmd.deinit(alloc);
+        try testing.expect(execute(io, alloc, &t, &cmd).?.ok());
+    }
+    try testing.expectEqual(@as(u64, 2), storage.command_serial);
+    try testing.expectEqual(@as(u64, 0), storage.pending_generation);
+
+    // A refused frame creation: the frame exists, pending, with the serial.
+    {
+        const cmd = try command.Parser.parseString(alloc, "a=f,i=1,t=s,f=24,s=1,v=1,z=30;L2tpZG8tbWlzc2luZw==");
+        defer cmd.deinit(alloc);
+        const response = execute(io, alloc, &t, &cmd).?;
+        try testing.expectEqualStrings("ENOTSUP: unsupported medium", response.message);
+    }
+    const held = storage.imageById(1).?;
+    try testing.expectEqual(@as(u32, 3), held.animation.?.frameCount());
+    try testing.expect(held.frameSlot(3).?.isPending());
+    try testing.expectEqual(@as(usize, 4), held.frameSlot(3).?.len());
+    try testing.expectEqual(@as(u64, 3), storage.command_serial);
+    try testing.expectEqual(@as(u64, 3), held.frameSerial(3).?);
+    try testing.expectEqual(@as(u32, 30), held.animation.?.gapAt(2));
+    const pending = storage.pending_generation;
+    try testing.expect(pending != 0);
+
+    // A refused edit of a loaded frame: it becomes pending, with a new serial.
+    {
+        const cmd = try command.Parser.parseString(alloc, "a=f,i=1,r=2,t=s,f=24,s=1,v=1;L2tpZG8tbWlzc2luZw==");
+        defer cmd.deinit(alloc);
+        _ = execute(io, alloc, &t, &cmd).?;
+    }
+    try testing.expect(storage.imageById(1).?.frameSlot(2).?.isPending());
+    try testing.expectEqual(@as(u64, 4), storage.imageById(1).?.frameSerial(2).?);
+    try testing.expect(storage.pending_generation != pending);
+    const pixels = [_]u8{ 0, 0, 0 };
+    const stale = storage.storeFrame(io, 1, 2, 3, .{ .complete = @constCast(&pixels) });
+    try testing.expectEqual(ImageStorage.FrameAttach.no_value, stale);
+}
+
+test "kittygfx restore input never moves the serial" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var t = try Terminal.init(io, alloc, .{ .rows = 5, .cols = 5 });
+    defer t.deinit(alloc);
+    const storage = &t.screens.active.kitty_images;
+    for ([_][]const u8{
+        "a=t,f=32,s=1,v=1,i=1;/wAA/w==",
+        "a=f,i=1,f=32,s=1,v=1;AAD//w==",
+    }) |input| {
+        const cmd = try command.Parser.parseString(alloc, input);
+        defer cmd.deinit(alloc);
+        try testing.expect(execute(io, alloc, &t, &cmd).?.ok());
+    }
+    try testing.expectEqual(@as(u64, 2), storage.command_serial);
+    const root = storage.imageById(1).?.root_serial;
+    const frame = storage.imageById(1).?.frameSerial(2).?;
+
+    for ([_][]const u8{
+        "a=t,f=32,s=1,v=1,i=2;/wAA/w==",
+        "a=f,i=1,f=32,s=1,v=1;AAD//w==",
+        "a=f,i=1,r=2,f=32,s=1,v=1;AAD//w==",
+        "a=c,i=1,r=1,c=2,w=1,h=1",
+    }) |input| {
+        const cmd = try command.Parser.parseString(alloc, input);
+        defer cmd.deinit(alloc);
+        _ = executeRestoring(io, alloc, &t, &cmd, true);
+    }
+    try testing.expectEqual(@as(u64, 2), storage.command_serial);
+    try testing.expectEqual(root, storage.imageById(1).?.root_serial);
+    // The restore edit of frame 2 and the composition onto it keep its serial.
+    try testing.expectEqual(frame, storage.imageById(1).?.frameSerial(2).?);
+    {
+        const del = try command.Parser.parseString(alloc, "a=d,d=f,i=1,r=2");
+        defer del.deinit(alloc);
+        _ = executeRestoring(io, alloc, &t, &del, true);
+    }
+    // A restore delete renumbers frame 3 to 2 and keeps its serial.
+    const renumbered = storage.imageById(1).?.frameSerial(2).?;
+    try testing.expect(renumbered != frame);
+    try testing.expectEqual(@as(u64, 2), storage.command_serial);
+
+    // The same live command afterwards takes the next serial.
+    const cmd = try command.Parser.parseString(alloc, "a=f,i=1,r=2,f=32,s=1,v=1;AAD//w==");
+    defer cmd.deinit(alloc);
+    try testing.expect(execute(io, alloc, &t, &cmd).?.ok());
+    try testing.expectEqual(@as(u64, 3), storage.command_serial);
+    try testing.expectEqual(@as(u64, 3), storage.imageById(1).?.frameSerial(2).?);
+}
+
+test "kittygfx a chunked command moves the serial once, at its final chunk" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var t = try Terminal.init(io, alloc, .{ .rows = 5, .cols = 5 });
+    defer t.deinit(alloc);
+    const storage = &t.screens.active.kitty_images;
+    for ([_]struct { input: []const u8, serial: u64 }{
+        .{ .input = "a=t,f=32,s=1,v=1,i=1,m=1;/wAA", .serial = 0 },
+        .{ .input = "m=0;/w==", .serial = 1 },
+        .{ .input = "a=q,f=32,s=1,v=1,i=9;/wAA/w==", .serial = 1 },
+        .{ .input = "a=a,i=1,s=3", .serial = 1 },
+        .{ .input = "a=t,f=32,s=1,v=1,i=1;ZZZZ", .serial = 2 },
+        .{ .input = "a=d,d=i,i=1", .serial = 2 },
+        .{ .input = "a=d,d=f,i=1", .serial = 3 },
+    }) |step| {
+        const cmd = try command.Parser.parseString(alloc, step.input);
+        defer cmd.deinit(alloc);
+        _ = execute(io, alloc, &t, &cmd);
+        try testing.expectEqual(step.serial, storage.command_serial);
+    }
+}
+
+test "kittygfx a terminal with storage disabled still counts the commands" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var pane = try Terminal.init(io, alloc, .{ .rows = 5, .cols = 5 });
+    defer pane.deinit(alloc);
+    var mirror = try Terminal.init(io, alloc, .{ .rows = 5, .cols = 5 });
+    defer mirror.deinit(alloc);
+    const limit = mirror.screens.active.kitty_images.total_limit;
+    mirror.setKittyGraphicsSizeLimit(alloc, 0);
+
+    for ([_][]const u8{
+        "a=t,f=32,s=1,v=1,i=1;/wAA/w==",
+        "a=f,i=1,f=32,s=1,v=1;AAD//w==",
+    }) |input| {
+        for ([_]*Terminal{ &pane, &mirror }) |t| {
+            const cmd = try command.Parser.parseString(alloc, input);
+            defer cmd.deinit(alloc);
+            _ = execute(io, alloc, t, &cmd);
+        }
+    }
+    try testing.expectEqual(@as(u32, 0), mirror.screens.active.kitty_images.images.count());
+    mirror.setKittyGraphicsSizeLimit(alloc, limit);
+
+    for ([_]*Terminal{ &pane, &mirror }) |t| {
+        const cmd = try command.Parser.parseString(alloc, "a=t,f=32,s=1,v=1,i=2;/wAA/w==");
+        defer cmd.deinit(alloc);
+        _ = execute(io, alloc, t, &cmd);
+    }
+    try testing.expectEqual(@as(u64, 3), pane.screens.active.kitty_images.imageById(2).?.root_serial);
+    try testing.expectEqual(
+        pane.screens.active.kitty_images.imageById(2).?.root_serial,
+        mirror.screens.active.kitty_images.imageById(2).?.root_serial,
+    );
 }
