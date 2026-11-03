@@ -1306,6 +1306,8 @@ GHOSTTY_API int ghostty_surface_kitty_frame_get_multi(ghostty_surface_t, ghostty
 GHOSTTY_API int ghostty_surface_kitty_frame_attach(ghostty_surface_t, ghostty_kitty_screen_e, uint32_t image_id, uint32_t frame, uint64_t generation, const uint8_t*, size_t len);
 GHOSTTY_API int ghostty_surface_kitty_frame_adopt(ghostty_surface_t, ghostty_kitty_screen_e, uint32_t image_id, uint32_t frame, uint64_t generation, void* base, size_t map_len, size_t offset, size_t len);
 GHOSTTY_API uint64_t ghostty_surface_kitty_pending_generation(ghostty_surface_t);
+typedef struct { ghostty_kitty_screen_e screen; uint32_t image_id; uint32_t frame; uint64_t generation; } ghostty_kitty_pending_frame_s;
+GHOSTTY_API void ghostty_surface_kitty_pending_frames(ghostty_surface_t, ghostty_kitty_pending_frame_s* out, size_t cap, size_t* count);
 typedef bool (*ghostty_snapshot_read_fn)(void*, uint8_t*, size_t, size_t*);
 typedef enum {
   GHOSTTY_SNAPSHOT_RESTORE_OK = 0,

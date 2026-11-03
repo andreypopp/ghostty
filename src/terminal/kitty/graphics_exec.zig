@@ -4021,6 +4021,50 @@ test "kittygfx a t=s that the limits refuse makes a pending frame and moves the 
     try testing.expectEqual(ImageStorage.FrameAttach.no_value, stale);
 }
 
+test "kittygfx pending frames lists the held frames with a stamp and not the ones without" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var t = try Terminal.init(io, alloc, .{
+        .rows = 5,
+        .cols = 5,
+        .kitty_image_loading_limits = .direct,
+    });
+    defer t.deinit(alloc);
+    const storage = &t.screens.active.kitty_images;
+
+    for ([_][]const u8{
+        "a=T,i=1,t=s,f=24,s=1,v=1,c=1,r=1;L2tpZG8tbWlzc2luZw==",
+        "a=f,i=1,t=s,f=24,s=1,v=1,z=30;L2tpZG8tbWlzc2luZw==",
+    }) |input| {
+        const cmd = try command.Parser.parseString(alloc, input);
+        defer cmd.deinit(alloc);
+        _ = execute(io, alloc, &t, &cmd);
+    }
+    _ = try storage.addPendingImage(io, alloc, t.screens.active, .{
+        .id = 9,
+        .width = 1,
+        .height = 1,
+        .format = .rgba,
+        .data = .{ .pending = 4 },
+    });
+    try testing.expectEqual(@as(u64, 0), storage.imageById(9).?.frameSerial(1).?);
+
+    const img = storage.imageById(1).?;
+    var seen = [_]bool{ false, false };
+    var it = storage.pendingFrames();
+    var count: usize = 0;
+    while (it.next()) |f| : (count += 1) {
+        try testing.expectEqual(@as(u32, 1), f.image_id);
+        try testing.expect(f.generation != 0);
+        try testing.expectEqual(img.frameSerial(f.frame).?, f.generation);
+        seen[f.frame - 1] = true;
+    }
+    try testing.expectEqual(@as(usize, 2), count);
+    try testing.expect(seen[0] and seen[1]);
+}
+
 test "kittygfx a live transmission replaces a held image, its placements and its serial" {
     const testing = std.testing;
     const alloc = testing.allocator;

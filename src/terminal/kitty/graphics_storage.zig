@@ -375,6 +375,42 @@ pub const ImageStorage = struct {
         return img.frameInfo(number) orelse error.NoFrame;
     }
 
+    pub const PendingFrame = struct { image_id: u32, frame: u32, generation: u64 };
+
+    /// The pending frames that a fetch can complete: their serial is not zero.
+    pub const PendingFrames = struct {
+        images: ImageMap.Iterator,
+        image_id: u32 = 0,
+        image: ?*const Image = null,
+        number: u32 = 0,
+
+        pub fn next(self: *PendingFrames) ?PendingFrame {
+            while (true) {
+                const img = self.image orelse {
+                    const entry = self.images.next() orelse return null;
+                    self.image = entry.value_ptr;
+                    self.image_id = entry.key_ptr.*;
+                    self.number = 0;
+                    continue;
+                };
+                const frames: u32 = if (img.animation) |anim| anim.frameCount() else 1;
+                self.number += 1;
+                if (self.number > frames) {
+                    self.image = null;
+                    continue;
+                }
+                if (!img.frameSlot(self.number).?.isPending()) continue;
+                const serial = img.frameSerial(self.number).?;
+                if (serial == 0) continue;
+                return .{ .image_id = self.image_id, .frame = self.number, .generation = serial };
+            }
+        }
+    };
+
+    pub fn pendingFrames(self: *const ImageStorage) PendingFrames {
+        return .{ .images = self.images.iterator() };
+    }
+
     /// Complete a pending frame with `data`, which has the frame's length.
     /// The storage owns `data` when this answers `attached`; for any other
     /// answer nothing changed and the caller still owns it.

@@ -2395,6 +2395,13 @@ pub const CAPI = struct {
         primary = 0,
         alternate = 1,
 
+        pub fn of(screen: terminal.ScreenSet.Key) KittyScreen {
+            return switch (screen) {
+                .primary => .primary,
+                .alternate => .alternate,
+            };
+        }
+
         fn key(self: KittyScreen) terminal.ScreenSet.Key {
             return switch (self) {
                 .primary => .primary,
@@ -2481,6 +2488,31 @@ pub const CAPI = struct {
 
     export fn ghostty_surface_kitty_pending_generation(surface: *Surface) u64 {
         return surface.core_surface.io.kittyPendingGeneration();
+    }
+
+    /// C: ghostty_kitty_pending_frame_s.
+    const KittyPendingFrame = extern struct {
+        screen: KittyScreen,
+        image_id: u32,
+        frame: u32,
+        generation: u64,
+
+        pub fn of(key: terminal.ScreenSet.Key, frame: terminal.kitty.graphics.ImageStorage.PendingFrame) KittyPendingFrame {
+            return .{ .screen = .of(key), .image_id = frame.image_id, .frame = frame.frame, .generation = frame.generation };
+        }
+    };
+
+    /// Lists the frames that a fetch can complete: pending, with a nonzero
+    /// stamp, on both screens, the active screen first. Writes at most
+    /// `cap` entries and stores the number that exist in `count`.
+    export fn ghostty_surface_kitty_pending_frames(
+        surface: *Surface,
+        out: ?[*]KittyPendingFrame,
+        cap: usize,
+        count: *usize,
+    ) void {
+        const list: []KittyPendingFrame = if (out) |p| p[0..cap] else &.{};
+        count.* = surface.core_surface.io.kittyPendingFrames(KittyPendingFrame, list);
     }
 
     fn adoptGrid(context: *anyopaque, columns: u16, rows: u16) void {
