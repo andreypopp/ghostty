@@ -13,6 +13,7 @@ const posix = std.posix;
 const termio = @import("../termio.zig");
 const StreamHandler = @import("stream_handler.zig").StreamHandler;
 const terminalpkg = @import("../terminal/main.zig");
+const ImageStorage = terminalpkg.kitty.graphics.ImageStorage;
 const global = @import("../global.zig");
 const xev = global.xev;
 const renderer = @import("../renderer.zig");
@@ -716,6 +717,35 @@ pub fn clearScreen(self: *Termio, td: *ThreadData, history: bool) !void {
         break :at_prompt self.terminal.clearScreen(history);
     };
     if (at_prompt) try self.queueWrite(td, &[_]u8{0x0C}, false);
+}
+
+/// What the C API reports about a Kitty graphics frame, read under the
+/// renderer lock. The pixels pointer is not valid after the call.
+pub fn kittyFrameInfo(self: *Termio, screen: terminalpkg.ScreenSet.Key, image_id: u32, frame: u32) ImageStorage.FrameError!terminalpkg.kitty.graphics.Image.FrameInfo {
+    self.renderer_state.mutex.lockUncancelable(global.io());
+    defer self.renderer_state.mutex.unlock(global.io());
+    const s = self.terminal.screens.get(screen) orelse return error.NoImage;
+    return s.kitty_images.frameInfo(image_id, frame);
+}
+
+/// Complete a pending Kitty graphics frame. See `ImageStorage.storeFrame`.
+/// The caller made `data` with `self.alloc` before the call and frees it
+/// after the call when the answer is not `attached`.
+pub fn kittyFrameStore(self: *Termio, screen: terminalpkg.ScreenSet.Key, image_id: u32, frame: u32, generation: u64, data: terminalpkg.kitty.graphics.Image.Data) ImageStorage.FrameAttach {
+    const answer = answer: {
+        self.renderer_state.mutex.lockUncancelable(global.io());
+        defer self.renderer_state.mutex.unlock(global.io());
+        const s = self.terminal.screens.get(screen) orelse break :answer .no_value;
+        break :answer s.kitty_images.storeFrame(global.io(), image_id, frame, generation, data);
+    };
+    if (answer == .attached) self.renderer_wakeup.notify() catch {};
+    return answer;
+}
+
+pub fn kittyPendingGeneration(self: *Termio) u64 {
+    self.renderer_state.mutex.lockUncancelable(global.io());
+    defer self.renderer_state.mutex.unlock(global.io());
+    return self.terminal.kittyPendingGeneration();
 }
 
 pub const RestoreResult = enum(c_int) {

@@ -1966,6 +1966,7 @@ pub const TerminalData = enum(c_int) {
     clipboard_write_max_bytes = 40,
     mouse_shape = 41,
     memory_usage = 42,
+    kitty_pending_generation = 43,
 
     /// Output type expected for querying the data of the given kind.
     pub fn OutType(comptime self: TerminalData) type {
@@ -2011,6 +2012,7 @@ pub const TerminalData = enum(c_int) {
             .selection => selection_c.CSelection,
             .mode => ModeConfig,
             .memory_usage => TerminalMemoryUsage,
+            .kitty_pending_generation => u64,
         };
     }
 };
@@ -2128,6 +2130,7 @@ fn getTyped(
             if (comptime !build_options.kitty_graphics) return .no_value;
             out.* = &t.screens.active.kitty_images;
         },
+        .kitty_pending_generation => out.* = t.kittyPendingGeneration(),
         .selection => out.* = selection_c.CSelection.fromZig(
             t.screens.active.selection orelse return .no_value,
         ),

@@ -363,22 +363,6 @@ typedef struct {
 } GhosttyTerminalScrollViewport;
 
 /**
- * Terminal screen identifier.
- *
- * Identifies which screen buffer is active in the terminal.
- *
- * @ingroup terminal
- */
-typedef enum GHOSTTY_ENUM_TYPED {
-  /** The primary (normal) screen. */
-  GHOSTTY_TERMINAL_SCREEN_PRIMARY = 0,
-
-  /** The alternate screen. */
-  GHOSTTY_TERMINAL_SCREEN_ALTERNATE = 1,
-  GHOSTTY_TERMINAL_SCREEN_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
-} GhosttyTerminalScreen;
-
-/**
  * Visual style of the terminal cursor.
  *
  * @ingroup terminal
@@ -3210,6 +3194,17 @@ typedef enum GHOSTTY_ENUM_TYPED {
    * Output type: GhosttyTerminalMemoryUsage *
    */
   GHOSTTY_TERMINAL_DATA_MEMORY_USAGE = 42,
+
+
+  /**
+   * A value that grows each time a Kitty graphics frame of either screen
+   * becomes pending, or the GENERATION of a pending frame moves. Read it
+   * after a batch of input; only then walk the images with
+   * ghostty_kitty_graphics_frame_get().
+   *
+   * Output type: uint64_t *
+   */
+  GHOSTTY_TERMINAL_DATA_KITTY_PENDING_GENERATION = 43,
   GHOSTTY_TERMINAL_DATA_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
 } GhosttyTerminalData;
 

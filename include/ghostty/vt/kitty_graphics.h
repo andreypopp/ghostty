@@ -455,6 +455,22 @@ typedef enum GHOSTTY_ENUM_TYPED {
 } GhosttyKittyImageCompression;
 
 /**
+ * Playback state of an animated image.
+ *
+ * @ingroup kitty_graphics
+ */
+typedef enum GHOSTTY_ENUM_TYPED {
+  /** No a=f or a=a yet. */
+  GHOSTTY_KITTY_ANIMATION_STATE_NONE = 0,
+  GHOSTTY_KITTY_ANIMATION_STATE_STOPPED = 1,
+  /** a=a s=2: parks on the last frame and waits for more frames. */
+  GHOSTTY_KITTY_ANIMATION_STATE_LOADING = 2,
+  /** a=a s=3. */
+  GHOSTTY_KITTY_ANIMATION_STATE_RUNNING = 3,
+  GHOSTTY_KITTY_ANIMATION_STATE_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
+} GhosttyKittyAnimationState;
+
+/**
  * Queryable data kinds for ghostty_kitty_graphics_image_get().
  *
  * @ingroup kitty_graphics
@@ -563,6 +579,51 @@ typedef enum GHOSTTY_ENUM_TYPED {
    * Output type: uint64_t *
    */
   GHOSTTY_KITTY_IMAGE_DATA_GENERATION = 9,
+
+  /**
+   * Number of frames, counting the image itself as frame 1. 1 for an
+   * image without animation.
+   *
+   * Output type: uint32_t *
+   */
+  GHOSTTY_KITTY_IMAGE_DATA_FRAME_COUNT = 10,
+
+  /**
+   * Playback state that the program set with a=a. NONE until the image
+   * has animation state (a=f or a=a).
+   *
+   * Output type: GhosttyKittyAnimationState *
+   */
+  GHOSTTY_KITTY_IMAGE_DATA_ANIMATION_STATE = 11,
+
+  /**
+   * The frame that is shown, numbered from 1 as a=a c= does.
+   *
+   * Output type: uint32_t *
+   */
+  GHOSTTY_KITTY_IMAGE_DATA_CURRENT_FRAME = 12,
+
+  /**
+   * Loops to play. 0 means forever.
+   *
+   * Output type: uint32_t *
+   */
+  GHOSTTY_KITTY_IMAGE_DATA_MAX_LOOPS = 13,
+
+  /**
+   * Loops that finished since playback started.
+   *
+   * Output type: uint32_t *
+   */
+  GHOSTTY_KITTY_IMAGE_DATA_CURRENT_LOOP = 14,
+
+  /**
+   * True if a frame of the image, or the image itself, is pending. An
+   * animation with a pending frame does not play.
+   *
+   * Output type: bool *
+   */
+  GHOSTTY_KITTY_IMAGE_DATA_PENDING_FRAMES = 15,
 
   GHOSTTY_KITTY_IMAGE_DATA_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
 } GhosttyKittyGraphicsImageData;
@@ -1048,6 +1109,169 @@ GHOSTTY_API GhosttyResult ghostty_kitty_graphics_placement_render_info(
     GhosttyKittyGraphicsImage image,
     GhosttyTerminal terminal,
     GhosttyKittyGraphicsPlacementRenderInfo* out_info);
+
+/**
+ * Get an image handle of either screen, not only the active one. The
+ * handle works with ghostty_kitty_graphics_image_get().
+ *
+ * @return An opaque image handle, or NULL if the terminal or image is
+ *         not found
+ *
+ * @ingroup kitty_graphics
+ */
+GHOSTTY_API GhosttyKittyGraphicsImage ghostty_kitty_graphics_screen_image(
+    GhosttyTerminal terminal,
+    GhosttyTerminalScreen screen,
+    uint32_t image_id);
+
+/**
+ * Queryable data kinds for ghostty_kitty_graphics_frame_get().
+ *
+ * @ingroup kitty_graphics
+ */
+typedef enum GHOSTTY_ENUM_TYPED {
+  GHOSTTY_KITTY_FRAME_DATA_INVALID = 0,
+
+  /**
+   * Pixel format. The image's format for frame 1, RGBA for the others.
+   *
+   * Output type: GhosttyKittyImageFormat *
+   */
+  GHOSTTY_KITTY_FRAME_DATA_FORMAT = 1,
+
+  /**
+   * Always GHOSTTY_KITTY_IMAGE_COMPRESSION_NONE.
+   *
+   * Output type: GhosttyKittyImageCompression *
+   */
+  GHOSTTY_KITTY_FRAME_DATA_COMPRESSION = 2,
+
+  /**
+   * The pixels. Borrowed: valid until the terminal changes.
+   * GHOSTTY_NO_VALUE while the frame is pending.
+   *
+   * Output type: const uint8_t ** (the pointer is written to *out)
+   */
+  GHOSTTY_KITTY_FRAME_DATA_DATA_PTR = 3,
+
+  /**
+   * Bytes of pixels: width * height * bytes per pixel, also while the
+   * frame is pending.
+   *
+   * Output type: size_t *
+   */
+  GHOSTTY_KITTY_FRAME_DATA_DATA_LEN = 4,
+
+  /**
+   * The serial of the graphics command that last set this frame's
+   * pixels or its number. It is not the image GENERATION, which moves
+   * on each animation tick, and not the storage generation. It stays
+   * the same across ticks and a=a. Every terminal that read the same
+   * bytes computes the same value, so a pane and its mirrors name a
+   * frame state the same way. 0 is a frame with no serial, which no
+   * fetch can complete: attach and adopt refuse it.
+   *
+   * Output type: uint64_t *
+   */
+  GHOSTTY_KITTY_FRAME_DATA_GENERATION = 5,
+
+  /**
+   * Milliseconds the frame is shown. 0 means gapless.
+   *
+   * Output type: uint32_t *
+   */
+  GHOSTTY_KITTY_FRAME_DATA_GAP_MS = 6,
+
+  GHOSTTY_KITTY_FRAME_DATA_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
+} GhosttyKittyGraphicsFrameData;
+
+/**
+ * Get data of frame `frame` of an image, numbered as the protocol does:
+ * 1 is the image, 2 and up are its animation frames.
+ *
+ * No call of this group takes a lock. The caller serializes all access
+ * to the terminal.
+ *
+ * @return GHOSTTY_SUCCESS; GHOSTTY_NO_VALUE if there is no such image or
+ *         the pixels are pending; GHOSTTY_INVALID_VALUE for a NULL
+ *         argument, frame 0 or a frame above FRAME_COUNT
+ *
+ * @ingroup kitty_graphics
+ */
+GHOSTTY_API GhosttyResult ghostty_kitty_graphics_frame_get(
+    GhosttyTerminal terminal,
+    GhosttyTerminalScreen screen,
+    uint32_t image_id,
+    uint32_t frame,
+    GhosttyKittyGraphicsFrameData data,
+    void* out);
+
+/**
+ * Get several data kinds of one frame. Stops at the first failure and
+ * sets `out_written` to the number of values written.
+ *
+ * @ingroup kitty_graphics
+ */
+GHOSTTY_API GhosttyResult ghostty_kitty_graphics_frame_get_multi(
+    GhosttyTerminal terminal,
+    GhosttyTerminalScreen screen,
+    uint32_t image_id,
+    uint32_t frame,
+    size_t count,
+    const GhosttyKittyGraphicsFrameData* keys,
+    void** values,
+    size_t* out_written);
+
+/**
+ * Attach decoded pixels to a pending frame, as the decoder's
+ * KITTY_IMAGE_PAYLOAD path does. `len` must equal DATA_LEN and
+ * `generation` must equal the frame's GENERATION. The frame keeps its
+ * GENERATION. The image gets a new image GENERATION if the frame is on
+ * screen. When the last pending frame of an animation arrives, its frame
+ * timer restarts and playback resumes at the next tick. The terminal
+ * copies the pixels.
+ *
+ * @return GHOSTTY_SUCCESS: attached. GHOSTTY_NO_VALUE: no such image or
+ *         frame, the frame is not pending, or its GENERATION moved on.
+ *         GHOSTTY_INVALID_VALUE: NULL argument, frame 0 or a length
+ *         mismatch. GHOSTTY_OUT_OF_MEMORY: the copy failed. Nothing
+ *         changes except on success.
+ *
+ * @ingroup kitty_graphics
+ */
+GHOSTTY_API GhosttyResult ghostty_kitty_graphics_frame_attach(
+    GhosttyTerminal terminal,
+    GhosttyTerminalScreen screen,
+    uint32_t image_id,
+    uint32_t frame,
+    uint64_t generation,
+    const uint8_t* pixels,
+    size_t len);
+
+/**
+ * The same as ghostty_kitty_graphics_frame_attach() with a read-only
+ * mapping and no copy. `base` and `map_len` are what mmap returned: the
+ * terminal rounds `map_len` up to a page and unmaps exactly that. The
+ * pixels are `len` bytes at `offset`, uncompressed, in the frame's
+ * FORMAT. On success the terminal owns the mapping, reads it in place,
+ * and unmaps it when the frame is freed, replaced, or copied before an
+ * in-place edit (a=f, a=c). The caller must not unmap or write it; it
+ * may close the descriptor. On any other result the caller still owns
+ * it. Also GHOSTTY_INVALID_VALUE: `base` not page aligned, or
+ * `offset + len > map_len`.
+ *
+ * @ingroup kitty_graphics
+ */
+GHOSTTY_API GhosttyResult ghostty_kitty_graphics_frame_adopt(
+    GhosttyTerminal terminal,
+    GhosttyTerminalScreen screen,
+    uint32_t image_id,
+    uint32_t frame,
+    uint64_t generation,
+    void* base,
+    size_t map_len,
+    size_t offset,
+    size_t len);
 
 /** @} */
 

@@ -399,6 +399,11 @@ comptime {
             @export(&c.kitty_graphics_image, .{ .name = "ghostty_kitty_graphics_image" });
             @export(&c.kitty_graphics_image_get, .{ .name = "ghostty_kitty_graphics_image_get" });
             @export(&c.kitty_graphics_image_get_multi, .{ .name = "ghostty_kitty_graphics_image_get_multi" });
+            @export(&c.kitty_graphics_screen_image, .{ .name = "ghostty_kitty_graphics_screen_image" });
+            @export(&c.kitty_graphics_frame_get, .{ .name = "ghostty_kitty_graphics_frame_get" });
+            @export(&c.kitty_graphics_frame_get_multi, .{ .name = "ghostty_kitty_graphics_frame_get_multi" });
+            @export(&c.kitty_graphics_frame_attach, .{ .name = "ghostty_kitty_graphics_frame_attach" });
+            @export(&c.kitty_graphics_frame_adopt, .{ .name = "ghostty_kitty_graphics_frame_adopt" });
             @export(&c.kitty_graphics_placement_iterator_new, .{ .name = "ghostty_kitty_graphics_placement_iterator_new" });
             @export(&c.kitty_graphics_placement_iterator_free, .{ .name = "ghostty_kitty_graphics_placement_iterator_free" });
             @export(&c.kitty_graphics_placement_iterator_set, .{ .name = "ghostty_kitty_graphics_placement_iterator_set" });

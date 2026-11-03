@@ -417,4 +417,20 @@ typedef struct {
  */
 GHOSTTY_API const char *ghostty_type_json(void);
 
+/**
+ * Terminal screen identifier.
+ *
+ * Identifies which screen buffer is active in the terminal.
+ *
+ * @ingroup terminal
+ */
+typedef enum GHOSTTY_ENUM_TYPED {
+  /** The primary (normal) screen. */
+  GHOSTTY_TERMINAL_SCREEN_PRIMARY = 0,
+
+  /** The alternate screen. */
+  GHOSTTY_TERMINAL_SCREEN_ALTERNATE = 1,
+  GHOSTTY_TERMINAL_SCREEN_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
+} GhosttyTerminalScreen;
+
 #endif /* GHOSTTY_VT_TYPES_H */
