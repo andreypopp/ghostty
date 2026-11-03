@@ -149,11 +149,15 @@ pub const Write = struct {
 
 /// A request from the running program to read a clipboard.
 ///
-/// Reads are synchronous: the effect callback must answer through `reply`
-/// before it returns, and the request (including its reply context) is
-/// invalid afterwards. An embedder that needs user consent must block until
-/// it has an answer; the VT stream waits with it.
+/// The effect callback answers through `reply` before it returns, and
+/// the request (including its reply context) is invalid afterwards. An
+/// embedder that cannot answer that fast calls `deferReply` instead and
+/// completes the returned `Deferred` later.
 pub const Read = struct {
+    /// The protocol the program used. The terminal encodes the answer
+    /// in that protocol itself.
+    protocol: Protocol,
+
     location: Location,
 
     /// The MIME types the program wants, in order of preference. The
@@ -192,6 +196,7 @@ pub const Read = struct {
     /// alive; a returned slice would have to outlive the callback.
     reply_ctx: *anyopaque,
     reply_fn: *const fn (*anyopaque, Result) void,
+    defer_fn: *const fn (*anyopaque) ?*Deferred,
 
     /// Answer the read. May be called at most once; later calls are
     /// ignored. Result memory is borrowed only for the duration of this
@@ -199,6 +204,37 @@ pub const Read = struct {
     pub fn reply(self: Read, result: Result) void {
         self.reply_fn(self.reply_ctx, result);
     }
+
+    /// Take the answer out of the callback: the callback may return
+    /// without replying, and the terminal does not answer the program
+    /// by itself. Returns null if the read was already replied to or
+    /// deferred, or on allocation failure; in the latter case the
+    /// callback must still reply before it returns.
+    ///
+    /// Complete the result exactly once. A `Deferred` outlives the
+    /// terminal: completing it after the terminal was freed only frees
+    /// it. Never completing it leaks it.
+    pub fn deferReply(self: Read) ?*Deferred {
+        return self.defer_fn(self.reply_ctx);
+    }
+
+    pub const Protocol = enum(c_int) {
+        osc52 = 0,
+        kitty = 1,
+        _,
+    };
+
+    /// A read whose answer is still to come.
+    pub const Deferred = struct {
+        complete_fn: *const fn (*Deferred, Result) void,
+
+        /// Answer the read and free this value. The terminal encodes the
+        /// result for the program. Call at most once, from the thread
+        /// that drives the terminal.
+        pub fn complete(self: *Deferred, result: Result) void {
+            self.complete_fn(self, result);
+        }
+    };
 
     /// The status of a clipboard read reply.
     pub const Status = enum(c_int) {

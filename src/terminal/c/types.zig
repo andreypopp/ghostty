@@ -567,6 +567,7 @@ pub const type_decls = [_]TypeDecl{
     .initAlias("GhosttyRow", u64, "u64"),
     .initAlias("GhosttyStyleId", u16, "u16"),
 
+    .initOpaque("GhosttyClipboardReadHandle"),
     .initOpaque("GhosttyFormatter"),
     .initOpaque("GhosttyKeyEncoder"),
     .initOpaque("GhosttyKeyEvent"),
