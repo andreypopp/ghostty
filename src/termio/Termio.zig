@@ -742,6 +742,26 @@ pub fn kittyFrameStore(self: *Termio, screen: terminalpkg.ScreenSet.Key, image_i
     return answer;
 }
 
+/// The frames that a fetch can complete, of both screens (the active one
+/// first), read under the renderer lock. `Entry.of(screen, frame)` makes an
+/// entry. Writes up to `out.len` entries and returns how many exist.
+pub fn kittyPendingFrames(self: *Termio, comptime Entry: type, out: []Entry) usize {
+    self.renderer_state.mutex.lockUncancelable(global.io());
+    defer self.renderer_state.mutex.unlock(global.io());
+    const active = self.terminal.screens.active_key;
+    const other: terminalpkg.ScreenSet.Key = if (active == .primary) .alternate else .primary;
+    var total: usize = 0;
+    for ([_]terminalpkg.ScreenSet.Key{ active, other }) |key| {
+        const s = self.terminal.screens.get(key) orelse continue;
+        var it = s.kitty_images.pendingFrames();
+        while (it.next()) |frame| {
+            if (total < out.len) out[total] = Entry.of(key, frame);
+            total += 1;
+        }
+    }
+    return total;
+}
+
 pub fn kittyPendingGeneration(self: *Termio) u64 {
     self.renderer_state.mutex.lockUncancelable(global.io());
     defer self.renderer_state.mutex.unlock(global.io());
