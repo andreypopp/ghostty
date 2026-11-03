@@ -131,6 +131,7 @@ pub fn executeRestoring(
                     alloc,
                     terminal,
                     cmd,
+                    restoring,
                 ),
             };
         },
@@ -221,6 +222,7 @@ fn transmit(
     alloc: Allocator,
     terminal: *Terminal,
     cmd: *const Command,
+    restoring: bool,
 ) Response {
     const t = cmd.transmission().?;
     const storage = &terminal.screens.active.kitty_images;
@@ -247,7 +249,7 @@ fn transmit(
         .placement_id = t.placement_id,
     };
 
-    const load = loadAndAddImage(io, alloc, terminal, cmd) catch |err| {
+    const load = loadAndAddImage(io, alloc, terminal, cmd, restoring) catch |err| {
         encodeError(&result, err);
         if (err == error.MediumUnavailable) {
             const id = if (t.image_id != 0) t.image_id else storage.nextImageId(if (t.image_number != 0) .explicit else .implicit);
@@ -521,6 +523,7 @@ fn transmitAnimationFrame(
             alloc,
             terminal,
             cmd,
+            restoring,
         );
 
         // Not the first frame, so continue loading similar to transmit
@@ -1112,6 +1115,7 @@ fn loadAndAddImage(
     alloc: Allocator,
     terminal: *Terminal,
     cmd: *const Command,
+    restoring: bool,
 ) !struct {
     image: Image,
     more: bool = false,
@@ -1142,7 +1146,9 @@ fn loadAndAddImage(
         // Reusing a specific image ID deletes the old image and all of its
         // placements when the new transmission begins, not when it completes.
         const held = storage.imageById(t.image_id);
-        if (cmd.control == .transmit and held != null and held.?.data.isPending()) {
+        // Only restore input completes a held image in place; a live
+        // transmission replaces it like any other reused ID.
+        if (restoring and cmd.control == .transmit and held != null and held.?.data.isPending()) {
             var pending = try LoadingImage.init(io, alloc, cmd, storage.image_limits);
             pending.pending_token = .{ .id = held.?.id, .transmission = held.?.transmission };
             break :loading pending;
@@ -4143,6 +4149,8 @@ test "kittygfx restore unread transmission rejects an older decoded fill" {
     const storage = &t.screens.active.kitty_images;
     try t.prepareImageFill(alloc, false, storage.total_limit, storage.image_limits);
     t.parseImageFill("\x1b_Ga=t,i=7,f=32,s=1,v=1;/wAA/w==\x1b\\");
+    // A live transmission replaces the held image and drops the restore's
+    // held placement, so the fill decoded for the old ticket is rejected.
     const unavailable: Command = .{
         .control = .{ .transmit = .{ .image_id = 7, .format = .rgba, .medium = .shared_memory, .width = 1, .height = 1 } },
         .data = try std.fmt.allocPrint(alloc, "kido-absent-{d}", .{std.c.getpid()}),
@@ -4151,10 +4159,13 @@ test "kittygfx restore unread transmission rejects an older decoded fill" {
     const response = execute(testing.io, alloc, &t, &unavailable).?;
     try testing.expectEqualStrings("EBADF: image data unavailable", response.message);
     try testing.expect(storage.imageById(7).?.data == .unread);
+    _ = execute(testing.io, alloc, &t, &placement);
     try testing.expect(storage.has_unread);
     try t.completeImageFill(alloc, false, true);
+    try testing.expect(storage.imageById(7).?.data.bytes() == null);
     try testing.expectEqual(ImageStorage.Recovery.fetch, storage.takeUnreadImages());
     try testing.expect(storage.imageById(7).?.data.isPending());
+    try testing.expectEqual(@as(usize, 1), storage.placements.count());
 }
 
 test "kittygfx restore animation fill is atomic across pages and reset" {
