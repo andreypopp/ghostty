@@ -12,6 +12,7 @@ const assert = @import("../quirks.zig").inlineAssert;
 const lib = @import("lib.zig");
 const testing = std.testing;
 const Allocator = std.mem.Allocator;
+const build_options = @import("terminal_options");
 const Screen = @import("Screen.zig");
 
 /// The possible keys for screens in the screen set.
@@ -95,6 +96,10 @@ pub fn remove(
 ) void {
     assert(key != .primary);
     if (self.all.fetchRemove(key)) |screen| {
+        // The serials of the removed screen's images must not come back.
+        if (comptime build_options.kitty_graphics) {
+            self.get(.primary).?.kitty_images.absorbCounters(&screen.kitty_images);
+        }
         self.generations.put(key, self.generation(key) +% 1);
         screen.deinit();
         alloc.destroy(screen);

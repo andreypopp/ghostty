@@ -1457,7 +1457,7 @@ test "kitty renderer uploads the current animation frame" {
     anim.* = .{};
     img.animation = anim;
     try anim.frames.append(alloc, .{
-        .data = try alloc.dupe(u8, &.{ 0, 0, 255, 255 }),
+        .data = .{ .complete = try alloc.dupe(u8, &.{ 0, 0, 255, 255 }) },
         .gap_ms = 40,
     });
     anim.current_index = 1;

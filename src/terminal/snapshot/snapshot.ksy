@@ -1127,6 +1127,11 @@ types:
         type: u4
       - id: next_internal_placement_id
         type: u4
+      - id: command_serial
+        type: u8
+        doc: |
+          ImageStorage.command_serial. A decoded storage continues the
+          count of the graphics commands that stamp frames.
       - id: num_images
         type: u4
       - id: num_placements
@@ -1171,6 +1176,9 @@ types:
         type: kitty_image_flags
       - id: data_length
         type: u8
+      - id: root_serial
+        type: u8
+        doc: The serial of the command that last set frame 1.
       - id: animation_present
         type: u1
         valid:
@@ -1220,6 +1228,9 @@ types:
         type: u4
       - id: data_length
         type: u8
+      - id: serial
+        type: u8
+        doc: The serial of the command that last set this frame.
 
   kitty_placement:
     params:
@@ -1450,6 +1461,11 @@ types:
         type: u4
         valid:
           min: 1
+      - id: serial
+        type: u8
+        doc: |
+          The serial of the frame in the storage record. A decoder drops the
+          pixels when the frame has another serial by then.
       - id: len_data
         type: u8
       - id: data
