@@ -1323,6 +1323,9 @@ GHOSTTY_API void* ghostty_surface_userdata(ghostty_surface_t);
 GHOSTTY_API ghostty_app_t ghostty_surface_app(ghostty_surface_t);
 GHOSTTY_API ghostty_surface_config_s ghostty_surface_inherited_config(ghostty_surface_t, ghostty_surface_context_e);
 GHOSTTY_API void ghostty_surface_update_config(ghostty_surface_t, ghostty_config_t);
+// Call from the manual-output decoder after restore. False disables history;
+// zero removes a bound. Lower bounds prune complete historical pages.
+GHOSTTY_API void ghostty_surface_set_scrollback_limits(ghostty_surface_t, bool, uintptr_t, uintptr_t);
 GHOSTTY_API bool ghostty_surface_needs_confirm_quit(ghostty_surface_t);
 GHOSTTY_API bool ghostty_surface_process_exited(ghostty_surface_t);
 // Returns the app-thread-owned live font size without reading renderer state.
