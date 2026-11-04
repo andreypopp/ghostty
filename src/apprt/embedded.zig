@@ -1650,6 +1650,35 @@ pub const Inspector = struct {
 };
 
 // C API
+fn setScrollbackLimits(term: *terminal.Terminal, history: bool, bytes: usize, lines: usize) void {
+    term.setScrollbackMaxBytes(if (!history) 0 else if (bytes == 0) null else bytes);
+    term.setScrollbackMaxLines(if (!history or lines == 0) null else lines);
+}
+
+test "surface scrollback limits decode absent and disabled bounds" {
+    const testing = std.testing;
+    var term = try terminal.Terminal.init(testing.io, testing.allocator, .{ .cols = 80, .rows = 3 });
+    defer term.deinit(testing.allocator);
+    const primary = term.screens.get(.primary).?;
+    const bytes: usize = 100000;
+    const lines: usize = 10;
+    setScrollbackLimits(&term, true, bytes, lines);
+    try testing.expectEqual(bytes, primary.pages.limits.bytes.explicit);
+    try testing.expectEqual(lines, primary.pages.limits.lines.explicit);
+    term.setScrollbackMaxBytes(primary.pages.limits.max(.bytes));
+    try testing.expect(primary.pages.limits.bytes.explicit > bytes);
+    setScrollbackLimits(&term, true, bytes, lines);
+    try term.resize(testing.allocator, .{ .cols = 20, .rows = 10 });
+    try testing.expectEqual(bytes, primary.pages.limits.bytes.explicit);
+    try testing.expectEqual(lines, primary.pages.limits.lines.explicit);
+    setScrollbackLimits(&term, false, 0, 0);
+    try testing.expect(primary.no_scrollback);
+    try testing.expectEqual(std.math.maxInt(usize), primary.pages.limits.lines.explicit);
+    setScrollbackLimits(&term, true, 0, 0);
+    try testing.expect(!primary.no_scrollback);
+    try testing.expectEqual(std.math.maxInt(usize), primary.pages.limits.bytes.explicit);
+}
+
 pub const CAPI = struct {
     /// This is the same as Surface.KeyEvent but this is the raw C API version.
     const KeyEvent = extern struct {
@@ -1977,6 +2006,13 @@ pub const CAPI = struct {
     /// Returns true if the surface process has exited.
     export fn ghostty_surface_process_exited(surface: *Surface) bool {
         return surface.core_surface.child_exited;
+    }
+
+    export fn ghostty_surface_set_scrollback_limits(surface: *Surface, history: bool, bytes: usize, lines: usize) void {
+        const core = &surface.core_surface;
+        core.renderer_state.lockDemand(global.io());
+        defer core.renderer_state.unlockDemand(global.io());
+        setScrollbackLimits(core.renderer_state.terminal, history, bytes, lines);
     }
 
     export fn ghostty_surface_scrollbar(surface: *Surface, result: *CoreSurface.AbsoluteScrollSnapshot) bool {

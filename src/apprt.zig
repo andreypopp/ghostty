@@ -53,6 +53,7 @@ pub const App = runtime.App;
 pub const Surface = runtime.Surface;
 
 test {
+    _ = embedded;
     _ = Runtime;
     _ = runtime;
     _ = action;
