@@ -816,10 +816,10 @@ pub const Handler = struct {
             .dcs_put => try self.dcsPut(value),
             .dcs_unhook => try self.dcsUnhook(),
 
-            // Have no terminal-modifying effect
-            .title_push,
-            .title_pop,
-            => {},
+            .title_push => if (value == 0) try self.terminal.pushTitle(),
+            .title_pop => if (value == 0 and self.terminal.popTitle()) {
+                if (self.effects.title_changed) |func| func(self);
+            },
         }
     }
 
@@ -5862,6 +5862,55 @@ test "stream: CSI W with intermediate but no params" {
     defer s.deinit();
 
     s.nextSlice("\x1b[?W");
+}
+
+test "title stack restores nested titles and fires effects" {
+    var t: Terminal = try .init(testing.io, testing.allocator, .{ .cols = 5, .rows = 1 });
+    defer t.deinit(testing.allocator);
+    const S = struct {
+        var count: usize = 0;
+        fn changed(_: *Handler) void {
+            count += 1;
+        }
+    };
+    S.count = 0;
+    var handler: Handler = .init(&t);
+    handler.effects.title_changed = &S.changed;
+    var s: Stream = .init(.{ .allocator = testing.allocator, .handler = handler });
+    defer s.deinit();
+
+    s.nextSlice("\x1b[23t\x1b[22t\x1b]2;first\x07\x1b[22;2t\x1b]2;second\x07");
+    try testing.expectEqual(@as(usize, 2), S.count);
+    s.nextSlice("\x1b[23;2t");
+    try testing.expectEqualStrings("first", t.getTitle().?);
+    try testing.expectEqual(@as(usize, 3), S.count);
+    s.nextSlice("\x1b[23t");
+    try testing.expect(t.getTitle() == null);
+    try testing.expectEqual(@as(usize, 4), S.count);
+    s.nextSlice("\x1b[23;0t");
+    try testing.expectEqual(@as(usize, 4), S.count);
+
+    s.nextSlice("\x1b]2;kept\x07\x1b[22;0;1t\x1b]2;current\x07\x1b[23;0;1t\x1b[23;0t");
+    try testing.expectEqualStrings("current", t.getTitle().?);
+    try testing.expectEqual(@as(usize, 6), S.count);
+    s.nextSlice("\x1b[22;0t\x1bc\x1b[23;0t");
+    try testing.expect(t.getTitle() == null);
+    try testing.expectEqual(@as(usize, 0), t.title_stack_len);
+}
+
+test "title stack drops the oldest title on overflow" {
+    var t: Terminal = try .init(testing.io, testing.allocator, .{ .cols = 5, .rows = 1 });
+    defer t.deinit(testing.allocator);
+    for ("abcdefghijk") |c| {
+        try t.setTitle(&.{c});
+        try t.pushTitle();
+    }
+    for ("kjihgfedcb") |c| {
+        try testing.expect(t.popTitle());
+        try testing.expectEqualStrings(&.{c}, t.getTitle().?);
+    }
+    try testing.expect(!t.popTitle());
+    try testing.expectEqualStrings("b", t.getTitle().?);
 }
 
 test "window_title effect is called" {
