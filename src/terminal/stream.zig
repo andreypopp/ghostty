@@ -2628,11 +2628,9 @@ pub fn Stream(comptime H: type) type {
                                     "ignoring CSI 21 t with extra parameters: {f}",
                                     .{input},
                                 ),
-                                inline 22, 23 => |number| if ((input.params.len == 2 or
-                                    input.params.len == 3) and
-                                    // we only support window title
-                                    (input.params[1] == 0 or
-                                        input.params[1] == 2))
+                                inline 22, 23 => |number| if (input.params.len == 1 or
+                                    ((input.params.len == 2 or input.params.len == 3) and
+                                        (input.params[1] == 0 or input.params[1] == 2)))
                                 {
                                     // push/pop title
                                     const index: u16 = if (input.params.len == 3)
@@ -4967,6 +4965,9 @@ test "stream: CSI t push title" {
 
     var s: Stream(H) = .init(.{ .handler = .{} });
 
+    s.nextSlice("\x1b[22t");
+    try testing.expectEqual(@as(u16, 0), s.handler.index.?);
+    s.handler.index = null;
     s.nextSlice("\x1b[22;0t");
     try testing.expectEqual(@as(u16, 0), s.handler.index.?);
 }
@@ -5055,6 +5056,9 @@ test "stream: CSI t pop title" {
 
     var s: Stream(H) = .init(.{ .handler = .{} });
 
+    s.nextSlice("\x1b[23t");
+    try testing.expectEqual(@as(u16, 0), s.handler.index.?);
+    s.handler.index = null;
     s.nextSlice("\x1b[23;0t");
     try testing.expectEqual(@as(u16, 0), s.handler.index.?);
 }

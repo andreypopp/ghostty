@@ -72,6 +72,9 @@ pwd: std.ArrayList(u8),
 
 /// The title of the terminal as set by escape sequences (e.g. OSC 0/2).
 title: std.ArrayList(u8),
+/// Xterm keeps ten saved titles and drops the oldest on overflow.
+title_stack: [10]std.ArrayList(u8) = @splat(.empty),
+title_stack_len: usize = 0,
 
 /// The color state for this terminal.
 colors: Colors,
@@ -423,6 +426,7 @@ pub fn deinit(self: *Terminal, alloc: Allocator) void {
     self.colors.palette.deinit(alloc);
     self.pwd.deinit(alloc);
     self.title.deinit(alloc);
+    for (self.title_stack[0..self.title_stack_len]) |*title| title.deinit(alloc);
     self.glyph_glossary.deinit(alloc);
     if (self.kitty_dnd) |dnd| dnd.destroy(alloc);
     self.* = undefined;
@@ -4948,8 +4952,27 @@ pub fn setTitle(self: *Terminal, t: []const u8) !void {
     self.title.items[t.len] = 0;
 }
 
+pub fn pushTitle(self: *Terminal) !void {
+    const saved = try self.title.clone(self.gpa());
+    if (self.title_stack_len == self.title_stack.len) {
+        self.title_stack[0].deinit(self.gpa());
+        std.mem.copyForwards(std.ArrayList(u8), self.title_stack[0 .. self.title_stack.len - 1], self.title_stack[1..]);
+        self.title_stack_len -= 1;
+    }
+    self.title_stack[self.title_stack_len] = saved;
+    self.title_stack_len += 1;
+}
+
+pub fn popTitle(self: *Terminal) bool {
+    if (self.title_stack_len == 0) return false;
+    self.title_stack_len -= 1;
+    self.title.deinit(self.gpa());
+    self.title = self.title_stack[self.title_stack_len];
+    return true;
+}
+
 /// Returns the title for the terminal, if any. The memory is owned by the
-/// Terminal and is not copied. It is safe until a reset or setTitle.
+/// Terminal and is not copied. It is safe until a reset, setTitle, or popTitle.
 pub fn getTitle(self: *const Terminal) ?[:0]const u8 {
     if (self.title.items.len == 0) return null;
     return self.title.items[0 .. self.title.items.len - 1 :0];
@@ -5217,6 +5240,8 @@ pub fn fullReset(self: *Terminal) void {
     self.previous_char = null;
     self.pwd.clearRetainingCapacity();
     self.title.clearRetainingCapacity();
+    for (self.title_stack[0..self.title_stack_len]) |*title| title.deinit(self.gpa());
+    self.title_stack_len = 0;
     self.glyph_glossary.clearAndFree(self.gpa());
     // A reset only interrupts an in-progress chunked OSC 72 command;
     // drag and drop registration survives, matching kitty.
