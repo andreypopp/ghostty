@@ -2751,6 +2751,24 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             cp_offset: usize,
         };
 
+        pub const ContentGeometry = struct {
+            image: ?imagepkg.State.Hit,
+            pixel_offset: f64,
+        };
+
+        pub fn imageAt(self: *Self, x: f64, y: f64, screen: terminal.ScreenSet.Key) ContentGeometry {
+            self.draw_mutex.lockUncancelable(global.io());
+            defer self.draw_mutex.unlock(global.io());
+            const pixel_offset = self.uniforms.scroll_offset - @as(f64, @floatFromInt(@as(u32, self.terminal_state.overscan.above) * self.grid_metrics.cell_height));
+            if (self.terminal_state.screen != screen) return .{ .image = null, .pixel_offset = pixel_offset };
+            const left: f64 = @floatFromInt(self.size.padding.left);
+            const top: f64 = @floatFromInt(self.size.padding.top);
+            var hit = self.images.hitCell(x - left, y - top, @floatFromInt(self.grid_metrics.cell_width), @floatFromInt(self.grid_metrics.cell_height), self.uniforms.scroll_offset) orelse return .{ .image = null, .pixel_offset = pixel_offset };
+            hit.x += left;
+            hit.y += top;
+            return .{ .image = hit, .pixel_offset = pixel_offset };
+        }
+
         /// Convert the terminal state to GPU cells stored in CPU memory. These
         /// are then synced to the GPU in the next frame. This only updates CPU
         /// memory and doesn't touch the GPU.

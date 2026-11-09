@@ -1302,6 +1302,15 @@ GHOSTTY_API bool ghostty_surface_set_grid_size(ghostty_surface_t,
                                                uint16_t rows,
                                                ghostty_surface_size_s* resolved);
 typedef enum { GHOSTTY_KITTY_SCREEN_E_PRIMARY = 0, GHOSTTY_KITTY_SCREEN_E_ALTERNATE = 1 } ghostty_kitty_screen_e;
+typedef enum { GHOSTTY_HIT_NONE, GHOSTTY_HIT_LINK, GHOSTTY_HIT_IMAGE } ghostty_hit_kind_e;
+typedef struct { double x, y, width, height; } ghostty_hit_rect_s;
+typedef struct { ghostty_hit_kind_e kind; ghostty_kitty_screen_e screen; uint32_t image_id; uint64_t transmission; ghostty_hit_rect_s rect; } ghostty_hit_s;
+typedef enum { GHOSTTY_IMAGE_FORMAT_GRAY, GHOSTTY_IMAGE_FORMAT_GRAY_ALPHA, GHOSTTY_IMAGE_FORMAT_RGB, GHOSTTY_IMAGE_FORMAT_RGBA } ghostty_image_format_e;
+typedef struct { uint32_t width, height; ghostty_image_format_e format; uint8_t* data; size_t len; } ghostty_image_s;
+GHOSTTY_API int ghostty_surface_content_at(ghostty_surface_t, double x, double y, ghostty_hit_s*);
+GHOSTTY_API bool ghostty_surface_open_link_at(ghostty_surface_t, double x, double y);
+GHOSTTY_API int ghostty_surface_image_copy(ghostty_surface_t, const ghostty_hit_s*, ghostty_image_s*);
+GHOSTTY_API void ghostty_image_free(ghostty_image_s*);
 GHOSTTY_API int ghostty_surface_kitty_frame_get_multi(ghostty_surface_t, ghostty_kitty_screen_e, uint32_t image_id, uint32_t frame, size_t count, const int* keys, void** values, size_t* out_written);
 GHOSTTY_API int ghostty_surface_kitty_frame_attach(ghostty_surface_t, ghostty_kitty_screen_e, uint32_t image_id, uint32_t frame, uint64_t generation, const uint8_t*, size_t len);
 GHOSTTY_API int ghostty_surface_kitty_frame_adopt(ghostty_surface_t, ghostty_kitty_screen_e, uint32_t image_id, uint32_t frame, uint64_t generation, void* base, size_t map_len, size_t offset, size_t len);

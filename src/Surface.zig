@@ -1811,7 +1811,7 @@ fn mouseRefreshLinks(
             }
         }
 
-        const link = (try self.linkAtPos(pos, size)) orelse break :link .{ null, false };
+        const link = (try self.linkAtPos(pos, size, self.mouseModsWithCapture(self.mouse.mods))) orelse break :link .{ null, false };
         switch (link.action) {
             .open => {
                 const str = try self.io.terminal.screens.active.selectionString(alloc, .{
@@ -4732,7 +4732,7 @@ pub fn mouseButtonCallback(
 
                 // If there is a link at this position, we want to
                 // select the link. Otherwise, select the word.
-                if (try self.linkAtPos(pos, size)) |link| {
+                if (try self.linkAtPos(pos, size, self.mouseModsWithCapture(self.mouse.mods))) |link| {
                     try self.setSelectionAndCopy(link.selection);
                 } else {
                     const sel = screen.selectWord(
@@ -4948,6 +4948,7 @@ fn linkAtPos(
     self: *Surface,
     pos: apprt.CursorPos,
     size: rendererpkg.Size,
+    mouse_mods: ?input.Mods,
 ) !?Link {
     // Convert our cursor position to a screen point.
     const screen: *terminal.Screen = self.renderer_state.terminal.screens.active;
@@ -4960,12 +4961,12 @@ fn linkAtPos(
         break :mouse_pin pin;
     };
 
-    // Get our comparison mods
-    const mouse_mods = self.mouseModsWithCapture(self.mouse.mods);
+    return try self.linkAtPinIncludingOSC8(mouse_pin, mouse_mods);
+}
 
-    // If we have the proper modifiers set then we can check for OSC8 links.
+fn linkAtPinIncludingOSC8(self: *Surface, mouse_pin: terminal.Pin, mouse_mods: ?input.Mods) !?Link {
     if (self.config.link_osc8 and
-        mouse_mods.equal(input.ctrlOrSuper(.{})))
+        (mouse_mods == null or mouse_mods.?.equal(input.ctrlOrSuper(.{}))))
     hyperlink: {
         const rac = mouse_pin.rowAndCell();
         const cell = rac.cell;
@@ -4974,7 +4975,6 @@ fn linkAtPos(
         return .{ .action = ._open_osc8, .selection = sel };
     }
 
-    // Fall back to configured links
     return try self.linkAtPin(mouse_pin, mouse_mods);
 }
 
@@ -5053,7 +5053,69 @@ fn mouseModsWithCapture(self: *Surface, mods: input.Mods) input.Mods {
 ///
 /// Requires the renderer state mutex is held.
 fn processLinks(self: *Surface, pos: apprt.CursorPos, size: rendererpkg.Size) !bool {
-    const link = try self.linkAtPos(pos, size) orelse return false;
+    const link = try self.linkAtPos(pos, size, self.mouseModsWithCapture(self.mouse.mods)) orelse return false;
+    return try self.openLink(link);
+}
+
+pub const Content = union(enum) {
+    none,
+    link,
+    image: struct {
+        screen: terminal.ScreenSet.Key,
+        id: u32,
+        transmission: u64,
+        rect: struct { x: f64, y: f64, width: f64, height: f64 },
+    },
+};
+
+fn contentPin(self: *Surface, pos: apprt.CursorPos, pixel_offset: f64) ?terminal.Pin {
+    const grid = self.size.grid();
+    const left: f64 = @floatFromInt(self.size.padding.left);
+    const top: f64 = @floatFromInt(self.size.padding.top);
+    if (pos.x < left or pos.y < top or
+        pos.x >= left + @as(f64, @floatFromInt(@as(u32, grid.columns) * self.size.cell.width)) or
+        pos.y >= top + @as(f64, @floatFromInt(@as(u32, grid.rows) * self.size.cell.height))) return null;
+    const x = @floor((pos.x - left) / @as(f64, @floatFromInt(self.size.cell.width)));
+    const y = @floor((pos.y - top + pixel_offset) / @as(f64, @floatFromInt(self.size.cell.height)));
+    const pages = &self.renderer_state.terminal.screens.active.pages;
+    const first = pages.getTopLeft(.viewport);
+    var pin = (if (y < 0) first.up(@intFromFloat(-y)) else first.down(@intFromFloat(y))) orelse return null;
+    if (x >= @as(f64, @floatFromInt(pages.cols)) or x >= @as(f64, @floatFromInt(pin.node.cols()))) return null;
+    pin.x = @intFromFloat(x);
+    return pin;
+}
+
+pub fn contentAt(self: *Surface, pos: apprt.CursorPos) !Content {
+    self.size_mutex.lockUncancelable(global.io());
+    defer self.size_mutex.unlock(global.io());
+    self.renderer_state.mutex.lockUncancelable(global.io());
+    defer self.renderer_state.mutex.unlock(global.io());
+    const t = self.renderer_state.terminal;
+    const geometry = self.renderer.imageAt(pos.x, pos.y, t.screens.active_key);
+    const pin = self.contentPin(pos, geometry.pixel_offset) orelse return .none;
+    if (try self.linkAtPinIncludingOSC8(pin, null) != null) return .link;
+    const hit = geometry.image orelse return .none;
+    const image = t.screens.active.kitty_images.imageById(hit.id) orelse return .none;
+    if (image.renderData().isPending() or image.generation != hit.generation) return .none;
+    return .{ .image = .{
+        .screen = t.screens.active_key,
+        .id = hit.id,
+        .transmission = image.transmission,
+        .rect = .{ .x = hit.x, .y = hit.y, .width = hit.width, .height = hit.height },
+    } };
+}
+
+pub fn openLinkAt(self: *Surface, pos: apprt.CursorPos) !bool {
+    self.size_mutex.lockUncancelable(global.io());
+    defer self.size_mutex.unlock(global.io());
+    self.renderer_state.mutex.lockUncancelable(global.io());
+    defer self.renderer_state.mutex.unlock(global.io());
+    const geometry = self.renderer.imageAt(pos.x, pos.y, self.renderer_state.terminal.screens.active_key);
+    const pin = self.contentPin(pos, geometry.pixel_offset) orelse return false;
+    return try self.openLink((try self.linkAtPinIncludingOSC8(pin, null)) orelse return false);
+}
+
+fn openLink(self: *Surface, link: Link) !bool {
     switch (link.action) {
         .open => {
             const str = try self.io.terminal.screens.active.selectionString(self.alloc, .{
@@ -5682,7 +5744,7 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
 
             self.renderer_state.mutex.lockUncancelable(global.io());
             defer self.renderer_state.mutex.unlock(global.io());
-            if (try self.linkAtPos(pos, size)) |link_info| {
+            if (try self.linkAtPos(pos, size, self.mouseModsWithCapture(self.mouse.mods))) |link_info| {
                 const url_text = switch (link_info.action) {
                     .open => url_text: {
                         // For regex links, get the text from selection

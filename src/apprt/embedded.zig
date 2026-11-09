@@ -2446,6 +2446,81 @@ pub const CAPI = struct {
         }
     };
 
+    const HitKind = enum(c_int) { none, link, image };
+    const HitRect = extern struct { x: f64 = 0, y: f64 = 0, width: f64 = 0, height: f64 = 0 };
+    const ContentHit = extern struct {
+        kind: HitKind = .none,
+        screen: KittyScreen = .primary,
+        image_id: u32 = 0,
+        transmission: u64 = 0,
+        rect: HitRect = .{},
+    };
+    const ImageFormat = enum(c_int) { gray, gray_alpha, rgb, rgba };
+    const ImageCopy = extern struct {
+        width: u32 = 0,
+        height: u32 = 0,
+        format: ImageFormat = .rgba,
+        data: ?[*]u8 = null,
+        len: usize = 0,
+    };
+
+    fn contentPoint(surface: *Surface, x: f64, y: f64) ?apprt.CursorPos {
+        if (!std.math.isFinite(x) or !std.math.isFinite(y) or x < 0 or y < 0) return null;
+        const px = x * surface.content_scale.x;
+        const py = y * surface.content_scale.y;
+        if (!std.math.isFinite(px) or !std.math.isFinite(py) or px > std.math.maxInt(u32) or py > std.math.maxInt(u32)) return null;
+        return .{ .x = @floatCast(px), .y = @floatCast(py) };
+    }
+
+    export fn ghostty_surface_content_at(surface: *Surface, x: f64, y: f64, out: *ContentHit) c_int {
+        out.* = .{};
+        const pos = contentPoint(surface, x, y) orelse return @backingInt(KittyResult.invalid_value);
+        const content = surface.core_surface.contentAt(pos) catch return @backingInt(KittyResult.out_of_memory);
+        switch (content) {
+            .none => {},
+            .link => out.kind = .link,
+            .image => |hit| out.* = .{
+                .kind = .image,
+                .screen = KittyScreen.of(hit.screen),
+                .image_id = hit.id,
+                .transmission = hit.transmission,
+                .rect = .{ .x = hit.rect.x / surface.content_scale.x, .y = hit.rect.y / surface.content_scale.y, .width = hit.rect.width / surface.content_scale.x, .height = hit.rect.height / surface.content_scale.y },
+            },
+        }
+        return @backingInt(KittyResult.success);
+    }
+
+    export fn ghostty_surface_open_link_at(surface: *Surface, x: f64, y: f64) bool {
+        const pos = contentPoint(surface, x, y) orelse return false;
+        return surface.core_surface.openLinkAt(pos) catch false;
+    }
+
+    export fn ghostty_surface_image_copy(surface: *Surface, hit: *const ContentHit, out: *ImageCopy) c_int {
+        out.* = .{};
+        if (hit.kind != .image) return @backingInt(KittyResult.invalid_value);
+        const copy = surface.core_surface.io.kittyImageCopy(hit.screen.key(), hit.image_id, hit.transmission, global.alloc()) catch |err| return @backingInt(switch (err) {
+            error.OutOfMemory => KittyResult.out_of_memory,
+            else => KittyResult.no_value,
+        });
+        const format: ImageFormat = switch (copy.format) {
+            .gray => .gray,
+            .gray_alpha => .gray_alpha,
+            .rgb => .rgb,
+            .rgba => .rgba,
+            .png => {
+                global.alloc().free(copy.data);
+                return @backingInt(KittyResult.invalid_value);
+            },
+        };
+        out.* = .{ .width = copy.width, .height = copy.height, .format = format, .data = copy.data.ptr, .len = copy.data.len };
+        return @backingInt(KittyResult.success);
+    }
+
+    export fn ghostty_image_free(image: *ImageCopy) void {
+        if (image.data) |p| global.alloc().free(p[0..image.len]);
+        image.* = .{};
+    }
+
     /// Frame calls for a mirror that plays animations from fetched frames.
     /// The results are GhosttyResult values. DATA_PTR is refused here: the
     /// pointer would outlive the renderer lock.

@@ -728,6 +728,25 @@ pub fn kittyFrameInfo(self: *Termio, screen: terminalpkg.ScreenSet.Key, image_id
     return s.kitty_images.frameInfo(image_id, frame);
 }
 
+pub const KittyImageCopy = struct {
+    width: u32,
+    height: u32,
+    format: @FieldType(terminalpkg.kitty.graphics.Image.FrameInfo, "format"),
+    data: []u8,
+};
+
+pub fn kittyImageCopy(self: *Termio, screen: terminalpkg.ScreenSet.Key, image_id: u32, transmission: u64, alloc: Allocator) !KittyImageCopy {
+    self.renderer_state.mutex.lockUncancelable(global.io());
+    defer self.renderer_state.mutex.unlock(global.io());
+    const s = self.terminal.screens.get(screen) orelse return error.NoImage;
+    const image = s.kitty_images.imageById(image_id) orelse return error.NoImage;
+    if (image.transmission != transmission) return error.NoImage;
+    const number: u32 = if (image.animation) |anim| anim.current_index + 1 else 1;
+    const info = image.frameInfo(number) orelse return error.NoFrame;
+    const bytes = info.bytes orelse return error.Pending;
+    return .{ .width = image.width, .height = image.height, .format = info.format, .data = try alloc.dupe(u8, bytes) };
+}
+
 /// Complete a pending Kitty graphics frame. See `ImageStorage.storeFrame`.
 /// The caller made `data` with `self.alloc` before the call and frees it
 /// after the call when the answer is not `attached`.
