@@ -105,10 +105,12 @@ pub fn yieldToDemand(self: *State, io: std.Io) void {
 }
 
 pub const Mouse = struct {
-    /// The point on the viewport where the mouse currently is. We use
-    /// viewport points to avoid the complexity of mapping the mouse to
-    /// the renderer state.
-    point: ?terminalpkg.point.Coordinate = null,
+    pub const Point = struct {
+        x: terminalpkg.size.CellCountInt,
+        y: isize,
+    };
+
+    point: ?Point = null,
 
     /// The mods that are currently active for the last mouse event.
     /// This could really just be mods in general and we probably will

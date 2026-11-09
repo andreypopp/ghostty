@@ -107,7 +107,7 @@ const log = std.log.scoped(.render_state);
 /// Overscan rows carry the same data as viewport rows (cells, styles,
 /// dirty flags, selection, and highlights). The cursor is only reported
 /// in `cursor.viewport` when it is inside the viewport itself. `string`
-/// and `linkCells` only look at the viewport.
+/// and `linkCells` include captured overscan rows.
 ///
 /// With no overscan requested (the default), `row_data` holds exactly
 /// the viewport and indices are viewport y values, as before.
@@ -1668,8 +1668,8 @@ pub const RenderState = struct {
     /// blank lines. This is fine for our current usage (link search) but
     /// we can adjust this later.
     ///
-    /// Only viewport rows are included, never overscan rows. The `y`
-    /// values in `map` are viewport rows.
+    /// Includes captured overscan rows. The `y` values in `map` are
+    /// relative to the first captured row.
     ///
     /// NOTE: There is a limitation in that wrapped lines before/after
     /// the top/bottom line of the viewport are not included, since
@@ -1682,11 +1682,10 @@ pub const RenderState = struct {
             map: *StringMap,
         },
     ) (Allocator.Error || std.Io.Writer.Error)!void {
-        // This only covers the viewport, never overscan rows.
         const row_slice = self.row_data.slice();
-        const vp_start = self.viewportStart();
-        const row_rows = row_slice.items(.raw)[vp_start..][0..self.rows];
-        const row_cells = row_slice.items(.cells)[vp_start..][0..self.rows];
+        const captured = self.rowDataRange();
+        const row_rows = row_slice.items(.raw)[captured.start..captured.end];
+        const row_cells = row_slice.items(.cells)[captured.start..captured.end];
 
         for (
             0..,
@@ -1739,34 +1738,33 @@ pub const RenderState = struct {
     /// For example, you may want to hold a lock for the duration of the
     /// update and hyperlink lookup to ensure no updates happen in between.
     ///
-    /// Only viewport rows are searched, never overscan rows. Both the
-    /// given point and the returned cells use viewport coordinates.
+    /// Searches captured rows, including overscan. The point and returned
+    /// cells are relative to the first captured row.
     pub fn linkCells(
         self: *const RenderState,
         alloc: Allocator,
-        viewport_point: point.Coordinate,
+        captured_point: point.Coordinate,
     ) Allocator.Error!CellSet {
         var result: CellSet = .empty;
         errdefer result.deinit(alloc);
 
-        // This only covers the viewport, never overscan rows.
         const row_slice = self.row_data.slice();
-        const vp_start = self.viewportStart();
-        const row_pins = row_slice.items(.pin)[vp_start..][0..self.rows];
-        const row_cells = row_slice.items(.cells)[vp_start..][0..self.rows];
+        const captured = self.rowDataRange();
+        const row_pins = row_slice.items(.pin)[captured.start..captured.end];
+        const row_cells = row_slice.items(.cells)[captured.start..captured.end];
 
         // Our viewport point is sent in by the caller and can't be trusted.
         // If it is outside the valid area then just return empty because
         // we can't possibly have a link there.
-        if (viewport_point.x >= self.cols or
-            viewport_point.y >= self.rows) return result;
+        if (captured_point.x >= self.cols or
+            captured_point.y >= row_pins.len) return result;
 
         // Grab our link ID
-        const link_pin: PageList.Pin = row_pins[viewport_point.y];
+        const link_pin: PageList.Pin = row_pins[captured_point.y];
         const link_page: *page.Page = link_pin.node.page();
         const link = link: {
             const rac = link_page.getRowAndCell(
-                viewport_point.x,
+                captured_point.x,
                 link_pin.y,
             );
 
@@ -3859,6 +3857,39 @@ test "linkCells" {
     var cells2 = try state.linkCells(alloc, .{ .x = 4, .y = 0 });
     defer cells2.deinit(alloc);
     try testing.expectEqual(0, cells2.count());
+}
+
+test "linkCells and string use captured rows with overscan" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var t = try Terminal.init(testing.io, alloc, .{ .cols = 2, .rows = 2 });
+    defer t.deinit(alloc);
+    var s = t.vtStream();
+    defer s.deinit();
+    s.nextSlice("\x1b]8;;https://example.com/above\x1b\\A\x1b]8;;\x1b\\\r\n\x1b]8;;https://example.com/visible\x1b\\B\x1b]8;;\x1b\\\r\nC");
+
+    var state: RenderState = .empty;
+    defer state.deinit(alloc);
+    state.overscan_request = .{ .above = 1 };
+    try state.update(alloc, &t);
+    try testing.expectEqual(1, state.overscan.above);
+    var above = try state.linkCells(alloc, .{ .x = 0, .y = 0 });
+    defer above.deinit(alloc);
+    try testing.expectEqual(1, above.count());
+    try testing.expect(above.contains(.{ .x = 0, .y = 0 }));
+    var visible = try state.linkCells(alloc, .{ .x = 0, .y = 1 });
+    defer visible.deinit(alloc);
+    try testing.expectEqual(1, visible.count());
+    try testing.expect(visible.contains(.{ .x = 0, .y = 1 }));
+
+    var w: std.Io.Writer.Allocating = .init(alloc);
+    defer w.deinit();
+    var map: RenderState.StringMap = .empty;
+    defer map.deinit(alloc);
+    try state.string(&w.writer, .{ .alloc = alloc, .map = &map });
+    try testing.expectEqualStrings("A\x00\nB\x00\nC\x00\n", w.writer.buffered());
+    try testing.expectEqual(point.Coordinate{ .x = 0, .y = 0 }, map.items[0]);
+    try testing.expectEqual(point.Coordinate{ .x = 0, .y = 1 }, map.items[3]);
 }
 
 test "string" {

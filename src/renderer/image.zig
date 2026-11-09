@@ -389,6 +389,35 @@ pub const State = struct {
         return @intCast(placements.len);
     }
 
+    pub const Hit = struct {
+        id: u32,
+        generation: u64,
+        x: f64,
+        y: f64,
+        width: f64,
+        height: f64,
+    };
+
+    pub fn hitCell(self: *const State, x: f64, y: f64, cell_width: f64, cell_height: f64, scroll: f64) ?Hit {
+        const cell_x = @floor(x / cell_width);
+        const cell_y = @floor((y + scroll) / cell_height);
+        const cell_top = cell_y * cell_height - scroll;
+        var i = self.kitty_placements.items.len;
+        while (i > 0) {
+            i -= 1;
+            const p = self.kitty_placements.items[i];
+            const left = @as(f64, @floatFromInt(p.x)) * cell_width + @as(f64, @floatFromInt(p.cell_offset_x));
+            const top = @as(f64, @floatFromInt(p.y)) * cell_height + @as(f64, @floatFromInt(p.cell_offset_y)) - scroll;
+            const width: f64 = @floatFromInt(p.width);
+            const height: f64 = @floatFromInt(p.height);
+            if ((cell_x + 1) * cell_width <= left or cell_x * cell_width >= left + width or
+                cell_top + cell_height <= top or cell_top >= top + height) continue;
+            const image = self.images.get(p.image_id) orelse continue;
+            return .{ .id = p.image_id.kitty, .generation = image.generation, .x = left, .y = top, .width = width, .height = height };
+        }
+        return null;
+    }
+
     const PrepImageError = error{
         OutOfMemory,
         ImageConversionError,
@@ -1231,6 +1260,8 @@ test "kitty renderer positions relative placements from virtual parent placehold
     try testing.expectEqual(@as(i32, 5), child.z);
     try testing.expectEqual(@as(i32, 2), child.x);
     try testing.expectEqual(@as(i32, 3), child.y);
+    try testing.expectEqual(@as(u32, 1), state.hitCell(15, 15, 10, 10, 0).?.id);
+    try testing.expect(state.hitCell(25, 15, 10, 10, 0) == null);
 }
 
 test "kitty renderer skips updates for rows without placeholder cells" {
@@ -1511,4 +1542,24 @@ test "kitty renderer aligns images with captured overscan cells" {
     try testing.expectEqual(@as(u16, 2), render_state.overscan.above);
     try testing.expectEqual(@as(usize, 1), state.kitty_placements.items.len);
     try testing.expectEqual(@as(i32, 2), state.kitty_placements.items[0].y);
+    const hit = state.hitCell(5, 5, 10, 10, 23).?;
+    try testing.expectEqual(@as(u32, 1), hit.id);
+    try testing.expectEqual(@as(f64, -3), hit.y);
+    try testing.expect(state.hitCell(5, 8, 10, 10, 23) == null);
+
+    var top = state.kitty_placements.items[0];
+    top.image_id = .{ .kitty = 2 };
+    top.z = 5;
+    const second_pixels = try alloc.dupe(u8, &.{ 255, 0, 0, 255 });
+    try storage.addImage(io, alloc, t.screens.active, .{
+        .id = 2,
+        .width = 1,
+        .height = 1,
+        .format = .rgba,
+        .data = .{ .complete = second_pixels },
+    });
+    var second = storage.imageById(2).?;
+    try state.prepKittyImage(alloc, &second);
+    try state.kitty_placements.append(alloc, top);
+    try testing.expectEqual(@as(u32, 2), state.hitCell(5, 5, 10, 10, 23).?.id);
 }
