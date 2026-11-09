@@ -187,6 +187,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
         /// The current GPU uniform values.
         uniforms: shaderpkg.Uniforms,
+        pixel_offset: f64 = 0,
 
         /// Custom shader uniform values.
         custom_shader_uniforms: shadertoy.Uniforms,
@@ -1420,7 +1421,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // Data we extract out of the critical area.
             const Critical = struct {
                 links: terminal.RenderState.CellSet,
-                mouse: renderer.State.Mouse,
+                mouse_point: ?terminal.point.Coordinate,
+                mouse_mods: inputpkg.Mods,
                 preedit: ?renderer.State.Preedit,
                 scrollbar: terminal.Scrollbar,
                 overlay_features: []const Overlay.Feature,
@@ -1551,11 +1553,19 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     self.images_rebuilt = true;
                 }
 
+                const mouse_point: ?terminal.point.Coordinate = mouse: {
+                    const point = state.mouse.point orelse break :mouse null;
+                    const y = point.y + @as(isize, @intCast(self.terminal_state.overscan.above));
+                    const captured = self.terminal_state.rowDataRange();
+                    if (y < 0 or y >= captured.end - captured.start) break :mouse null;
+                    break :mouse .{ .x = point.x, .y = @intCast(y) };
+                };
+
                 // Get our OSC8 links we're hovering if we have a mouse.
                 // This requires terminal state because of URLs.
                 const links: terminal.RenderState.CellSet = osc8: {
                     // If our mouse isn't hovering, we have no links.
-                    const vp = state.mouse.point orelse break :osc8 .empty;
+                    const vp = mouse_point orelse break :osc8 .empty;
 
                     // If the right mods aren't pressed, then we can't match.
                     if (!state.mouse.mods.equal(inputpkg.ctrlOrSuper(.{})))
@@ -1580,7 +1590,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
                 break :critical .{
                     .links = links,
-                    .mouse = state.mouse,
+                    .mouse_point = mouse_point,
+                    .mouse_mods = state.mouse.mods,
                     .preedit = preedit,
                     .scrollbar = scrollbar,
                     .overlay_features = overlay_features,
@@ -1598,8 +1609,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 arena_alloc,
                 &critical.links,
                 &self.terminal_state,
-                state.mouse.point,
-                state.mouse.mods,
+                critical.mouse_point,
+                critical.mouse_mods,
             ) catch |err| {
                 log.warn("error searching for regex links err={}", .{err});
             };
@@ -2751,6 +2762,30 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             cp_offset: usize,
         };
 
+        pub const ContentGeometry = struct {
+            image: ?imagepkg.State.Hit,
+            pixel_offset: f64,
+        };
+
+        pub fn pixelOffset(self: *Self) f64 {
+            self.draw_mutex.lockUncancelable(global.io());
+            defer self.draw_mutex.unlock(global.io());
+            return self.pixel_offset;
+        }
+
+        pub fn imageAt(self: *Self, x: f64, y: f64, screen: terminal.ScreenSet.Key) ContentGeometry {
+            self.draw_mutex.lockUncancelable(global.io());
+            defer self.draw_mutex.unlock(global.io());
+            const pixel_offset = self.pixel_offset;
+            if (self.terminal_state.screen != screen) return .{ .image = null, .pixel_offset = pixel_offset };
+            const left: f64 = @floatFromInt(self.size.padding.left);
+            const top: f64 = @floatFromInt(self.size.padding.top);
+            var hit = self.images.hitCell(x - left, y - top, @floatFromInt(self.grid_metrics.cell_width), @floatFromInt(self.grid_metrics.cell_height), self.uniforms.scroll_offset) orelse return .{ .image = null, .pixel_offset = pixel_offset };
+            hit.x += left;
+            hit.y += top;
+            return .{ .image = hit, .pixel_offset = pixel_offset };
+        }
+
         /// Convert the terminal state to GPU cells stored in CPU memory. These
         /// are then synced to the GPU in the next frame. This only updates CPU
         /// memory and doesn't touch the GPU.
@@ -2768,6 +2803,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
             const captured = state.rowDataRange();
             const state_rows: terminal.size.CellCountInt = @intCast(captured.end - captured.start);
+            self.pixel_offset = state.pixel_offset;
             self.uniforms.scroll_offset = state.pixel_offset + @as(f32, @floatFromInt(@as(u32, state.overscan.above) * self.grid_metrics.cell_height));
             const grid_size_diff =
                 self.cells.size.rows != state_rows or
@@ -3380,10 +3416,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // an underline, in which case use a double underline to
                 // distinguish them.
                 const underline: terminal.Attribute.Underline = underline: {
-                    const above = self.terminal_state.overscan.above;
-                    if (y >= above and links.contains(.{
+                    if (links.contains(.{
                         .x = @intCast(x),
-                        .y = @intCast(y - above),
+                        .y = y,
                     })) {
                         break :underline if (style.flags.underline == .single)
                             .double

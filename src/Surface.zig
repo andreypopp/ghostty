@@ -340,7 +340,7 @@ const Mouse = struct {
 
     /// The last x/y in the cursor position for links. We use this to
     /// only process link hover events when the mouse actually moves cells.
-    link_point: ?terminal.point.Coordinate = null,
+    link_point: ?rendererpkg.State.Mouse.Point = null,
 
     /// Return the left-click pin only if it still belongs to the active screen.
     fn activeLeftClickPin(self: *const Mouse, screens: *const terminal.ScreenSet) ?*terminal.Pin {
@@ -1780,7 +1780,8 @@ fn mouseRefreshLinks(
 
     // Update the last point that we checked for links so we don't
     // recheck if the mouse moves some pixels to the same point.
-    self.mouse.link_point = pos_vp;
+    const point = contentPoint(size, pos, self.renderer.pixelOffset(), .clamp);
+    self.mouse.link_point = point;
 
     // We use an arena for everything below to make things easy to clean up.
     // In the case we don't do any allocs this is very cheap to setup
@@ -1811,7 +1812,7 @@ fn mouseRefreshLinks(
             }
         }
 
-        const link = (try self.linkAtPos(pos, size)) orelse break :link .{ null, false };
+        const link = (try self.linkAtPoint(point, self.mouseModsWithCapture(self.mouse.mods))) orelse break :link .{ null, false };
         switch (link.action) {
             .open => {
                 const str = try self.io.terminal.screens.active.selectionString(alloc, .{
@@ -1842,7 +1843,7 @@ fn mouseRefreshLinks(
     // If we found a link, setup our internal state and notify the
     // apprt so it can highlight it.
     if (link_) |link| {
-        self.renderer_state.mouse.point = pos_vp;
+        self.renderer_state.mouse.point = point;
         self.mouse.over_link = true;
         self.renderer_state.terminal.screens.active.dirty.hyperlink_hover = true;
         _ = try self.rt_app.performAction(
@@ -4732,7 +4733,7 @@ pub fn mouseButtonCallback(
 
                 // If there is a link at this position, we want to
                 // select the link. Otherwise, select the word.
-                if (try self.linkAtPos(pos, size)) |link| {
+                if (try self.linkAtPoint(contentPoint(size, pos, self.renderer.pixelOffset(), .clamp), self.mouseModsWithCapture(self.mouse.mods))) |link| {
                     try self.setSelectionAndCopy(link.selection);
                 } else {
                     const sel = screen.selectWord(
@@ -4944,28 +4945,19 @@ const Link = struct {
 /// Returns the link at the given cursor position, if any.
 ///
 /// Requires the renderer mutex is held.
-fn linkAtPos(
+fn linkAtPoint(
     self: *Surface,
-    pos: apprt.CursorPos,
-    size: rendererpkg.Size,
+    point: ?rendererpkg.State.Mouse.Point,
+    mouse_mods: ?input.Mods,
 ) !?Link {
-    // Convert our cursor position to a screen point.
-    const screen: *terminal.Screen = self.renderer_state.terminal.screens.active;
-    const mouse_pin: terminal.Pin = mouse_pin: {
-        const point = posToViewport(size, pos.x, pos.y);
-        const pin = screen.pages.pin(.{ .viewport = point }) orelse {
-            log.warn("failed to get pin for clicked point", .{});
-            return null;
-        };
-        break :mouse_pin pin;
-    };
+    const mouse_pin = self.contentPin(point orelse return null) orelse return null;
 
-    // Get our comparison mods
-    const mouse_mods = self.mouseModsWithCapture(self.mouse.mods);
+    return try self.linkAtPinIncludingOSC8(mouse_pin, mouse_mods);
+}
 
-    // If we have the proper modifiers set then we can check for OSC8 links.
+fn linkAtPinIncludingOSC8(self: *Surface, mouse_pin: terminal.Pin, mouse_mods: ?input.Mods) !?Link {
     if (self.config.link_osc8 and
-        mouse_mods.equal(input.ctrlOrSuper(.{})))
+        (mouse_mods == null or mouse_mods.?.equal(input.ctrlOrSuper(.{}))))
     hyperlink: {
         const rac = mouse_pin.rowAndCell();
         const cell = rac.cell;
@@ -4974,7 +4966,6 @@ fn linkAtPos(
         return .{ .action = ._open_osc8, .selection = sel };
     }
 
-    // Fall back to configured links
     return try self.linkAtPin(mouse_pin, mouse_mods);
 }
 
@@ -5053,7 +5044,79 @@ fn mouseModsWithCapture(self: *Surface, mods: input.Mods) input.Mods {
 ///
 /// Requires the renderer state mutex is held.
 fn processLinks(self: *Surface, pos: apprt.CursorPos, size: rendererpkg.Size) !bool {
-    const link = try self.linkAtPos(pos, size) orelse return false;
+    const link = try self.linkAtPoint(contentPoint(size, pos, self.renderer.pixelOffset(), .clamp), self.mouseModsWithCapture(self.mouse.mods)) orelse return false;
+    return try self.openLink(link);
+}
+
+pub const Content = union(enum) {
+    none,
+    link,
+    image: struct {
+        screen: terminal.ScreenSet.Key,
+        id: u32,
+        transmission: u64,
+        rect: struct { x: f64, y: f64, width: f64, height: f64 },
+    },
+};
+
+fn contentPoint(size: rendererpkg.Size, pos: apprt.CursorPos, pixel_offset: f64, bounds: enum { clamp, reject }) ?rendererpkg.State.Mouse.Point {
+    const grid = size.grid();
+    const left: f64 = @floatFromInt(size.padding.left);
+    const top: f64 = @floatFromInt(size.padding.top);
+    const width: f64 = @floatFromInt(@as(u32, grid.columns) * size.cell.width);
+    const height: f64 = @floatFromInt(@as(u32, grid.rows) * size.cell.height);
+    if (bounds == .reject and (pos.x < left or pos.y < top or pos.x >= left + width or pos.y >= top + height)) return null;
+    const x = if (pos.x >= left + width) width - 1 else @max(0, pos.x - left);
+    const y = if (pos.y >= top + height) height - 1 else @max(0, pos.y - top);
+    return .{
+        .x = @intFromFloat(@floor(x / @as(f64, @floatFromInt(size.cell.width)))),
+        .y = @intFromFloat(@floor((y + pixel_offset) / @as(f64, @floatFromInt(size.cell.height)))),
+    };
+}
+
+fn contentPin(self: *Surface, point: rendererpkg.State.Mouse.Point) ?terminal.Pin {
+    const x = point.x;
+    const y = point.y;
+    const pages = &self.renderer_state.terminal.screens.active.pages;
+    const first = pages.getTopLeft(.viewport);
+    var pin = (if (y < 0) first.up(@intCast(-y)) else first.down(@intCast(y))) orelse return null;
+    if (x >= pages.cols or x >= pin.node.cols()) return null;
+    pin.x = x;
+    return pin;
+}
+
+pub fn contentAt(self: *Surface, pos: apprt.CursorPos) !Content {
+    self.size_mutex.lockUncancelable(global.io());
+    defer self.size_mutex.unlock(global.io());
+    self.renderer_state.mutex.lockUncancelable(global.io());
+    defer self.renderer_state.mutex.unlock(global.io());
+    const t = self.renderer_state.terminal;
+    const geometry = self.renderer.imageAt(pos.x, pos.y, t.screens.active_key);
+    const point = contentPoint(self.size, pos, geometry.pixel_offset, .reject) orelse return .none;
+    const pin = self.contentPin(point) orelse return .none;
+    if (try self.linkAtPinIncludingOSC8(pin, null) != null) return .link;
+    const hit = geometry.image orelse return .none;
+    const image = t.screens.active.kitty_images.imageById(hit.id) orelse return .none;
+    if (image.renderData().isPending() or image.generation != hit.generation) return .none;
+    return .{ .image = .{
+        .screen = t.screens.active_key,
+        .id = hit.id,
+        .transmission = image.transmission,
+        .rect = .{ .x = hit.x, .y = hit.y, .width = hit.width, .height = hit.height },
+    } };
+}
+
+pub fn openLinkAt(self: *Surface, pos: apprt.CursorPos) !bool {
+    self.size_mutex.lockUncancelable(global.io());
+    defer self.size_mutex.unlock(global.io());
+    self.renderer_state.mutex.lockUncancelable(global.io());
+    defer self.renderer_state.mutex.unlock(global.io());
+    const point = contentPoint(self.size, pos, self.renderer.pixelOffset(), .reject) orelse return false;
+    const pin = self.contentPin(point) orelse return false;
+    return try self.openLink((try self.linkAtPinIncludingOSC8(pin, null)) orelse return false);
+}
+
+fn openLink(self: *Surface, link: Link) !bool {
     switch (link.action) {
         .open => {
             const str = try self.io.terminal.screens.active.selectionString(self.alloc, .{
@@ -5269,7 +5332,7 @@ pub fn cursorPosCallback(
     // 2. mouse reporting is on and we are not reporting shift to the terminal
     if ((over_link or
         self.mouse.link_point == null or
-        (self.mouse.link_point != null and !self.mouse.link_point.?.eql(pos_vp))) and
+        !std.meta.eql(self.mouse.link_point, contentPoint(size, pos, self.renderer.pixelOffset(), .clamp))) and
         (self.io.terminal.flags.mouse_event == .none or
             (self.mouse.mods.shift and !self.mouseShiftCapture(false))))
     {
@@ -5682,7 +5745,7 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
 
             self.renderer_state.mutex.lockUncancelable(global.io());
             defer self.renderer_state.mutex.unlock(global.io());
-            if (try self.linkAtPos(pos, size)) |link_info| {
+            if (try self.linkAtPoint(contentPoint(size, pos, self.renderer.pixelOffset(), .clamp), self.mouseModsWithCapture(self.mouse.mods))) |link_info| {
                 const url_text = switch (link_info.action) {
                     .open => url_text: {
                         // For regex links, get the text from selection

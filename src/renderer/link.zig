@@ -25,14 +25,14 @@ pub const Link = struct {
     /// Returns true if this link's highlight condition matches the given mouse state.
     fn active(
         self: *const Link,
-        mouse_viewport: ?point.Coordinate,
+        captured_point: ?point.Coordinate,
         mouse_mods: inputpkg.Mods,
     ) bool {
         return switch (self.highlight) {
             .always => true,
             .always_mods => |v| mouse_mods.equal(v),
-            .hover => mouse_viewport != null,
-            .hover_mods => |v| mouse_viewport != null and mouse_mods.equal(v),
+            .hover => captured_point != null,
+            .hover_mods => |v| captured_point != null and mouse_mods.equal(v),
         };
     }
 };
@@ -74,7 +74,7 @@ pub const Set = struct {
         alloc: Allocator,
         result: *terminal.RenderState.CellSet,
         render_state: *const terminal.RenderState,
-        mouse_viewport: ?point.Coordinate,
+        captured_point: ?point.Coordinate,
         mouse_mods: inputpkg.Mods,
     ) !void {
         // Fast path, not very likely since we have default links.
@@ -85,7 +85,7 @@ pub const Set = struct {
         // function runs during frame updates, so avoid allocating them when
         // the current mouse/modifier state can't highlight any regex links.
         for (self.links) |*link| {
-            if (link.active(mouse_viewport, mouse_mods)) break;
+            if (link.active(captured_point, mouse_mods)) break;
         } else return;
 
         // Convert our render state to a string + byte map.
@@ -102,7 +102,7 @@ pub const Set = struct {
 
         // Go through each link and see if we have any matches.
         for (self.links) |*link| {
-            if (!link.active(mouse_viewport, mouse_mods)) continue;
+            if (!link.active(captured_point, mouse_mods)) continue;
 
             var offset: usize = 0;
             while (offset < str.len) {
@@ -128,7 +128,7 @@ pub const Set = struct {
 
                 switch (link.highlight) {
                     .always, .always_mods => {},
-                    .hover, .hover_mods => if (mouse_viewport) |vp| {
+                    .hover, .hover_mods => if (captured_point) |vp| {
                         for (map.items[start..end]) |pt| {
                             if (pt.eql(vp)) break;
                         } else continue;
