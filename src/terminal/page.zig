@@ -825,7 +825,7 @@ pub const Page = struct {
             .rows = @intCast(y_end - y_start),
             .styles = @intCast(styles_cap),
             .grapheme_bytes = @intCast(grapheme_bytes),
-            .hyperlink_bytes = @intCast(hyperlink_bytes),
+            .hyperlink_bytes = @intCast(@min(hyperlink_bytes, std.math.maxInt(size.HyperlinkCountInt))),
             .hyperlink_cells = @intCast(@min(
                 hyperlink_cells,
                 std.math.maxInt(size.HyperlinkCountInt),
@@ -909,6 +909,30 @@ pub const Page = struct {
         x_start: usize,
         x_end_req: usize,
     ) CloneFromError!void {
+        return self.clonePartialRow(other, dst_row, src_row, x_start, x_end_req, .strict);
+    }
+
+    pub fn clonePartialRowBestEffort(
+        self: *Page,
+        other: *const Page,
+        dst_row: *Row,
+        src_row: *const Row,
+        x_start: usize,
+        x_end: usize,
+    ) void {
+        assert(other != self);
+        self.clonePartialRow(other, dst_row, src_row, x_start, x_end, .best_effort) catch unreachable;
+    }
+
+    fn clonePartialRow(
+        self: *Page,
+        other: *const Page,
+        dst_row: *Row,
+        src_row: *const Row,
+        x_start: usize,
+        x_end_req: usize,
+        comptime policy: enum { strict, best_effort },
+    ) CloneFromError!void {
         // This whole operation breaks integrity until the end.
         self.pauseIntegrityChecks(true);
         defer {
@@ -986,7 +1010,9 @@ pub const Page = struct {
 
                     // Safe to use setGraphemes because we cleared all
                     // managed memory for our destination cell range.
-                    try self.setGraphemes(dst_row, dst_cell, cps);
+                    self.setGraphemes(dst_row, dst_cell, cps) catch |err| {
+                        if (policy == .strict) return err;
+                    };
                 }
                 if (src_cell.hyperlink) hyperlink: {
                     const id = other.lookupHyperlink(src_cell).?;
@@ -1005,6 +1031,7 @@ pub const Page = struct {
                     // a hyperlink then we have to return an error.
                     if (self.hyperlinkCount() >= self.hyperlinkCapacity()) {
                         // The hyperlink map capacity needs to be increased.
+                        if (policy == .best_effort) break :hyperlink;
                         return error.HyperlinkMapOutOfMemory;
                     }
 
@@ -1029,6 +1056,7 @@ pub const Page = struct {
                         const dst_link = other_link.dupe(other, self) catch |e| {
                             comptime assert(@TypeOf(e) == error{OutOfMemory});
                             // The string alloc capacity needs to be increased.
+                            if (policy == .best_effort) break :hyperlink;
                             return error.StringAllocOutOfMemory;
                         };
 
@@ -1043,16 +1071,20 @@ pub const Page = struct {
                             dst_link,
                             id,
                             .{ .page = self },
-                        ) catch |e| switch (e) {
-                            // The hyperlink set capacity needs to be increased.
-                            error.OutOfMemory => return error.HyperlinkSetOutOfMemory,
-
-                            // The hyperlink set needs to be rehashed.
-                            error.NeedsRehash => return error.HyperlinkSetNeedsRehash,
+                        ) catch |e| {
+                            dst_link.free(self);
+                            if (policy == .best_effort) break :hyperlink;
+                            return switch (e) {
+                                error.OutOfMemory => error.HyperlinkSetOutOfMemory,
+                                error.NeedsRehash => error.HyperlinkSetNeedsRehash,
+                            };
                         } orelse id;
                     };
 
-                    try self.setHyperlink(dst_row, dst_cell, dst_id);
+                    self.setHyperlink(dst_row, dst_cell, dst_id) catch |err| {
+                        self.hyperlink_set.release(self.memory, dst_id);
+                        if (policy == .strict) return err;
+                    };
                 }
                 if (src_cell.style_id != stylepkg.default_id) style: {
                     dst_row.styled = true;
@@ -1072,12 +1104,12 @@ pub const Page = struct {
                         self.memory,
                         other_style.*,
                         src_cell.style_id,
-                    ) catch |e| switch (e) {
-                        // The style set capacity needs to be increased.
-                        error.OutOfMemory => return error.StyleSetOutOfMemory,
-
-                        // The style set needs to be rehashed.
-                        error.NeedsRehash => return error.StyleSetNeedsRehash,
+                    ) catch |e| {
+                        if (policy == .best_effort) break :style;
+                        return switch (e) {
+                            error.OutOfMemory => error.StyleSetOutOfMemory,
+                            error.NeedsRehash => error.StyleSetNeedsRehash,
+                        };
                     } orelse src_cell.style_id;
                 }
                 if (comptime build_options.kitty_graphics) {
@@ -4307,6 +4339,34 @@ test "Page cloneRowFrom partial hyperlink in same page copy" {
         }
     }
     try testing.expectEqual(@as(usize, 2), page.hyperlinkCount());
+}
+
+test "Page best effort row clone keeps cells when managed storage is full" {
+    var src = try Page.init(.{ .cols = 2, .rows = 1 });
+    defer src.deinit();
+    var dst = try Page.init(.{ .cols = 2, .rows = 1, .hyperlink_cells = 0, .grapheme_bytes = 0 });
+    defer dst.deinit();
+    const rac = src.getRowAndCell(0, 0);
+    rac.cell.* = .{ .content_tag = .codepoint, .content = .{ .codepoint = .{ .data = 'X' } } };
+    rac.row.blank = false;
+    const id = try src.hyperlink_set.addContext(src.memory, .{ .id = .{ .implicit = 0 }, .uri = .{} }, .{ .page = &src });
+    try src.setHyperlink(rac.row, rac.cell, id);
+    try src.setGraphemes(rac.row, rac.cell, &.{0x301});
+    rac.cell.style_id = try src.styles.add(src.memory, .{ .flags = .{ .bold = true } });
+    rac.row.styled = true;
+    dst.clonePartialRowBestEffort(&src, dst.getRow(0), src.getRow(0), 0, 2);
+    const copied = dst.getRowAndCell(0, 0);
+    try testing.expectEqual(@as(u21, 'X'), copied.cell.codepoint());
+    try testing.expectEqual(rac.cell.wide, copied.cell.wide);
+    try testing.expect(!copied.cell.hyperlink);
+    try testing.expect(!copied.cell.hasGrapheme());
+    try testing.expect(dst.styles.get(dst.memory, copied.cell.style_id).flags.bold);
+    var unstyled = try Page.init(.{ .cols = 2, .rows = 1, .styles = 0, .hyperlink_cells = 0 });
+    defer unstyled.deinit();
+    unstyled.clonePartialRowBestEffort(&src, unstyled.getRow(0), src.getRow(0), 0, 2);
+    const plain = unstyled.getRowAndCell(0, 0);
+    try testing.expectEqual(@as(u21, 'X'), plain.cell.codepoint());
+    try testing.expectEqual(stylepkg.default_id, plain.cell.style_id);
 }
 
 test "Page cloneRowFrom partial hyperlink in same page omit" {

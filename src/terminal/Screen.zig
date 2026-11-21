@@ -699,79 +699,37 @@ pub fn increaseCapacity(
 ///
 /// The cursor style and hyperlink IDs, as well as the cached row and cell
 /// pointers, all refer to the destroyed page, so this never touches it.
-/// The style and hyperlink are added to the page the pin now points to and
-/// then the cursor is reloaded.
+/// The style and hyperlink are added to the page the pin now points to.
 fn cursorPageReplaced(self: *Screen) void {
-    const new_page: *Page = self.cursor.page_pin.node.page();
-
-    // Re-add the style, if the page somehow doesn't have enough
-    // memory to add it, we emit a warning and gracefully degrade
-    // to the default style for the cursor.
-    if (self.cursor.style_id != style.default_id) {
-        self.cursor.style_id = new_page.styles.add(
-            new_page.memory,
-            self.cursor.style,
-        ) catch |err| id: {
-            // TODO: Should we increase the capacity further in this case?
-            log.warn(
-                "(Screen.cursorPageReplaced) Failed to add cursor style back to page, err={}",
-                .{err},
-            );
-
-            // Reset the cursor style.
-            self.cursor.style = .{};
-            break :id style.default_id;
-        };
-    }
-
-    // Re-add the hyperlink, if the page somehow doesn't have enough
-    // memory to add it, we emit a warning and gracefully degrade to
-    // no hyperlink.
-    if (self.cursor.hyperlink) |link| {
-        // So we don't attempt to free any memory in the replaced page.
-        self.cursor.hyperlink_id = 0;
-        self.cursor.hyperlink = null;
-
-        // Re-add
-        self.startHyperlinkOnce(link.*) catch |err| {
-            // TODO: Should we increase the capacity further in this case?
-            log.warn(
-                "(Screen.cursorPageReplaced) Failed to add cursor hyperlink back to page, err={}",
-                .{err},
-            );
-        };
-
-        // Remove our old link
-        link.deinit(self.alloc);
-        self.alloc.destroy(link);
-    }
-
-    // Reload the cursor information because the pin changed.
-    // So our page row/cell and so on are all off.
+    const restore_style = self.cursor.style_id != style.default_id;
+    const link = self.cursor.hyperlink;
+    self.cursor.style_id = style.default_id;
+    self.cursor.hyperlink_id = 0;
+    self.cursor.hyperlink = null;
     self.cursorReload();
+
+    if (restore_style) {
+        self.manualStyleUpdate() catch |err| {
+            log.warn("failed to restore cursor style err={}", .{err});
+            self.cursor.style = .{};
+            self.cursor.style_id = style.default_id;
+        };
+    }
+
+    if (link) |value| {
+        self.startHyperlinkValue(value.*) catch |err| {
+            log.warn("failed to restore cursor hyperlink err={}", .{err});
+        };
+        value.deinit(self.alloc);
+        self.alloc.destroy(value);
+    }
 }
 
-/// Clone the cells in columns [x_start, x_end) of a source row into
-/// the row at `dst_y` of the given node's page, increasing the node's
-/// capacity as necessary to fit the managed memory (styles,
-/// hyperlinks, etc.) of the copied cells.
-///
-/// This is the Screen-level analog of PageList.cloneRowGrowCapacity:
-/// capacity increases are routed through Screen.increaseCapacity so
-/// that the cursor's style/hyperlink references are migrated when the
-/// destination node is the cursor's page.
-///
-/// Since increasing capacity replaces the node in the page list, the
-/// (possibly replaced) node is returned and the caller must use it in
-/// place of the old node. Tracked pins are updated automatically. The
-/// source must NOT be on the given node since the node's page memory
-/// may be freed on capacity increase.
-///
-/// Callers use this mid-mutation (after rows have been rotated or
-/// shifted), so a failure can't be propagated without leaving the
-/// page list half-mutated (and corrupt). If the capacity can't be
-/// increased (system OOM or the page is already at max capacity),
-/// this panics: a crash is better than corruption.
+/// Clone columns [x_start, x_end), growing or isolating and compacting
+/// the destination as needed. Returns the destination node and migrates
+/// cursor references. An isolated row at the capacity limit loses only
+/// managed data that cannot fit. Source and destination must be on
+/// different nodes.
 pub fn clonePartialRowGrowCapacity(
     self: *Screen,
     node: *PageList.List.Node,
@@ -784,12 +742,14 @@ pub fn clonePartialRowGrowCapacity(
     assert(src_page != node.page());
 
     var current = node;
+    var y = dst_y;
+    var isolated = false;
     while (true) {
         const cur_page: *Page = current.page();
         const cur_rows = cur_page.rows.ptr(cur_page.memory.ptr);
         cur_page.clonePartialRowFrom(
             src_page,
-            &cur_rows[dst_y],
+            &cur_rows[y],
             src_row,
             x_start,
             x_end,
@@ -808,8 +768,23 @@ pub fn clonePartialRowGrowCapacity(
                 error.OutOfMemory,
                 => @panic("increaseCapacity system allocator OOM"),
 
-                error.OutOfSpace,
-                => @panic("increaseCapacity OutOfSpace"),
+                error.OutOfSpace => split: {
+                    if (isolated) {
+                        cur_page.clonePartialRowBestEffort(src_page, &cur_rows[y], src_row, x_start, x_end);
+                        return current;
+                    }
+                    const old_cursor = self.cursor.page_pin.*;
+                    const serial = old_cursor.node.serial;
+                    const pin = self.pages.isolateRow(.{ .node = current, .y = @intCast(y), .x = 0 }) catch
+                        @panic("isolateRow system allocator OOM");
+                    const destination = self.pages.trackPin(pin) catch
+                        @panic("trackPin system allocator OOM");
+                    defer self.pages.untrackPin(destination);
+                    self.cursorStorageMoved(old_cursor, serial);
+                    y = destination.y;
+                    isolated = true;
+                    break :split destination.node;
+                },
             };
 
             continue;
@@ -1226,10 +1201,7 @@ fn cursorScrollAboveRotate(
     // at the tail, which is the only node that can be freshly allocated.
     var current = self.pages.pages.last.?;
     var current_is_fresh = fresh_node != null;
-    while (current != self.cursor.page_pin.node) : ({
-        current = current.prev.?;
-        current_is_fresh = false;
-    }) {
+    while (current != self.cursor.page_pin.node) {
         const prev = current.prev.?;
 
         // A newly allocated tail has no earlier references to invalidate.
@@ -1267,6 +1239,8 @@ fn cursorScrollAboveRotate(
 
         // Mark dirty on the page, since we are dirtying all rows with this.
         current.page().dirty = true;
+        current = prev;
+        current_is_fresh = false;
     }
 
     // Our current is our cursor page, we need to rotate down from
@@ -2605,30 +2579,30 @@ fn splitForCapacity(
         pin.node.rows(),
     )).total_size;
 
-    // We need to track the old cursor pin because if our split
-    // moves the cursor pin we need to update our accounting.
-    const old_cursor = self.cursor.page_pin.*;
-
     // If our bytes above are less than bytes below, we move the pin
     // to split down one since splitting includes the pinned row in
     // the new node.
-    try self.pages.split(if (bytes_above < bytes_below)
+    try self.split(if (bytes_above < bytes_below)
         pin.down(1) orelse pin
     else
         pin);
+}
 
-    // Cursor didn't change nodes, we're done.
-    if (self.cursor.page_pin.node == old_cursor.node) return;
+fn split(self: *Screen, pin: Pin) PageList.SplitError!void {
+    const old_cursor = self.cursor.page_pin.*;
+    const serial = old_cursor.node.serial;
+    try self.pages.split(pin);
+    self.cursorStorageMoved(old_cursor, serial);
+}
 
-    // Cursor changed, we need to restore the old pin then use
-    // cursorChangePin to move to the new pin. The old node is guaranteed
-    // to still exist, just not the row.
-    //
-    // Note that page_row and all that will be invalid, it points to the
-    // new node, but at the time of writing this we don't need any of that
-    // to be right in cursorChangePin.
+fn cursorStorageMoved(self: *Screen, old: Pin, serial: u64) void {
+    if (!self.pages.nodeIsValid(old.node, serial)) {
+        self.cursorPageReplaced();
+        return;
+    }
+    if (self.cursor.page_pin.node == old.node) return;
     const new_cursor = self.cursor.page_pin.*;
-    self.cursor.page_pin.* = old_cursor;
+    self.cursor.page_pin.* = old;
     self.cursorChangePin(new_cursor);
 }
 
@@ -2761,7 +2735,10 @@ pub fn startHyperlink(
         .implicit => self.cursor.hyperlink_implicit_id -%= 1,
     };
 
-    // Loop until we have enough page memory to add the hyperlink
+    try self.startHyperlinkValue(link);
+}
+
+fn startHyperlinkValue(self: *Screen, link: hyperlink.Hyperlink) PageList.IncreaseCapacityError!void {
     while (true) {
         if (self.startHyperlinkOnce(link)) {
             return;

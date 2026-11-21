@@ -8732,6 +8732,96 @@ test "Terminal: print wide char at right margin does not create spacer head" {
     }
 }
 
+test "Terminal: partial row isolation preserves cursor style and hyperlink" {
+    var t = try init(testing.io, testing.allocator, .{ .cols = 2048, .rows = 2 });
+    defer t.deinit(testing.allocator);
+    var s = t.vtStream();
+    defer s.deinit();
+    var buf: [128]u8 = undefined;
+    for (0..1800) |i| {
+        s.nextSlice(try std.fmt.bufPrint(&buf, "\x1b]8;id={d};{d}\x1b\\X", .{ i, i }));
+    }
+    s.nextSlice("\x1b]8;;\x1b\\");
+    const original = t.screens.active.cursor.page_pin.node;
+    const serial = original.serial;
+    try t.screens.active.pages.split(.{ .node = original, .y = 1, .x = 0 });
+    s.nextSlice("\x1b[2;2048H\x1b]8;;source\x1b\\Z\x1b]8;;\x1b\\");
+    s.nextSlice("\x1b[?69h\x1b[2047;2048s\x1b[1;2047H\x1b[1m\x1b]8;id=0;0\x1b\\\x1b[M");
+    const screen = t.screens.active;
+    screen.assertIntegrity();
+    try testing.expect(!screen.pages.nodeIsValid(original, serial));
+    try testing.expectEqual(@as(size.CellCountInt, 0), screen.cursor.y);
+    try testing.expectEqual(@as(size.CellCountInt, 2046), screen.cursor.x);
+    try testing.expect(screen.cursor.style.flags.bold);
+    try testing.expectEqualStrings("0", screen.cursor.hyperlink.?.uri);
+    const page = screen.cursor.page_pin.node.page();
+    try testing.expect(page.styles.get(page.memory, screen.cursor.style_id).flags.bold);
+    try testing.expectEqualStrings("0", page.hyperlink_set.get(page.memory, screen.cursor.hyperlink_id).uri.slice(page.memory));
+    const moved = screen.pages.getCell(.{ .active = .{ .x = 2047, .y = 0 } }).?;
+    try testing.expectEqual(@as(u21, 'Z'), moved.cell.codepoint());
+}
+
+test "Terminal: region scroll preserves links at page capacity" {
+    for ([_][]const u8{ "\n", "\x1b[2;1H\x1b[M" }) |action| {
+        for ([_]bool{ false, true }) |inflated| {
+            var t = try init(testing.io, testing.allocator, .{ .cols = 80, .rows = 24 });
+            defer t.deinit(testing.allocator);
+            var s = t.vtStream();
+            defer s.deinit();
+            var buf: [128]u8 = undefined;
+            for (0..1787) |i| {
+                s.nextSlice(try std.fmt.bufPrint(&buf, "\x1b]8;;{d}\x1b\\X", .{i}));
+                if (i >= 1200) s.nextSlice("\r\n");
+            }
+            s.nextSlice("\x1b]8;;\x1b\\\x1b[2;24r\x1b[24;1H\x1b[1m");
+            var cps: [24][80]u21 = undefined;
+            var links: [24][80]?[]u8 = undefined;
+            defer for (&links) |*row| {
+                for (row) |uri| if (uri) |v| testing.allocator.free(v);
+            };
+            for (&cps, &links, 0..) |*row, *uris, y| {
+                for (row, uris, 0..) |*cp, *uri, x| {
+                    const c = t.screens.active.pages.getCell(.{ .active = .{ .x = @intCast(x), .y = @intCast(y) } }).?;
+                    cp.* = c.cell.codepoint();
+                    const p = c.node.page();
+                    uri.* = if (p.lookupHyperlink(c.cell)) |id|
+                        try testing.allocator.dupe(u8, p.hyperlink_set.get(p.memory, id).uri.slice(p.memory))
+                    else
+                        null;
+                }
+            }
+            var destination = t.screens.active.pages.pin(.{ .active = .{ .y = 1 } }).?.node;
+            if (inflated) {
+                while (destination.capacity().grapheme_bytes < 1024 * 1024) {
+                    destination = try t.screens.active.increaseCapacity(destination, .grapheme_bytes);
+                }
+            }
+            s.nextSlice(action);
+            try testing.expectEqual(@as(size.CellCountInt, if (action[0] == '\n') 23 else 1), t.screens.active.cursor.y);
+            try testing.expect(t.screens.active.cursor.style.flags.bold);
+            const cursor = t.screens.active.cursor;
+            const pin = t.screens.active.pages.pin(.{ .active = .{ .x = cursor.x, .y = cursor.y } }).?;
+            try testing.expect(cursor.page_pin.eql(pin));
+            const rac = pin.rowAndCell();
+            try testing.expectEqual(rac.row, cursor.page_row);
+            try testing.expectEqual(rac.cell, cursor.page_cell);
+            try testing.expect(pin.node.page().styles.get(pin.node.page().memory, cursor.style_id).flags.bold);
+            for (0..24) |y| {
+                for (0..80) |x| {
+                    const c = t.screens.active.pages.getCell(.{ .active = .{ .x = @intCast(x), .y = @intCast(y) } }).?;
+                    const old_y = if (y == 0) 0 else @min(y + 1, 23);
+                    try testing.expectEqual(if (y == 23) 0 else cps[old_y][x], c.cell.codepoint());
+                    const p = c.node.page();
+                    const uri = if (p.lookupHyperlink(c.cell)) |id| p.hyperlink_set.get(p.memory, id).uri.slice(p.memory) else null;
+                    if (if (y == 23) null else links[old_y][x]) |expected| {
+                        try testing.expectEqualStrings(expected, uri.?);
+                    } else try testing.expect(uri == null);
+                }
+            }
+        }
+    }
+}
+
 test "Terminal: print with hyperlink" {
     var t = try init(testing.io, testing.allocator, .{ .cols = 80, .rows = 80 });
     defer t.deinit(testing.allocator);

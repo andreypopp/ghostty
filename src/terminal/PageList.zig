@@ -3945,6 +3945,26 @@ pub fn compact(self: *PageList, node: *List.Node) Allocator.Error!?*List.Node {
     return new_node;
 }
 
+pub fn isolateRow(self: *PageList, p: Pin) Allocator.Error!Pin {
+    var result = p;
+    if (result.y > 0) {
+        self.split(result) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.OutOfSpace => unreachable,
+        };
+        result.node = result.node.next.?;
+        result.y = 0;
+    }
+    if (result.node.rows() > 1) {
+        self.split(.{ .node = result.node, .y = 1, .x = 0 }) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.OutOfSpace => unreachable,
+        };
+    }
+    result.node = (try self.compact(result.node)) orelse result.node;
+    return result;
+}
+
 pub const SplitError = error{
     // Allocator OOM
     OutOfMemory,
@@ -5928,14 +5948,10 @@ fn destroyNodeExt(
     pool.nodes.destroy(node);
 }
 
-/// Clone the given source row into the row at `dst_y` of the given
-/// node's page, increasing the node's capacity as necessary to fit the
-/// source row's managed memory (styles, hyperlinks, etc.).
-///
-/// Since increasing capacity replaces the node in the page list, the
-/// (possibly replaced) node is returned and the caller must use it in
-/// place of the old node. The source must NOT be on the given node
-/// since the node's page memory may be freed on capacity increase.
+/// Clone a row, growing or isolating and compacting the destination as
+/// needed. Returns the destination node. An isolated row at the capacity
+/// limit loses only managed data that cannot fit. Source and destination
+/// must be on different nodes.
 fn cloneRowGrowCapacity(
     self: *PageList,
     node: *List.Node,
@@ -5946,12 +5962,14 @@ fn cloneRowGrowCapacity(
     assert(src_page != node.page());
 
     var current = node;
+    var y = dst_y;
+    var isolated = false;
     while (true) {
         const cur_page = current.page();
         const cur_rows = cur_page.rows.ptr(cur_page.memory.ptr);
         cur_page.cloneRowFrom(
             src_page,
-            &cur_rows[dst_y],
+            &cur_rows[y],
             src_row,
         ) catch |err| {
             // Adjust our page capacity to make room for what we
@@ -5967,8 +5985,17 @@ fn cloneRowGrowCapacity(
                 error.OutOfMemory,
                 => @panic("increaseCapacity system allocator OOM"),
 
-                error.OutOfSpace,
-                => @panic("increaseCapacity OutOfSpace"),
+                error.OutOfSpace => split: {
+                    if (isolated) {
+                        cur_page.clonePartialRowBestEffort(src_page, &cur_rows[y], src_row, 0, self.cols);
+                        return current;
+                    }
+                    const p = self.isolateRow(.{ .node = current, .y = @intCast(y), .x = 0 }) catch
+                        @panic("isolateRow system allocator OOM");
+                    y = p.y;
+                    isolated = true;
+                    break :split p.node;
+                },
             };
 
             // Retry the row copy with the increased capacity.
